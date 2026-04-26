@@ -51,7 +51,7 @@ native installer via PyInstaller. No Python installation is required.
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon and Intel both
 supported.
 
-1. Download **`LightbucketAstroPlanner-0.7.0-beta.dmg`** from the release page.
+1. Download **`[LightbucketAstroPlanner-0.7.0-beta.dmg](https://github.com/lightbucketastro/lightbucket-astro-planner/releases/latest)`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -70,7 +70,7 @@ supported.
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-0.7.0-beta-setup.exe`** from the
+1. Download **`[LightbucketAstroPlanner-0.7.0-beta-setup.exe](https://github.com/lightbucketastro/lightbucket-astro-planner/releases/latest)`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
