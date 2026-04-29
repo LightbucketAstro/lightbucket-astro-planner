@@ -15,10 +15,13 @@ native installer via PyInstaller. No Python installation is required.
 ---
 The main screen with the target planner
 <img width="993" height="705" alt="Screenshot 2026-04-23 at 1 15 56 PM" src="https://github.com/user-attachments/assets/e095c0a1-8224-4d6b-bc72-23f4c0d4e49e" />
+
 Pop-up view of tonight's suggested targets
 <img width="992" height="701" alt="Screenshot 2026-04-23 at 1 18 46 PM" src="https://github.com/user-attachments/assets/6b132251-3f26-4ae2-bf10-65c0187b1e45" />
 
+The target screen, with session planning tools and automatic calculation of sub exposures based on equipment.
 <img width="992" height="701" alt="Screenshot 2026-04-23 at 1 16 56 PM" src="https://github.com/user-attachments/assets/4016c384-18a7-4b16-9a5b-51d483ce3113" />
+
 
 <img width="992" height="702" alt="Screenshot 2026-04-23 at 1 18 01 PM" src="https://github.com/user-attachments/assets/8b832dd0-5864-4a16-b71f-d87a02094cd0" />
 
