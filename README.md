@@ -32,55 +32,17 @@ In one window it:
 - 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
 - 📊 **Builds a multi-target Gantt schedule** for the night, with per-rig support for dual-scope setups
 - 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
+- 🛠️ **Stores your equipment inventory** — cameras, telescopes, and reducers — so every new session starts with the right gear pre-filled
+- 💾 **Saves and reloads sessions** as JSON, with a prompt on close so an evening's planning is never lost by accident
+- 🔴 **Switches between day and night themes** so it's legible outdoors under a red torch and indoors at a desk
 
-No account, no cloud, no subscription. Your data stays on your machine.
+No account, no cloud, no subscription. Your data stays on your machine. Built as a single-window Tkinter app and shipped as native installers — no Python install required on either platform.
 
 ## Why I built this
 
 I kept finding myself on imaging nights doing the same routine — checking Stellarium for what's up, doing sub-exposure math on a napkin, opening Telescopius to check a frame, then hand-typing it all into NINA's Sequencer. So I built the planner I wanted.
 
 If it's useful to you too, [grab the latest release](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases/latest). If something's broken or missing, [open an issue](https://github.com/LightbucketAstro/lightbucket-astro-planner/issues/new) — I read all of them.
-
----
-
-# Lightbucket Astro Planner
-
-**Version 0.7.0-beta**
-
-A desktop planning tool for deep-sky astrophotography. Lightbucket Astro Planner
-helps you decide *what* to image, *when* to image it, and *how long* each
-sub-exposure should be — based on your location, equipment, and sky conditions
-— and then hands the resulting target list to
-[NINA (Nighttime Imaging 'N' Astronomy)](https://nighttime-imaging.eu/) ready to
-run.
-
-It is a single-window Tkinter application for macOS and Windows, bundled as a
-native installer via PyInstaller. No Python installation is required.
-
----
-
-## Features
-
-- **Sub-exposure recommendation** — calculates an optimal sub length from your
-  camera's read noise, the sky background at your Bortle class, and a
-  configurable noise-ratio constant (the "C-constant").
-- **Tonight's imaging window** — finds the usable window between astronomical
-  twilight, moonrise/moonset, and per-target altitude constraints.
-- **Target Planner** — searches the full NGC / IC catalog (downloaded on first
-  run) and shows a live DSS thumbnail with a draggable sensor-frame overlay so
-  you can frame the target before you go outside.
-- **Integration planner** — turns a recommended sub length and an allocated
-  number of hours into a concrete plan: sub count, total integration, start
-  and end times.
-- **Tonight's Plan** — a multi-target queue with a Gantt-style schedule and
-  one-click export to NINA's `.ninaTargetSet` format. Multi-rig plans are
-  split automatically into one file per telescope.
-- **Equipment inventory** — stores your cameras, telescopes, and reducers so
-  every new session starts with the right gear pre-filled.
-- **Session save / load** — save a full evening's plan to JSON and reopen it
-  later, with a prompt on close so nothing is lost by accident.
-- **Day / night theming** — legible outdoors under a red torch as well as
-  indoors at a desk.
 
 ---
 
