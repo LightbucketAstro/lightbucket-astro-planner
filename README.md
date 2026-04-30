@@ -1,4 +1,3 @@
-```markdown
 <div align="center">
 
 <img src="docs/logo.png" alt="Lightbucket Astro Planner" width="140">
