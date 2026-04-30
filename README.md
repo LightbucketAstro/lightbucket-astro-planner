@@ -38,6 +38,31 @@ In one window it:
 
 No account, no cloud, no subscription. Your data stays on your machine. Built as a single-window Tkinter app and shipped as native installers — no Python install required on either platform.
 
+## Screenshots
+
+<table>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/planner-m101-galaxy.png" alt="Planner tab showing Bode's Galaxy analysis with FOV preview and altitude chart">
+      <p align="center"><sub><b>Planner</b> — target analysis with framing, exposure recommendation, and the night's altitude track</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/tonights-plan-multirig.png" alt="Tonight's Plan with multiple targets across two telescopes">
+      <p align="center"><sub><b>Tonight's Plan</b> — multi-rig schedule with one-click NINA export per scope</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <img src="docs/screenshots/framing-zoomed.png" alt="Close-up of the FOV preview showing the rotated sensor frame on a galaxy">
+      <p align="center"><sub><b>FOV framing</b> — drag and rotate your sensor frame on a live DSS image</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/visible-tonight.png" alt="Visible Tonight dialog showing seasonal galaxies above the altitude floor">
+      <p align="center"><sub><b>Visible Tonight</b> — seasonal targets above your altitude floor, filtered by type and magnitude</sub></p>
+    </td>
+  </tr>
+</table>
+
 ## Why I built this
 
 I kept finding myself on imaging nights doing the same routine — checking Stellarium for what's up, doing sub-exposure math on a napkin, opening Telescopius to check a frame, then hand-typing it all into NINA's Sequencer. So I built the planner I wanted.
@@ -250,6 +275,15 @@ If something breaks, please include:
 2. The app version (shown in the title bar).
 3. A copy of `crash.log` from the data folder if one exists.
 4. A short description of what you were doing when the problem occurred.
+
+---
+
+## Contributing
+
+PRs welcome on small fixes and clear-cut improvements. For anything larger —
+new features, architectural changes, refactors — please open an issue first
+so we can discuss the approach before code gets written. That saves both of
+us time if the change isn't a fit, and helps shape it if it is.
 
 ---
 
