@@ -1,3 +1,49 @@
+```markdown
+<div align="center">
+
+<img src="docs/logo.png" alt="Lightbucket Astro Planner" width="140">
+
+# Lightbucket Astro Planner
+
+### Plan tonight's deep-sky imaging session in five minutes — and hand the list straight to NINA.
+
+[![Latest release](https://img.shields.io/github/v/release/LightbucketAstro/lightbucket-astro-planner?include_prereleases&label=download)](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases/latest)
+[![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-blue)](#installation)
+[![License](https://img.shields.io/github/license/LightbucketAstro/lightbucket-astro-planner)](LICENSE)
+[![Free](https://img.shields.io/badge/price-free-brightgreen)](#)
+[![Downloads](https://img.shields.io/github/downloads/LightbucketAstro/lightbucket-astro-planner/total)](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases)
+
+<img src="docs/demo.gif" alt="Lightbucket Astro Planner — animated demo" width="780">
+
+**[⬇ Download for macOS](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases/latest)** &nbsp;·&nbsp; **[⬇ Download for Windows](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases/latest)** &nbsp;·&nbsp; [Documentation](#first-run-setup) &nbsp;·&nbsp; [Report a bug](https://github.com/LightbucketAstro/lightbucket-astro-planner/issues/new)
+
+</div>
+
+---
+
+## What it does
+
+Lightbucket is a free, local desktop app that closes the gap between **"what should I image tonight?"** and **"NINA, run this list."** Built for amateur deep-sky astrophotographers who already use [N.I.N.A.](https://nighttime-imaging.eu/) to drive their rigs.
+
+In one window it:
+
+- 🔭 **Searches the full NGC / IC catalog** with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976)
+- 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image
+- ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
+- 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
+- 📊 **Builds a multi-target Gantt schedule** for the night, with per-rig support for dual-scope setups
+- 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
+
+No account, no cloud, no subscription. Your data stays on your machine.
+
+## Why I built this
+
+I kept finding myself on imaging nights doing the same routine — checking Stellarium for what's up, doing sub-exposure math on a napkin, opening Telescopius to check a frame, then hand-typing it all into NINA's Sequencer. So I built the planner I wanted.
+
+If it's useful to you too, [grab the latest release](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases/latest). If something's broken or missing, [open an issue](https://github.com/LightbucketAstro/lightbucket-astro-planner/issues/new) — I read all of them.
+
+---
+```
 # Lightbucket Astro Planner
 
 **Version 0.7.0-beta**
