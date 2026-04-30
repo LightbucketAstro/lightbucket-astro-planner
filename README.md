@@ -164,7 +164,7 @@ complete analysis.
 The app is organised as five tabs, selectable from the icon sidebar on the
 left.
 
-### 🎯 Target Planner
+### 🎯 Planner
 
 The main workspace for analysing a single object. Choose a camera, telescope,
 and (optionally) a reducer and filter from the equipment chips at the top.
@@ -255,7 +255,11 @@ If something breaks, please include:
 
 ## License
 
-*(TBD — add license text here.)*
+Released under the MIT License. See [LICENSE](LICENSE) for the full text.
+
+In short: you may use, copy, modify, and redistribute this software freely,
+including in commercial projects, provided the original copyright notice and
+license text travel with it. The software is provided as-is, with no warranty.
 
 ## Credits
 
