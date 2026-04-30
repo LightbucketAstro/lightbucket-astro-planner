@@ -42,7 +42,7 @@ I kept finding myself on imaging nights doing the same routine — checking Stel
 If it's useful to you too, [grab the latest release](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases/latest). If something's broken or missing, [open an issue](https://github.com/LightbucketAstro/lightbucket-astro-planner/issues/new) — I read all of them.
 
 ---
-```
+
 # Lightbucket Astro Planner
 
 **Version 0.7.0-beta**
