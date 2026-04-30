@@ -84,7 +84,7 @@ native installer via PyInstaller. No Python installation is required.
 
 ---
 
-## Installation
+## First-Run Setup
 
 > **A note on code signing.** The beta builds are **not currently signed** by
 > Apple or Microsoft. Both operating systems will warn you the first time you
