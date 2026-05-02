@@ -1,6 +1,10 @@
-# PyInstaller
+# PyInstaller / Into setup build output and test files
 build/
 dist/
+InstallerBuild/build/
+InstallerBuild/dist/
+InstallerBuild/installer/
+InstallerBuild/Distros/
 *.spec.bak
 
 # Python
