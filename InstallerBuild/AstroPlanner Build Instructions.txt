@@ -1,0 +1,200 @@
+================================================================================
+              LIGHTBUCKET ASTRO PLANNER - BUILD INSTRUCTIONS
+                              Version 0.7.0-beta
+================================================================================
+
+These instructions cover building Lightbucket Astro Planner from source on
+both macOS (.app bundle) and Windows (.exe + Inno Setup installer).
+
+The same project layout is used on both platforms.
+
+
+================================================================================
+1. DIRECTORY LAYOUT
+================================================================================
+
+Set up the following structure under your home directory on each machine:
+
+    AstroPlannerDev/
+        AstroPlannerBeta7.py        <-- main script
+        logo.png                    <-- runtime header logo
+        logo.ico                    <-- Windows window/installer icon
+        logo.icns                   <-- macOS .app bundle icon (Mac only)
+        InstallerBuild/
+            AstroPlannerBeta7.spec  <-- PyInstaller spec
+            MakeSetupFile.iss       <-- Inno Setup script (Windows only)
+	    MakeDmgFile.sh		macOS script to create DMG (Mac only)
+
+Full paths:
+    Mac:     /Users/<you>/AstroPlannerDev/
+    Windows: C:\Users\<you>\AstroPlannerDev\
+
+The .spec file resolves all paths relative to its own location, so the
+project home folder name does not matter as long as the layout above is
+preserved.
+
+
+================================================================================
+2. ONE-TIME PREREQUISITES
+================================================================================
+
+BOTH PLATFORMS
+--------------
+Install Python 3 (3.10 or newer recommended), then:
+
+    pip install pyinstaller pillow
+    brew install create-dmg (Mac only)
+    chmod +x MakeDmgFile.sh
+
+Make sure your dev Python can already run AstroPlannerBeta7.py from source
+before attempting to freeze it.  PyInstaller bundles whatever the script
+actually imports -- if a module is missing at dev time, it will be missing
+in the frozen app too.
+If you don't have Homebrew, install it first from https://brew.sh.
+
+WINDOWS ONLY
+------------
+Install Inno Setup 6 from:
+
+    https://jrsoftware.org/isdl.php
+
+The default install options are fine.
+
+
+================================================================================
+3. BUILD STEPS - macOS (.app bundle)
+================================================================================
+
+Step 1.  Open Terminal and change into the build directory:
+
+             cd ~/AstroPlannerDev/InstallerBuild
+
+Step 2.  Run PyInstaller against the spec file:
+
+             pyinstaller AstroPlannerBeta7.spec --clean --noconfirm
+
+         The --clean flag wipes PyInstaller's cache before building.
+         The --noconfirm flag skips the "remove old dist?" prompt.
+
+Step 3.  Verify the output:
+
+             ~/AstroPlannerDev/InstallerBuild/dist/Lightbucket Astro Planner.app
+
+         Double-click to launch, or drag into /Applications to install.
+
+         FIRST LAUNCH NOTE: Because the .app is unsigned, macOS Gatekeeper
+         will refuse to open it on the first try.  Workaround:
+            - Right-click (or Control-click) the app
+            - Choose "Open" from the context menu
+            - Click "Open" in the warning dialog
+         Subsequent launches work normally with a double-click.
+
+Step 4. Create a .dmg file for distribution:
+	Run the script: ./MakeDmgFile.sh
+
+	Output should be in: ~/AstroPlannerDev/InstallerBuild/installer/LightbucketAstroPlanner-0.7.0-beta.dmg
+
+
+================================================================================
+4. BUILD STEPS - Windows (.exe folder + installer)
+================================================================================
+
+Step 1.  Open Command Prompt (or PowerShell) and change into the build
+         directory:
+
+             cd %USERPROFILE%\AstroPlannerDev\InstallerBuild
+
+Step 2.  Run PyInstaller against the spec file:
+
+             pyinstaller AstroPlannerBeta7.spec --clean --noconfirm
+
+         Output:
+
+             ...\InstallerBuild\dist\AstroPlannerBeta7\AstroPlannerBeta7.exe
+
+         Sanity-check by double-clicking AstroPlannerBeta7.exe directly
+         from the dist folder -- it should launch the app.  If this works,
+         the freeze step is good.
+
+Step 3.  Build the installer in Inno Setup:
+
+             a) Launch "Inno Setup Compiler" from the Start menu.
+             b) File > Open > InstallerBuild\MakeSetupFile.iss
+             c) Press F9 (or Build > Compile).
+             d) Wait for the "Compile finished" message.
+
+         Output:
+
+             ...\InstallerBuild\installer\
+                 LightbucketAstroPlanner-0.7.0-beta-setup.exe
+
+Step 4.  Test the installer:
+
+             - Double-click the setup .exe (do NOT right-click > Run as
+               administrator -- the installer is configured for per-user
+               install and should not require elevation).
+             - Walk through the wizard, including the "Create a desktop
+               shortcut" checkbox.
+             - Verify:
+                 * App appears in Start Menu under
+                   "Lightbucket Astro Planner"
+                 * Desktop shortcut is created (if the box was checked)
+                 * Launching from either shortcut starts the app
+                 * Uninstall via Settings > Apps works cleanly
+
+
+================================================================================
+5. WHERE THINGS GET INSTALLED (Windows)
+================================================================================
+
+Per-user install paths (no admin required):
+
+    Application files:
+        %LOCALAPPDATA%\Programs\LightbucketAstroPlanner\
+
+    Start Menu shortcut:
+        %APPDATA%\Microsoft\Windows\Start Menu\Programs\
+            Lightbucket Astro Planner\
+
+    Desktop shortcut (if selected during install):
+        %USERPROFILE%\Desktop\Lightbucket Astro Planner.lnk
+
+    User data folder (created by the app on first run):
+        %LOCALAPPDATA%\LightbucketAstroPlanner\
+
+
+================================================================================
+6. TROUBLESHOOTING
+================================================================================
+
+PROBLEM: PyInstaller fails with "ModuleNotFoundError" at build time.
+SOLUTION: The module is not installed in the Python environment running
+         PyInstaller.  Install it with pip and rebuild.
+
+PROBLEM: The frozen app launches but crashes silently or shows a missing
+         module error at runtime.
+SOLUTION: PyInstaller failed to detect a dynamically imported module.  Add
+         it to the hiddenimports list in AstroPlannerBeta7.spec, e.g.:
+
+             hiddenimports=['some_missing_module'],
+
+         Then rebuild with --clean.
+
+PROBLEM: Logo does not appear in the header bar of the running app.
+SOLUTION: Confirm logo.png exists in ~/AstroPlannerDev/ before building.
+         The spec only bundles it if present.
+
+PROBLEM: Inno Setup compile fails with "File not found: ..\logo.ico".
+SOLUTION: Confirm logo.ico exists in ~/AstroPlannerDev/ (one level up from
+         the InstallerBuild folder).
+
+PROBLEM: Installer reports an "access denied" or similar error when the
+         "Create desktop shortcut" box is checked.
+SOLUTION: This was the original beta-test bug.  Confirm MakeSetupFile.iss
+         uses {autodesktop} (NOT {commondesktop}) on the desktop-shortcut
+         line in the [Icons] section.
+
+
+================================================================================
+END OF BUILD INSTRUCTIONS
+================================================================================
