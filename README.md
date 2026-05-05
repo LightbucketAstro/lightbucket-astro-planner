@@ -43,7 +43,7 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
 <table>
   <tr>
     <td width="50%">
-      <img src="docs/screenshots/planner-m101-galaxy.png" alt="Planner tab showing Bode's Galaxy analysis with FOV preview and altitude chart">
+      <img src="docs/screenshots/planner-bodes-galaxy.png" alt="Planner tab showing Bode's Galaxy analysis with FOV preview and altitude chart">
       <p align="center"><sub><b>Planner</b> — target analysis with framing, exposure recommendation, and the night's altitude track</sub></p>
     </td>
     <td width="50%">
@@ -73,7 +73,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 ## Installation
 
-> **A note on code signing.** The beta builds are **not currently signed** by
+> **A note on code signing.** The builds are **not currently signed** by
 > Apple or Microsoft. Both operating systems will warn you the first time you
 > run the app. The steps below show you how to bypass those warnings for an
 > unsigned build — this is a one-time action per install.
@@ -83,7 +83,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon and Intel both
 supported.
 
-1. Download **`LightbucketAstroPlanner-0.7.0-beta.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.0.0.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -102,7 +102,7 @@ supported.
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-0.7.0-beta-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.0.0-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
