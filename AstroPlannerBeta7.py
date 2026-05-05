@@ -1,4 +1,4 @@
-"""
+."""
 Lightbucket Astro Planner — astrophotography planner.
 
 A Tkinter desktop application for planning deep-sky astrophotography sessions.
@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "0.7.0-beta"
+__version__ = "1.0.0"
 
 
 def _resource_path(relative):
@@ -2904,15 +2904,13 @@ class AstroApp:
         self._queue_cards_canvas.pack(side="left", fill="both", expand=True)
         self._queue_cards_scrollbar.pack(side="right", fill="y")
 
-        # Mousewheel scrolling
-        def _on_queue_mousewheel(event):
-            self._queue_cards_canvas.yview_scroll(
-                int(-1 * (event.delta / 120)), "units")
-        self._queue_cards_canvas.bind("<MouseWheel>", _on_queue_mousewheel)
-        self._queue_cards_canvas.bind("<Button-4>",
-            lambda e: self._queue_cards_canvas.yview_scroll(-1, "units"))
-        self._queue_cards_canvas.bind("<Button-5>",
-            lambda e: self._queue_cards_canvas.yview_scroll(1, "units"))
+        # Mousewheel scrolling — bind on the canvas AND the embedded inner
+        # frame.  Card widgets created later in _refresh_queue_tree get the
+        # same bindings recursively, because Tk routes MouseWheel events to
+        # the widget under the cursor; once cards fill the visible area the
+        # canvas itself never sees the wheel.
+        self._bind_queue_mousewheel(self._queue_cards_canvas)
+        self._bind_queue_mousewheel(self._queue_cards_inner)
 
         # Selection state for cards
         self._queue_card_selected = None  # index of selected card
@@ -2974,15 +2972,13 @@ class AstroApp:
         self._plan_cards_canvas.pack(side="left", fill="both", expand=True)
         self._plan_cards_scrollbar.pack(side="right", fill="y")
 
-        # Mousewheel scrolling
-        def _on_plan_mousewheel(event):
-            self._plan_cards_canvas.yview_scroll(
-                int(-1 * (event.delta / 120)), "units")
-        self._plan_cards_canvas.bind("<MouseWheel>", _on_plan_mousewheel)
-        self._plan_cards_canvas.bind("<Button-4>",
-            lambda e: self._plan_cards_canvas.yview_scroll(-1, "units"))
-        self._plan_cards_canvas.bind("<Button-5>",
-            lambda e: self._plan_cards_canvas.yview_scroll(1, "units"))
+        # Mousewheel scrolling — bind on the canvas AND the embedded inner
+        # frame.  Card widgets created later in _refresh_plan_view get the
+        # same bindings recursively, because Tk routes MouseWheel events to
+        # the widget under the cursor; once cards fill the visible area the
+        # canvas itself never sees the wheel.
+        self._bind_plan_mousewheel(self._plan_cards_canvas)
+        self._bind_plan_mousewheel(self._plan_cards_inner)
 
         # Card selection state
         self._plan_card_selected = None
@@ -3029,6 +3025,72 @@ class AstroApp:
                               command=self._export_nina)
         nina_btn.pack(side="left")
         ToolTip(nina_btn, "Export tonight's plan as a NINA target set\n(.ninaTargetSet) for import into N.I.N.A.\nEach target becomes a CaptureSequenceList\nwith its sub-exposure and sub-count filled in.")
+
+
+    def _bind_plan_mousewheel(self, widget):
+        """Bind mousewheel / Linux scroll-button events on a widget so the
+        wheel scrolls the Tonight's Plan card list.  Called on the canvas
+        and inner frame at setup time, and recursively on every card and
+        descendant in _refresh_plan_tree (cards absorb wheel events, so
+        each child needs its own binding for the wheel to keep working
+        once the list fills up).
+
+        Handles the cross-platform <MouseWheel> delta quirk: Windows reports
+        deltas as +/- 120 per notch; macOS reports tiny ints (often 1-3) per
+        event.  A naive `delta / 120` rounds to 0 on macOS and the wheel
+        never moves, which is why an earlier attempt at this fix appeared to
+        do nothing on Mac.
+        """
+        def _on_wheel(e):
+            if abs(e.delta) >= 120:
+                # Windows-style: one notch = 120
+                steps = int(-1 * (e.delta / 120))
+            elif e.delta:
+                # macOS-style: one event per tick, sign gives direction
+                steps = -1 if e.delta > 0 else 1
+            else:
+                steps = 0
+            if steps:
+                self._plan_cards_canvas.yview_scroll(steps, "units")
+        widget.bind("<MouseWheel>", _on_wheel)
+        widget.bind("<Button-4>",
+            lambda e: self._plan_cards_canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>",
+            lambda e: self._plan_cards_canvas.yview_scroll(1, "units"))
+
+    def _bind_plan_mousewheel_recursive(self, widget):
+        """Recursively apply _bind_plan_mousewheel to a widget and all of
+        its descendants."""
+        self._bind_plan_mousewheel(widget)
+        for child in widget.winfo_children():
+            self._bind_plan_mousewheel_recursive(child)
+
+    def _bind_queue_mousewheel(self, widget):
+        """Bind mousewheel / Linux scroll-button events on a widget so the
+        wheel scrolls the queue card list on the Targets List tab.  Mirrors
+        _bind_plan_mousewheel — see that method for the macOS delta quirk
+        explanation."""
+        def _on_wheel(e):
+            if abs(e.delta) >= 120:
+                steps = int(-1 * (e.delta / 120))
+            elif e.delta:
+                steps = -1 if e.delta > 0 else 1
+            else:
+                steps = 0
+            if steps:
+                self._queue_cards_canvas.yview_scroll(steps, "units")
+        widget.bind("<MouseWheel>", _on_wheel)
+        widget.bind("<Button-4>",
+            lambda e: self._queue_cards_canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>",
+            lambda e: self._queue_cards_canvas.yview_scroll(1, "units"))
+
+    def _bind_queue_mousewheel_recursive(self, widget):
+        """Recursively apply _bind_queue_mousewheel to a widget and all of
+        its descendants."""
+        self._bind_queue_mousewheel(widget)
+        for child in widget.winfo_children():
+            self._bind_queue_mousewheel_recursive(child)
 
 
     def setup_settings_tab(self):
@@ -3569,6 +3631,10 @@ class AstroApp:
                 _bind_all(child)
             for child in metrics.winfo_children():
                 _bind_all(child)
+
+            # Mousewheel bindings — must be applied to every descendant,
+            # otherwise the wheel stops working once cards cover the canvas.
+            self._bind_plan_mousewheel_recursive(card)
 
         # Restore selection
         if old_sel is not None and old_sel < len(self._plan_entries):
@@ -6851,6 +6917,10 @@ class AstroApp:
                 _bind_click(child)
             for child in metrics.winfo_children():
                 _bind_click(child)
+
+            # Mousewheel bindings — must be applied to every descendant,
+            # otherwise the wheel stops working once cards cover the canvas.
+            self._bind_queue_mousewheel_recursive(card)
 
         # Restore selection
         if old_sel is not None and old_sel < len(self._queue_entries):
