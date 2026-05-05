@@ -22,7 +22,7 @@ from pathlib import Path
 # SPECPATH is auto-defined by PyInstaller as the directory containing this
 # spec file.  The main script and assets live one level up.
 PROJECT_DIR = Path(SPECPATH).parent
-SCRIPT      = str(PROJECT_DIR / "AstroPlannerBeta7.py")
+SCRIPT      = str(PROJECT_DIR / "AstroPlanner.py")
 LOGO_PNG    = PROJECT_DIR / "logo.png"
 LOGO_ICO    = PROJECT_DIR / "logo.ico"
 LOGO_ICNS   = PROJECT_DIR / "logo.icns"
