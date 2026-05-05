@@ -43,7 +43,7 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
 <table>
   <tr>
     <td width="50%">
-      <img src="docs/screenshots/planner-bodes-galaxy.png" alt="Planner tab showing Bode's Galaxy analysis with FOV preview and altitude chart">
+      <img src="docs/screenshots/planner-m101-galaxy.png" alt="Planner tab showing Bode's Galaxy analysis with FOV preview and altitude chart">
       <p align="center"><sub><b>Planner</b> — target analysis with framing, exposure recommendation, and the night's altitude track</sub></p>
     </td>
     <td width="50%">
