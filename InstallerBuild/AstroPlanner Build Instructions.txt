@@ -110,7 +110,7 @@ Step 2.  Run PyInstaller against the spec file:
 
          Output:
 
-             ...\InstallerBuild\dist\AstroPlannerBeta7\AstroPlanner.exe
+             ...\InstallerBuild\dist\AstroPlanner\AstroPlanner.exe
 
          Sanity-check by double-clicking AstroPlanner.exe directly
          from the dist folder -- it should launch the app.  If this works,

@@ -13,7 +13,7 @@ SetupIconFile=..\logo.ico
 WizardStyle=modern
 
 [Files]
-Source: "dist\AstroPlannerBeta7\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
+Source: "dist\AstroPlanner\*"; DestDir: "{app}"; Flags: recursesubdirs createallsubdirs
 
 [Icons]
 Name: "{group}\Lightbucket Astro Planner"; Filename: "{app}\AstroPlanner.exe"
