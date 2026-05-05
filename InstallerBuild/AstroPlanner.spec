@@ -1,6 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
 """
-PyInstaller spec for Lightbucket Astro Planner (script: AstroPlannerBeta7.py).
+PyInstaller spec for Lightbucket Astro Planner (script: AstroPlanner.py).
 
 Project layout assumed:
     ~/AstroPlannerDev/
@@ -70,7 +70,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name="AstroPlannerBeta7",
+    name="AstroPlanner",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -91,12 +91,12 @@ coll = COLLECT(
     strip=False,
     upx=False,
     upx_exclude=[],
-    name="AstroPlannerBeta7",
+    name="AstroPlanner",
 )
 
 # macOS only: wrap the collected output in a proper .app bundle.  The
 # bundle name is the product name (what users see in Finder); the inner
-# launcher binary keeps the AstroPlannerBeta7 name from EXE() above.
+# launcher binary keeps the AstroPlanner name from EXE() above.
 if sys.platform == "darwin":
     app = BUNDLE(
         coll,
