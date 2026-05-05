@@ -1,4 +1,4 @@
-."""
+"""
 Lightbucket Astro Planner — astrophotography planner.
 
 A Tkinter desktop application for planning deep-sky astrophotography sessions.
