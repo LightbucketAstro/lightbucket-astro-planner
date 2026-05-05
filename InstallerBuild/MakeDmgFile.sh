@@ -18,7 +18,7 @@
 set -e
 
 APP_NAME="Lightbucket Astro Planner"
-APP_VERSION="0.7.0-beta"
+APP_VERSION="1.0.0"
 APP_PATH="dist/${APP_NAME}.app"
 OUTPUT_DIR="installer"
 DMG_NAME="LightbucketAstroPlanner-${APP_VERSION}.dmg"
@@ -30,7 +30,7 @@ VOLICON="../logo.icns"
 if [ ! -d "${APP_PATH}" ]; then
     echo "ERROR: ${APP_PATH} not found."
     echo "Build it first with:"
-    echo "    pyinstaller AstroPlannerBeta7.spec --clean --noconfirm"
+    echo "    pyinstaller AstroPlanner.spec --clean --noconfirm"
     exit 1
 fi
 

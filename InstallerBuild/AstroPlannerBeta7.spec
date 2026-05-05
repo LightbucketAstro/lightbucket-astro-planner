@@ -4,16 +4,16 @@ PyInstaller spec for Lightbucket Astro Planner (script: AstroPlannerBeta7.py).
 
 Project layout assumed:
     ~/AstroPlannerDev/
-        AstroPlannerBeta7.py          <- main script
+        AstroPlanner.py               <- main script
         logo.png                      <- runtime header logo
         logo.ico                      <- Windows window/app icon
         logo.icns                     <- macOS .app bundle icon
         InstallerBuild/
-            AstroPlannerBeta7.spec    <- THIS FILE
+            AstroPlanner.spec    <- THIS FILE
             (PyInstaller writes build/ and dist/ here)
 
 Build command (run from inside InstallerBuild/):
-    pyinstaller AstroPlannerBeta7.spec --clean --noconfirm
+    pyinstaller AstroPlanner.spec --clean --noconfirm
 """
 
 import sys
@@ -106,8 +106,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName":              "Lightbucket Astro Planner",
             "CFBundleDisplayName":       "Lightbucket Astro Planner",
-            "CFBundleShortVersionString": "0.7.0",
-            "CFBundleVersion":           "0.7.0",
+            "CFBundleShortVersionString": "1.0.0",
+            "CFBundleVersion":           "1.0.0",
             "NSHighResolutionCapable":   True,
         },
     )
