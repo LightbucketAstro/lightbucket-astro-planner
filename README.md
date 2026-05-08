@@ -80,8 +80,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 ### macOS
 
-**Requirements:** macOS 11 (Big Sur) or later. Apple Silicon and Intel both
-supported.
+**Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
 1. Download **`LightbucketAstroPlanner-1.0.0.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
