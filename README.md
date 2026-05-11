@@ -10,7 +10,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-blue)](#installation)
 [![License](https://img.shields.io/github/license/LightbucketAstro/lightbucket-astro-planner)](LICENSE)
 [![Free](https://img.shields.io/badge/price-free-brightgreen)](#)
-[![Downloads](https://img.shields.io/github/downloads/LightbucketAstro/lightbucket-astro-planner/v1.0.0/total)](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases)
+[![Downloads](https://img.shields.io/github/downloads/LightbucketAstro/lightbucket-astro-planner/v1.0.1/total)](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases)
 
 <img src="docs/demo.gif" alt="Lightbucket Astro Planner — animated demo" width="780">
 
@@ -82,7 +82,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.0.0.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.0.1.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -101,7 +101,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.0.0-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.0.1-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
