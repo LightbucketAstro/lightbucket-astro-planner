@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.0.1"
+__version__ = "1.0.2-dev"
 
 
 def _resource_path(relative):
