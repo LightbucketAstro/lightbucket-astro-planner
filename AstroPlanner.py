@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.0.1-Dev"
+__version__ = "1.0.1"
 
 
 def _resource_path(relative):
@@ -65,6 +65,47 @@ def _resource_path(relative):
     """
     base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent
     return Path(base) / relative
+
+
+def _macos_should_force_clam():
+    """Return True when the app should switch to the ``clam`` ttk theme on macOS.
+
+    The native macOS ``aqua`` theme draws Entry and Combobox fields using
+    AppKit, which ignores ``fieldbackground`` overrides and adapts the field
+    color to the OS appearance setting. In dark mode, that cooperates with
+    our white foreground — fields go dark, white text reads fine. In light
+    mode, the field stays white while our explicit ``foreground=#ffffff``
+    setting still applies, producing white-on-white text in every dropdown
+    and entry. Switching to ``clam`` (a pure-Python renderer) makes ttk
+    honor every color override, fixing the bug at the cost of the native
+    aqua look.
+
+    Detection runs ``defaults read -g AppleInterfaceStyle``: on macOS this
+    prints ``Dark`` in dark mode and exits with status 1 (key not found) in
+    light mode — the standard system signal. Returns True when light mode
+    is detected, False when dark mode is confirmed.
+
+    If detection fails (timeout, missing binary, unexpected error) we
+    return True and force clam anyway — losing the aqua look in dark mode
+    is a smaller cost than leaving the white-on-white bug in place for a
+    user whose detection happened to fail.
+
+    Always returns False on non-macOS platforms; callers handle Windows
+    and Linux separately.
+    """
+    if platform.system() != "Darwin":
+        return False
+    try:
+        result = subprocess.run(
+            ["defaults", "read", "-g", "AppleInterfaceStyle"],
+            capture_output=True, text=True, timeout=1.0,
+        )
+        # "Dark" in stdout => dark mode (keep aqua). Anything else
+        # (exit 1, empty stdout, unexpected value) => treat as light mode.
+        return "Dark" not in result.stdout
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        # Detection failed — fall back to forcing clam (safe default).
+        return True
 
 
 # --- SSL FIX ---
@@ -1894,7 +1935,14 @@ class AstroApp:
         # Switching to "clam" gives us a pure-Python renderer that respects every
         # style option we set — appearance and layout are unchanged; only the
         # colour plumbing now works correctly on Windows.
-        if platform.system() == "Windows":
+        #
+        # macOS has the same class of problem, but only in light mode: the
+        # native aqua theme adapts Entry/Combobox field colors to the OS
+        # appearance setting, so our white foreground sits unreadably on a
+        # white field. We detect that case at startup via
+        # _macos_should_force_clam() and switch to clam only when needed —
+        # macOS users in dark mode keep the native aqua look they're used to.
+        if platform.system() == "Windows" or _macos_should_force_clam():
             try:
                 style.theme_use("clam")
             except tk.TclError:
