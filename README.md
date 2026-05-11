@@ -10,7 +10,7 @@
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20%7C%20Windows-blue)](#installation)
 [![License](https://img.shields.io/github/license/LightbucketAstro/lightbucket-astro-planner)](LICENSE)
 [![Free](https://img.shields.io/badge/price-free-brightgreen)](#)
-[![Downloads](https://img.shields.io/github/downloads/LightbucketAstro/lightbucket-astro-planner/v1.0.1/total)](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases)
+[![Downloads](https://img.shields.io/github/downloads/LightbucketAstro/lightbucket-astro-planner/total)](https://github.com/LightbucketAstro/lightbucket-astro-planner/releases)
 
 <img src="docs/demo.gif" alt="Lightbucket Astro Planner — animated demo" width="780">
 
