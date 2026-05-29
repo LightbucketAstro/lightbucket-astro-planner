@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.0.2-dev"
+__version__ = "1.0.2"
 
 
 def _resource_path(relative):
@@ -279,7 +279,51 @@ FILTER_BADGE_COLORS = {
 # ═══════════════════════════════════════════════════════════════════════
 C_VALUE = 10
 NGC_URL = "https://raw.githubusercontent.com/mattiaverga/OpenNGC/master/database_files/NGC.csv"
+ADDENDUM_URL = "https://raw.githubusercontent.com/mattiaverga/OpenNGC/master/database_files/addendum.csv"
 MESSIER_XREF_URL = "http://www.messier.seds.org/m-cross.html"
+
+# Filename of the bundled Sharpless catalog (313 H II regions, derived from
+# VizieR VII/20 with B1900→J2000 precession applied).  Shipped as a data
+# file next to AstroPlanner.py and loaded at startup via _resource_path().
+SHARPLESS_CATALOG_FILE = "sharpless_catalog.csv"
+
+# Caldwell cross-reference table — maps each Caldwell number to its NGC/IC
+# designation as published by Patrick Moore in Sky & Telescope, Dec 1995.
+# The 4 Caldwell objects that are NOT in NGC/IC (C9 Cave/Sh2-155, C14 Double
+# Cluster, C41 Hyades, C99 Coalsack) are omitted here — they're supplied by
+# OpenNGC's addendum.csv where they live as Name="C009", "C014", "C041", "C099".
+# At load time we inject "Cnn" into the Common names field of the matching
+# NGC/IC row, so the existing alias system picks up Caldwell-number searches
+# the same way it handles Messier numbers.
+CALDWELL_TABLE = [
+    (  1, "NGC 188"),   (  2, "NGC 40"),    (  3, "NGC 4236"), (  4, "NGC 7023"),
+    (  5, "IC 342"),    (  6, "NGC 6543"),  (  7, "NGC 2403"), (  8, "NGC 559"),
+    ( 10, "NGC 663"),   ( 11, "NGC 7635"),  ( 12, "NGC 6946"), ( 13, "NGC 457"),
+    ( 15, "NGC 6826"),  ( 16, "NGC 7243"),  ( 17, "NGC 147"),  ( 18, "NGC 185"),
+    ( 19, "IC 5146"),   ( 20, "NGC 7000"),  ( 21, "NGC 4449"), ( 22, "NGC 7662"),
+    ( 23, "NGC 891"),   ( 24, "NGC 1275"),  ( 25, "NGC 2419"), ( 26, "NGC 4244"),
+    ( 27, "NGC 6888"),  ( 28, "NGC 752"),   ( 29, "NGC 5005"), ( 30, "NGC 7331"),
+    ( 31, "IC 405"),    ( 32, "NGC 4631"),  ( 33, "NGC 6992"), ( 34, "NGC 6960"),
+    ( 35, "NGC 4889"),  ( 36, "NGC 4559"),  ( 37, "NGC 6885"), ( 38, "NGC 4565"),
+    ( 39, "NGC 2392"),  ( 40, "NGC 3626"),  ( 42, "NGC 7006"), ( 43, "NGC 7814"),
+    ( 44, "NGC 7479"),  ( 45, "NGC 5248"),  ( 46, "NGC 2261"), ( 47, "NGC 6934"),
+    ( 48, "NGC 2775"),  ( 49, "NGC 2237"),  ( 50, "NGC 2244"), ( 51, "IC 1613"),
+    ( 52, "NGC 4697"),  ( 53, "NGC 3115"),  ( 54, "NGC 2506"), ( 55, "NGC 7009"),
+    ( 56, "NGC 246"),   ( 57, "NGC 6822"),  ( 58, "NGC 2360"), ( 59, "NGC 3242"),
+    ( 60, "NGC 4038"),  ( 61, "NGC 4039"),  ( 62, "NGC 247"),  ( 63, "NGC 7293"),
+    ( 64, "NGC 2362"),  ( 65, "NGC 253"),   ( 66, "NGC 5694"), ( 67, "NGC 1097"),
+    ( 68, "NGC 6729"),  ( 69, "NGC 6302"),  ( 70, "NGC 300"),  ( 71, "NGC 2477"),
+    ( 72, "NGC 55"),    ( 73, "NGC 1851"),  ( 74, "NGC 3132"), ( 75, "NGC 6124"),
+    ( 76, "NGC 6231"),  ( 77, "NGC 5128"),  ( 78, "NGC 6541"), ( 79, "NGC 3201"),
+    ( 80, "NGC 5139"),  ( 81, "NGC 6352"),  ( 82, "NGC 6193"), ( 83, "NGC 4945"),
+    ( 84, "NGC 5286"),  ( 85, "IC 2391"),   ( 86, "NGC 6397"), ( 87, "NGC 1261"),
+    ( 88, "NGC 5823"),  ( 89, "NGC 6087"),  ( 90, "NGC 2867"), ( 91, "NGC 3532"),
+    ( 92, "NGC 3372"),  ( 93, "NGC 6752"),  ( 94, "NGC 4755"), ( 95, "NGC 6025"),
+    ( 96, "NGC 2516"),  ( 97, "NGC 3766"),  ( 98, "NGC 4609"), (100, "IC 2944"),
+    (101, "NGC 6744"),  (102, "IC 2602"),   (103, "NGC 2070"), (104, "NGC 362"),
+    (105, "NGC 4833"),  (106, "NGC 104"),   (107, "NGC 6101"), (108, "NGC 4372"),
+    (109, "NGC 3195"),
+]
 
 BORTLE_FACTORS = {
     "1 (Excellent)": {"mono": 1.0, "color": 0.33},
@@ -295,10 +339,18 @@ BORTLE_FACTORS = {
 
 # Seasonal recommendations mapping
 SEASONAL_TARGETS = {
-    "Winter": ["M42", "M45", "NGC 2244", "M1", "IC 434", "NGC 2024", "M35", "NGC 2264", "M78", "NGC 1499"],
-    "Spring": ["M81", "M82", "M51", "M101", "M63", "M104", "M64", "NGC 4565", "M87", "NGC 4631"],
-    "Summer": ["M8", "M20", "M16", "M17", "M27", "M57", "NGC 6960", "NGC 7000", "IC 1396", "M31"],
-    "Autumn": ["M31", "M33", "NGC 7293", "NGC 253", "M52", "NGC 7331", "NGC 891", "M74", "NGC 7635", "NGC 281"]
+    "Winter": ["M42", "M45", "NGC 2244", "M1", "IC 434", "NGC 2024", "M35", "NGC 2264", "M78", "NGC 1499",
+               # Caldwell + Sharpless additions
+               "C41", "C46", "Sh2-240", "Sh2-264", "Sh2-308"],
+    "Spring": ["M81", "M82", "M51", "M101", "M63", "M104", "M64", "NGC 4565", "M87", "NGC 4631",
+               # Caldwell + Sharpless additions (Sharpless is sparse in spring — Milky Way out of frame)
+               "C53", "C77", "C7"],
+    "Summer": ["M8", "M20", "M16", "M17", "M27", "M57", "NGC 6960", "NGC 7000", "IC 1396", "M31",
+               # Caldwell + Sharpless additions
+               "C27", "C33", "Sh2-101", "Sh2-129"],
+    "Autumn": ["M31", "M33", "NGC 7293", "NGC 253", "M52", "NGC 7331", "NGC 891", "M74", "NGC 7635", "NGC 281",
+               # Caldwell + Sharpless additions
+               "C22", "C9", "Sh2-155", "Sh2-157"]
 }
 
 # NGC type → human-readable category
@@ -930,6 +982,7 @@ class AstroApp:
         
         self.data_path = self.get_data_path()
         self.catalog_path = self.data_path.parent / "ngc_catalog.csv"
+        self.addendum_path = self.data_path.parent / "ngc_addendum.csv"
 
         # ── Crash logging ────────────────────────────────────────────────
         # When packaged with --windowed (no console), uncaught exceptions
@@ -958,6 +1011,21 @@ class AstroApp:
         self.searchable_names = []
         self.current_target_info = None  
         self.auto_update_enabled = _saved_settings.get("auto_update", False)
+
+        # Catalog filter state — controls which catalogs are searched.
+        # 'Other' covers addendum extras (PGC, ESO, Mel, Barnard, MWSC, HCG,
+        # UGC, etc. — ~58 entries that don't carry an NGC/IC/M/C/Sh tag).
+        # Persisted to disk; restored each launch.
+        self.catalog_filter = _saved_settings.get("catalog_filter") or {
+            "NGC": True, "IC": True, "Messier": True,
+            "Caldwell": True, "Sharpless": True, "Other": True,
+        }
+        # Forward-compatibility normaliser: older saved settings may lack
+        # newer keys (e.g. 'Other' added later). Default any missing key
+        # to True so the user sees everything until they explicitly filter.
+        for _cat in ("NGC", "IC", "Messier", "Caldwell", "Sharpless", "Other"):
+            self.catalog_filter.setdefault(_cat, True)
+        self._catalog_filter_popup = None
 
         # State shared between analyze_framing and the integration planner
         self._last_exp_s    = None   # most recent recommended sub-exposure (seconds)
@@ -1135,7 +1203,7 @@ class AstroApp:
     def show_welcome_message(self):
         """Pop up the first-run welcome message directing the user to Manage Equipment."""
         messagebox.showinfo("Welcome!", 
-            "Welcome to Lightbucket Astro Planner (Beta)!\n\n"
+            "Welcome to Lightbucket Astro Planner!\n\n"
             "Your inventory is currently empty. Add at least one camera and "
             "one telescope on this tab to get started, then switch to the "
             "Planner tab to begin planning a session.\n\n"
@@ -1415,7 +1483,15 @@ class AstroApp:
         self.root.report_callback_exception = _tk_hook
 
     def ensure_catalog_exists(self):
-        """Download the NGC catalog if missing, else fall back to the built-in Messier list."""
+        """Download the NGC catalog if missing, else fall back to the built-in Messier list.
+
+        Also downloads the OpenNGC addendum (small file containing notable
+        objects outside NGC/IC — supplies C9/C14/C41/C99 plus M40 and the
+        Pleiades).  During the same one-time download pass, Messier AND
+        Caldwell cross-references are written into the main NGC.csv's
+        Common-names column so the existing alias system surfaces them
+        automatically on every subsequent load.
+        """
         if not self.catalog_path.exists():
             # ── Try to download the full NGC catalog ──────────────────────────
             try:
@@ -1426,6 +1502,14 @@ class AstroApp:
                 xref_matches = re.findall(r'M\s*(\d+).*?(NGC|IC)\s*(\d+)', html, re.DOTALL | re.IGNORECASE)
                 messier_map = {f"{c.upper()}{int(n)}": f"M{m}" for m, c, n in xref_matches}
 
+                # Caldwell xref map: same lookup-key shape as messier_map.
+                # Keys look like "NGC188" or "IC342", values like "C1".
+                caldwell_map = {}
+                for c_num, ref in CALDWELL_TABLE:
+                    m = re.match(r'([A-Z]+)\s*(\d+)', ref.upper())
+                    if m:
+                        caldwell_map[f"{m.group(1)}{int(m.group(2))}"] = f"C{c_num}"
+
                 updated_rows = []
                 with open(self.catalog_path, 'r', encoding='utf-8-sig') as f:
                     reader = csv.DictReader(f, delimiter=';')
@@ -1435,11 +1519,23 @@ class AstroApp:
                         if match:
                             cat_type, cat_num = match.groups()
                             lookup_key = f"{cat_type}{int(cat_num)}"
+                            existing_common = row.get('Common names', '').strip()
+                            existing_upper = existing_common.upper()
+
+                            # Inject Messier designation if applicable
                             if lookup_key in messier_map:
                                 m_designation = messier_map[lookup_key]
-                                existing_common = row.get('Common names', '').strip()
-                                if m_designation.upper() not in existing_common.upper():
-                                    row['Common names'] = f"{existing_common}{'; ' if existing_common else ''}{m_designation}"
+                                if m_designation.upper() not in existing_upper:
+                                    existing_common = f"{existing_common}{'; ' if existing_common else ''}{m_designation}"
+                                    existing_upper = existing_common.upper()
+
+                            # Inject Caldwell designation if applicable
+                            if lookup_key in caldwell_map:
+                                c_designation = caldwell_map[lookup_key]
+                                if c_designation.upper() not in existing_upper:
+                                    existing_common = f"{existing_common}{'; ' if existing_common else ''}{c_designation}"
+
+                            row['Common names'] = existing_common
                         updated_rows.append(row)
 
                 with open(self.catalog_path, 'w', encoding='utf-8', newline='') as f:
@@ -1467,6 +1563,19 @@ class AstroApp:
                     "loaded so you can still plan sessions.\n\n"
                     "Connect to the internet and restart the app to download "
                     "the full 13,000-object NGC/IC catalog.")
+
+        # ── Try to download the OpenNGC addendum (small, ~16 KB) ──────────
+        # Failure is non-fatal: only 64 objects involved, and the only
+        # observably-missing Caldwell entries without it are C9/C14/C41/C99.
+        if not self.addendum_path.exists():
+            try:
+                urllib.request.urlretrieve(ADDENDUM_URL, self.addendum_path)
+            except Exception:
+                # Silent — the rest of the catalog still works fine without it.
+                try:
+                    self.addendum_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
         self.load_target_catalog()
 
@@ -2680,7 +2789,20 @@ class AstroApp:
 
         # ── Full-width search entry ──────────────────────────────────────
         self.target_search = ttk.Entry(search_row, width=50, font=("Helvetica", 12))
-        self.target_search.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.target_search.pack(side="left", fill="x", expand=True, padx=(0, 4))
+
+        # ── Catalog filter button ────────────────────────────────────────
+        # Small icon-only button next to the search entry that opens a popup
+        # with checkboxes for NGC / IC / Messier / Caldwell / Sharpless / Other.
+        # Shows a dot indicator when any catalog is filtered out.
+        self._catalog_filter_btn = ttk.Button(
+            search_row, text="▽",
+            command=self._toggle_catalog_filter_popup,
+            width=3)
+        self._catalog_filter_btn.pack(side="left", padx=(0, 8))
+        ToolTip(self._catalog_filter_btn,
+                "Limit the search and suggestion popup to\nspecific catalogs (NGC, IC, Messier,\nCaldwell, Sharpless).")
+        self._update_catalog_filter_btn_label()
 
         # ── Floating suggestion popup (replaces fixed Listbox) ───────────
         self._suggestion_popup = None
@@ -3253,16 +3375,16 @@ class AstroApp:
         data_grid = ttk.Frame(data_card)
         data_grid.pack(fill="x", padx=8, pady=4)
 
-        # NINA filter import
-        ttk.Label(data_grid, text="NINA filter import:").grid(
+        # NINA profile import
+        ttk.Label(data_grid, text="NINA profile import:").grid(
             row=0, column=0, padx=4, pady=4, sticky="w")
-        ttk.Button(data_grid, text="Import Filter Names",
-                   command=self._import_nina_filters).grid(
+        ttk.Button(data_grid, text="Import NINA Profile",
+                   command=self._import_nina_profile).grid(
             row=0, column=1, padx=4, pady=4, sticky="w")
-        self._settings_nina_status = ttk.Label(data_grid, text="",
+        self._settings_nina_profile_status = ttk.Label(data_grid, text="",
             font=("Helvetica", 9), foreground="#556677")
-        self._settings_nina_status.grid(row=0, column=2, padx=(8, 4), pady=4, sticky="w")
-        self._update_nina_filter_status()
+        self._settings_nina_profile_status.grid(row=0, column=2, padx=(8, 4), pady=4, sticky="w")
+        self._update_nina_profile_status()
 
         # Catalog re-download
         ttk.Label(data_grid, text="NGC/IC catalog:").grid(
@@ -3377,16 +3499,39 @@ class AstroApp:
             self.catalog_path.unlink(missing_ok=True)
         except Exception:
             pass
+        try:
+            self.addendum_path.unlink(missing_ok=True)
+        except Exception:
+            pass
         self.ensure_catalog_exists()
         self._update_catalog_status()
 
     def _update_catalog_status(self):
-        """Update the catalog status label in the settings panel."""
+        """Update the catalog status label in the settings panel.
+
+        Shows a per-catalog breakdown when the catalog is loaded — e.g.
+        "✓ Catalog loaded (14,300 objects)
+            8,026 NGC · 5,566 IC · 109 Messier · 109 Caldwell · 313 Sharpless"
+        """
         if hasattr(self, '_settings_catalog_status'):
             count = len(self.targets) if self.targets else 0
             if count > 0:
-                self._settings_catalog_status.config(
-                    text=f"✓ Catalog loaded ({count:,} objects)", foreground="#4caf50")
+                counts = self._count_targets_by_catalog()
+                # Build breakdown line — only show catalogs with non-zero counts
+                # so a fallback-only load (110 Messier objects, nothing else)
+                # doesn't show a wall of zeros.
+                segments = []
+                for cat in ("NGC", "IC", "Messier", "Caldwell", "Sharpless"):
+                    if counts.get(cat, 0):
+                        segments.append(f"{counts[cat]:,} {cat}")
+                # Total unique objects (deduped by id) — usually a few hundred
+                # less than len(self.targets) because of regex-alias keys.
+                seen_ids = {t.get("id") for t in self.targets.values() if t.get("id")}
+                unique = len(seen_ids)
+                header = f"✓ Catalog loaded ({unique:,} objects)"
+                breakdown = "   " + "  ·  ".join(segments) if segments else ""
+                full = f"{header}\n{breakdown}" if breakdown else header
+                self._settings_catalog_status.config(text=full, foreground="#4caf50")
             elif self.catalog_path.exists():
                 self._settings_catalog_status.config(
                     text="Catalog file present (loading…)", foreground="#f59e0b")
@@ -3401,16 +3546,26 @@ class AstroApp:
         self._cached_dss_survey_deg = None
         messagebox.showinfo("Cache Cleared", "DSS image cache has been cleared.")
 
-    def _update_nina_filter_status(self):
-        """Update the NINA filter status label in the settings panel."""
-        if not hasattr(self, '_settings_nina_status'):
+    def _update_nina_profile_status(self):
+        """Update the NINA profile status label in the settings panel.
+
+        Shows the imported filter configuration (LRGB / narrowband + bandwidth)
+        and, when present, the most recently imported telescope.  Scope info is
+        read from ``nina_filters['scope']`` — a small breadcrumb dropped by the
+        importer so we can report it here without keeping an entirely separate
+        ``nina_profile`` block in the JSON.
+        """
+        if not hasattr(self, '_settings_nina_profile_status'):
             return
         nf = self.data.get("nina_filters", {})
         imported_date = nf.get("imported_date")
         lrgb = nf.get("lrgb")
         nb = nf.get("narrowband")
-        if imported_date or lrgb or nb:
+        scope = nf.get("scope")  # {"name": ..., ...} or None — written by importer
+        if imported_date or lrgb or nb or scope:
             parts = []
+            if scope and scope.get("name"):
+                parts.append(f"Scope: {scope['name']}")
             if lrgb:
                 parts.append(f"LRGB: {', '.join(lrgb)}")
             if nb:
@@ -3419,13 +3574,13 @@ class AstroApp:
                 parts.append(f"NB: {', '.join(nb)}{bw_str}")
             filter_list = "  ·  ".join(parts) if parts else ""
             date_str = imported_date or "unknown date"
-            self._settings_nina_status.config(
-                text=f"✓ Filter configuration updated {date_str}" +
+            self._settings_nina_profile_status.config(
+                text=f"✓ Profile imported {date_str}" +
                      (f"\n   {filter_list}" if filter_list else ""),
                 foreground="#4caf50")
         else:
-            self._settings_nina_status.config(
-                text="No filters imported yet",
+            self._settings_nina_profile_status.config(
+                text="No profile imported yet",
                 foreground="#556677")
 
     def _refresh_settings_display(self):
@@ -3435,7 +3590,7 @@ class AstroApp:
         settings frame, fixing the blank-tab issue on macOS.
         """
         self._update_catalog_status()
-        self._update_nina_filter_status()
+        self._update_nina_profile_status()
         # Reload saved location into the fields
         saved_lat, saved_lon = self._get_saved_location()
         if saved_lat is not None:
@@ -4633,7 +4788,7 @@ class AstroApp:
         self._theme_popup(popup)
 
     # ═══════════════════════════════════════════════════════════════════
-    # INTEGRATION PLAN & NINA FILTER IMPORT
+    # INTEGRATION PLAN & NINA PROFILE IMPORT
     # ═══════════════════════════════════════════════════════════════════
 
     def _rf_for_filter_mode(self, mode):
@@ -4803,9 +4958,17 @@ class AstroApp:
         """Return True if the filter name looks like a narrowband filter."""
         return name.strip().upper() in AstroApp._NARROWBAND_NAMES
 
-    def _import_nina_filters(self):
-        """Open a NINA .profile file, extract filter names, optionally ask for
-        narrowband bandwidth, then display a confirmation dialog."""
+    def _import_nina_profile(self):
+        """Open a NINA .profile file, extract the filter wheel definitions and
+        the configured telescope, then present a unified diff confirmation
+        dialog before persisting either.
+
+        The scope is read from ``<TelescopeSettings>``.  NINA does not store
+        aperture, so we compute it from ``FocalLength / FocalRatio``.  If the
+        scope name is blank or either numeric value is zero/missing we treat
+        the profile as having no scope configured and skip it silently — only
+        the filters are imported in that case.
+        """
 
         # ── 1. File picker ────────────────────────────────────────────────────
         default_dir = ""
@@ -4823,7 +4986,7 @@ class AstroApp:
         if not path:
             return
 
-        # ── 2. Parse XML ──────────────────────────────────────────────────────
+        # ── 2. Read file ──────────────────────────────────────────────────────
         try:
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 content = fh.read()
@@ -4832,28 +4995,59 @@ class AstroApp:
             return
 
         import re
+
+        # ── 3. Parse FilterWheelSettings → filter names ──────────────────────
         fw_match = re.search(
             r'<FilterWheelSettings\b.*?</FilterWheelSettings>', content, re.DOTALL
         )
         search_text = fw_match.group() if fw_match else content
         filters = re.findall(r'<a:_name>(.*?)</a:_name>', search_text)
 
-        if not filters:
+        # ── 4. Parse TelescopeSettings → scope_info | None ───────────────────
+        # NINA always emits the <TelescopeSettings> block even when no scope
+        # is configured.  We treat a blank Name or non-positive FL/FR as "no
+        # scope" and skip it — only filters get imported in that case.
+        scope_info = None
+        ts_match = re.search(
+            r'<TelescopeSettings\b.*?</TelescopeSettings>', content, re.DOTALL
+        )
+        if ts_match:
+            ts = ts_match.group()
+            name_m = re.search(r'<Name>([^<]*)</Name>', ts)
+            fl_m   = re.search(r'<FocalLength>([^<]*)</FocalLength>', ts)
+            fr_m   = re.search(r'<FocalRatio>([^<]*)</FocalRatio>', ts)
+            nm = name_m.group(1).strip() if name_m else ""
+            try:
+                fl = float(fl_m.group(1)) if fl_m and fl_m.group(1).strip() else 0.0
+            except (ValueError, TypeError):
+                fl = 0.0
+            try:
+                fr = float(fr_m.group(1)) if fr_m and fr_m.group(1).strip() else 0.0
+            except (ValueError, TypeError):
+                fr = 0.0
+            if nm and fl > 0 and fr > 0:
+                scope_info = {
+                    "name":          nm,
+                    "focal_length":  fl,    # mm
+                    "focal_ratio":   fr,
+                    "aperture":      fl / fr,   # mm — derived
+                }
+
+        if not filters and scope_info is None:
             messagebox.showinfo(
-                "No Filters Found",
-                "No filter definitions were found in the selected profile.\n\n"
-                "Make sure the file is a valid NINA .profile that includes "
-                "a configured filter wheel."
+                "Nothing to Import",
+                "No filter definitions or telescope settings were found in "
+                "the selected profile.\n\n"
+                "Make sure the file is a valid NINA .profile."
             )
             return
 
-        # ── 3. Check for narrowband filters ───────────────────────────────────
-        nb_filters   = [f for f in filters if self._is_narrowband(f)]
+        # ── 5. Bandwidth prompt for narrowband filters ───────────────────────
+        nb_filters    = [f for f in filters if self._is_narrowband(f)]
         broad_filters = [f for f in filters if not self._is_narrowband(f)]
-        chosen_bw    = None   # will be set to e.g. "7" if narrowband present
+        chosen_bw     = None
 
         if nb_filters:
-            # Show a small bandwidth-prompt dialog (modal, blocks until answered)
             bw_dlg = tk.Toplevel(self.root)
             bw_dlg.title("Narrowband Filter Bandwidth")
             bw_dlg.resizable(False, False)
@@ -4881,7 +5075,7 @@ class AstroApp:
                              font=("Helvetica", 9), foreground="#aaaaaa")
             hint.pack(padx=24, pady=(0, 12))
 
-            _bw_result = [None]   # container so inner function can write to it
+            _bw_result = [None]
 
             def _bw_ok():
                 raw = bw_var.get().strip()
@@ -4906,15 +5100,14 @@ class AstroApp:
             bw_dlg.bind("<Escape>", lambda e: _bw_cancel())
             self._theme_popup(bw_dlg)
 
-            bw_dlg.wait_window()   # block until the bandwidth dialog is closed
+            bw_dlg.wait_window()
 
             if _bw_result[0] is None:
                 return  # user cancelled bandwidth prompt → abort entire import
 
             chosen_bw = _bw_result[0]
 
-        # ── 4. Build display labels (apply bandwidth to narrowband filters) ───
-        # Strip trailing ".0" so "7.0" → "7"
+        # ── 6. Build display labels for narrowband filters ───────────────────
         def _fmt_bw(val):
             try:
                 return str(int(float(val))) if float(val) == int(float(val)) else val
@@ -4923,61 +5116,209 @@ class AstroApp:
 
         bw_display = _fmt_bw(chosen_bw) if chosen_bw else None
 
-        display_names = []
-        for f in filters:
-            if self._is_narrowband(f) and bw_display:
-                display_names.append(f"{f}  ({bw_display} nm)")
+        # ── 7. Compute scope diff state (NEW / UPDATE / MATCH) ───────────────
+        # Used by the dialog row + the success summary at the end.  MATCH means
+        # the profile's scope is byte-for-byte identical to what we already
+        # have in inventory — we still display it (so the user sees the import
+        # was processed) but in muted grey, and the badge says EXISTS.
+        scope_state = None
+        scope_prev  = None
+        if scope_info is not None:
+            existing = self.data.get("scopes", {}).get(scope_info["name"])
+            if existing is None:
+                scope_state = "NEW"
             else:
-                display_names.append(f)
+                ex_ap = existing.get("aperture")
+                ex_fl = existing.get("native_fl")
+                ex_fr = existing.get("native_f_ratio")
+                identical = (
+                    ex_ap is not None and abs(ex_ap - scope_info["aperture"])    < 0.01 and
+                    ex_fl is not None and abs(ex_fl - scope_info["focal_length"]) < 0.01 and
+                    ex_fr is not None and abs(ex_fr - scope_info["focal_ratio"])  < 0.01
+                )
+                scope_state = "MATCH" if identical else "UPDATE"
+                if scope_state == "UPDATE":
+                    scope_prev = {"aperture": ex_ap, "native_fl": ex_fl,
+                                  "native_f_ratio": ex_fr}
 
-        # ── 5. Results + confirmation dialog ─────────────────────────────────
+        # ── 7b. Compute per-filter diff state (NEW / UPDATE / MATCH) ─────────
+        # Compares each incoming filter against the existing nina_filters
+        # block.  MATCH = same name (and, for narrowband, same bandwidth) is
+        # already in inventory.  UPDATE = narrowband filter name is already
+        # in inventory but the bandwidth differs — we show the old bandwidth
+        # inline on the row.  NEW = filter wasn't in inventory before.
+        existing_nf       = self.data.get("nina_filters", {}) or {}
+        existing_lrgb_set = set(existing_nf.get("lrgb")       or [])
+        existing_nb_set   = set(existing_nf.get("narrowband") or [])
+        existing_bw       = existing_nf.get("bandwidth_nm")
+
+        def _bw_match(a, b):
+            """Compare two bandwidths tolerantly (handles None and float dust)."""
+            if a is None or b is None:
+                return False
+            try:
+                return abs(float(a) - float(b)) < 0.01
+            except (ValueError, TypeError):
+                return False
+
+        new_bw_val = float(chosen_bw) if chosen_bw is not None else None
+
+        def _filter_state(name, is_nb):
+            if is_nb:
+                if name in existing_nb_set:
+                    return "MATCH" if _bw_match(new_bw_val, existing_bw) else "UPDATE"
+                return "NEW"
+            return "MATCH" if name in existing_lrgb_set else "NEW"
+
+        def _fmt_bw_simple(val):
+            """Format a bandwidth float as '5' or '7.5' (no trailing .0)."""
+            try:
+                v = float(val)
+                return str(int(v)) if v == int(v) else f"{v:g}"
+            except (ValueError, TypeError):
+                return str(val)
+
+        # ── 8. Build the unified diff dialog ─────────────────────────────────
+        # Palette (matches the rest of the app in day mode; falls back to the
+        # night-mode red theme via the manual-color path below).
+        if self.night_mode:
+            DLG_BG     = "#1a0000"
+            LIST_BG    = "#0d0000"
+            HEAD_FG    = "#ff7878"
+            BODY_FG    = "#ffb0b0"
+            MUTED_FG   = "#a06060"
+            SEP_COL    = "#3a0000"
+            NB_FG      = "#ffa060"
+            SCOPE_FG   = "#ff8080"
+        else:
+            DLG_BG     = "#1e2d3e"
+            LIST_BG    = "#131f2e"
+            HEAD_FG    = "#ffffff"
+            BODY_FG    = "#e2e8f0"
+            MUTED_FG   = "#94a3b8"
+            SEP_COL    = "#2e4a63"
+            NB_FG      = "#f0c060"
+            SCOPE_FG   = "#7eb8d4"
+
+        # State-badge colors — same in both modes; readable on the row bg
+        BADGE = {
+            "NEW":    ("#4ade80", "#062e1a"),
+            "UPDATE": ("#fbbf24", "#3a2a08"),
+            "MATCH":  ("#94a3b8", "#202833"),
+        }
+
         dlg = tk.Toplevel(self.root)
-        dlg.title("NINA Filters Found")
+        dlg.title("NINA Profile Import")
+        dlg.configure(bg=DLG_BG)
         dlg.resizable(False, False)
         dlg.grab_set()
 
-        ttk.Label(dlg, text=f"Found {len(filters)} filter(s) in profile:",
-                  font=("Helvetica", 11, "bold")).pack(padx=20, pady=(16, 6))
+        body = tk.Frame(dlg, bg=DLG_BG)
+        body.pack(padx=18, pady=14, fill="both", expand=True)
 
-        list_frame = ttk.Frame(dlg)
-        list_frame.pack(padx=20, pady=4, fill="both", expand=True)
+        # Header row — title + item count
+        item_total = (1 if scope_info else 0) + len(filters)
+        head = tk.Frame(body, bg=DLG_BG)
+        head.pack(fill="x", pady=(0, 8))
+        tk.Label(head, text="NINA Profile Import", bg=DLG_BG, fg=HEAD_FG,
+                 font=("Helvetica", 13, "bold")).pack(side="left")
+        tk.Label(head, text=f"{item_total} item{'s' if item_total != 1 else ''}",
+                 bg=DLG_BG, fg=MUTED_FG,
+                 font=("Helvetica", 9)).pack(side="right")
 
-        lb = tk.Listbox(list_frame, height=min(len(display_names), 12),
-                        selectmode=tk.BROWSE,
-                        font=("Helvetica", 11),
-                        bg="#1e2d3e", fg="#ffffff",
-                        selectbackground="#3a6186", selectforeground="#ffffff",
-                        relief="flat", borderwidth=1)
-        lb.pack(side="left", fill="both", expand=True)
+        # List container (no ttk — we need exact bg control for the rows)
+        list_outer = tk.Frame(body, bg=LIST_BG, padx=6, pady=4)
+        list_outer.pack(fill="both", expand=True)
 
-        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
-        sb.pack(side="right", fill="y")
-        lb.configure(yscrollcommand=sb.set)
+        def _add_row(icon, icon_color, name_text, detail_text, badge,
+                     name_color=None, detail_color=None, is_last=False):
+            """Build a single row inside list_outer."""
+            row = tk.Frame(list_outer, bg=LIST_BG)
+            row.pack(fill="x", pady=(2, 2))
 
-        NB_COLOR  = "#f0c060"   # warm amber — narrowband rows
-        STD_COLOR = "#ffffff"   # white — broadband rows
-        for name, display in zip(filters, display_names):
-            lb.insert(tk.END, f"  {display}")
-            color = NB_COLOR if self._is_narrowband(name) else STD_COLOR
-            lb.itemconfig(tk.END, fg=color)
+            # icon column (fixed width)
+            tk.Label(row, text=icon, bg=LIST_BG, fg=icon_color,
+                     width=2, font=("Helvetica", 11, "bold")).pack(side="left", padx=(2, 6))
 
-        note = ttk.Label(dlg,
-                         text="Profile: " + os.path.basename(path),
-                         font=("Helvetica", 9), foreground="#aaaaaa")
-        note.pack(padx=20, pady=(6, 2))
+            # badge column (fixed) — packed BEFORE the expanding text column
+            # so it gets its full width before the text column claims the rest
+            if badge:
+                fg, bg = BADGE.get(badge, BADGE["NEW"])
+                tk.Label(row, text=f" {badge} ", bg=bg, fg=fg,
+                         font=("Helvetica", 8, "bold"),
+                         padx=4, pady=1).pack(side="right", padx=(6, 4))
 
-        if nb_filters:
-            ttk.Label(dlg,
-                      text=f"★ Narrowband filters shown in amber  •  bandwidth: {bw_display} nm",
-                      font=("Helvetica", 9), foreground=NB_COLOR).pack(padx=20, pady=(0, 6))
+            # name + detail column (expanding)
+            text_col = tk.Frame(row, bg=LIST_BG)
+            text_col.pack(side="left", fill="x", expand=True)
+            tk.Label(text_col, text=name_text, bg=LIST_BG,
+                     fg=name_color or BODY_FG,
+                     font=("Helvetica", 11), anchor="w").pack(anchor="w", fill="x")
+            if detail_text:
+                tk.Label(text_col, text=detail_text, bg=LIST_BG,
+                         fg=detail_color or MUTED_FG,
+                         font=("Helvetica", 9), anchor="w").pack(anchor="w", fill="x")
 
-        sep = ttk.Separator(dlg, orient="horizontal")
-        sep.pack(fill="x", padx=20, pady=(4, 0))
+            # row separator (skip after the last row)
+            if not is_last:
+                tk.Frame(list_outer, bg=SEP_COL, height=1).pack(fill="x")
 
-        confirm_label = ttk.Label(dlg,
-                                  text="Import these filters into Lightbucket Astro Planner?",
-                                  font=("Helvetica", 11, "bold"))
-        confirm_label.pack(padx=20, pady=(10, 4))
+        # Build row list — scope first, then filters
+        rows_total = (1 if scope_info else 0) + len(filters)
+        rows_drawn = 0
+
+        if scope_info is not None:
+            rows_drawn += 1
+            ap = scope_info["aperture"]
+            fl = scope_info["focal_length"]
+            fr = scope_info["focal_ratio"]
+            detail = f"{ap:.0f} mm aperture · {fl:.0f} mm FL · f/{fr:.1f}"
+            if scope_state == "UPDATE" and scope_prev:
+                detail += (f"   (was {scope_prev['aperture']:.0f} mm · "
+                           f"{scope_prev['native_fl']:.0f} mm · "
+                           f"f/{scope_prev['native_f_ratio']:.1f})")
+            _add_row(
+                icon="🔭", icon_color=SCOPE_FG,
+                name_text=scope_info["name"],
+                detail_text=detail,
+                badge=scope_state,
+                name_color=HEAD_FG,
+                is_last=(rows_drawn == rows_total),
+            )
+
+        for f in filters:
+            rows_drawn += 1
+            is_nb = self._is_narrowband(f)
+            if is_nb and bw_display:
+                name_text = f"{f}  ({bw_display} nm)"
+            else:
+                name_text = f
+            f_state = _filter_state(f, is_nb)
+            # On UPDATE (narrowband bandwidth change) note the previous value
+            f_detail = ""
+            if f_state == "UPDATE" and existing_bw is not None:
+                f_detail = f"previously {_fmt_bw_simple(existing_bw)} nm"
+            _add_row(
+                icon=("★" if is_nb else "✦"),
+                icon_color=(NB_FG if is_nb else MUTED_FG),
+                name_text=name_text, detail_text=f_detail,
+                badge=f_state,
+                name_color=(NB_FG if is_nb else BODY_FG),
+                is_last=(rows_drawn == rows_total),
+            )
+
+        # Profile filename footer
+        tk.Label(body, text="Profile: " + os.path.basename(path),
+                 bg=DLG_BG, fg=MUTED_FG,
+                 font=("Helvetica", 9)).pack(anchor="w", pady=(8, 0))
+
+        # Optional informational line if a scope was found but is identical
+        # to what's already in inventory (so the user understands the no-op).
+        if scope_state == "MATCH":
+            tk.Label(body,
+                     text="Scope already in inventory — no change needed.",
+                     bg=DLG_BG, fg=MUTED_FG,
+                     font=("Helvetica", 9, "italic")).pack(anchor="w", pady=(2, 0))
 
         # ── classify the raw filter names into lrgb / narrowband buckets ─────
         lrgb_names = [f for f in filters if not self._is_narrowband(f)]
@@ -4994,16 +5335,51 @@ class AstroApp:
                 except (TypeError, ValueError):
                     pass
 
-            # Persist into data store
-            self.data["nina_filters"] = {
-                "lrgb":         lrgb_names  or None,
-                "narrowband":   nb_names    or None,
-                "bandwidth_nm": float(chosen_bw) if chosen_bw is not None else None,
-                "imported_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            }
+            # 1) Persist the scope first (if any) so the inventory refresh below
+            #    picks it up.  We do NOT touch the active scope selection —
+            #    the user keeps whatever was selected before the import.
+            scope_written = False
+            if scope_info is not None and scope_state in ("NEW", "UPDATE"):
+                self.data.setdefault("scopes", {})[scope_info["name"]] = {
+                    "aperture":       scope_info["aperture"],
+                    "native_fl":      scope_info["focal_length"],
+                    "native_f_ratio": scope_info["focal_ratio"],
+                }
+                scope_written = True
+
+            # 2) Persist filters.  Always overwrites the previous nina_filters
+            #    block — that's the historical behavior.  We also stash a
+            #    scope summary inside the same block so the Settings status
+            #    label can report it without a separate JSON section.
+            scope_breadcrumb = None
+            if scope_info is not None:
+                scope_breadcrumb = {
+                    "name":         scope_info["name"],
+                    "aperture":     scope_info["aperture"],
+                    "focal_length": scope_info["focal_length"],
+                    "focal_ratio":  scope_info["focal_ratio"],
+                }
+
+            if filters:
+                self.data["nina_filters"] = {
+                    "lrgb":          lrgb_names  or None,
+                    "narrowband":    nb_names    or None,
+                    "bandwidth_nm":  float(chosen_bw) if chosen_bw is not None else None,
+                    "imported_date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "scope":         scope_breadcrumb,
+                }
+            elif scope_breadcrumb is not None:
+                # No filters in profile but we still want the scope reported
+                # in the Settings status — merge into whatever's there now.
+                nf = self.data.setdefault("nina_filters", {})
+                nf["scope"]         = scope_breadcrumb
+                nf["imported_date"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+
             self._persist_data()
 
-            # Refresh the filter dropdown so the imported bandwidth appears
+            # 3) Refresh UI — inventory tables pick up the new scope, dropdowns
+            #    pick up the new filter bandwidth entry.
+            self.refresh_inventory_tables()
             self.refresh_dropdowns()
 
             # If a narrowband bandwidth was specified, select it in the dropdown
@@ -5011,26 +5387,40 @@ class AstroApp:
                 self.filter_mode.set(nb_mode)
 
             # Update the settings panel status label
-            self._update_nina_filter_status()
+            self._update_nina_profile_status()
 
             dlg.destroy()
-            nb_summary = f", narrowband bandwidth: {bw_display} nm" if nb_names and bw_display else ""
-            lrgb_summary = f"LRGB: {', '.join(lrgb_names)}" if lrgb_names else ""
-            nb_name_summary = f"Narrowband: {', '.join(nb_names)}" if nb_names else ""
-            parts = [p for p in [lrgb_summary, nb_name_summary] if p]
+
+            # Build the success summary
+            parts = []
+            if scope_written:
+                verb = "Updated" if scope_state == "UPDATE" else "Added"
+                parts.append(
+                    f"{verb} scope: {scope_info['name']} "
+                    f"({scope_info['aperture']:.0f} mm · "
+                    f"{scope_info['focal_length']:.0f} mm FL · "
+                    f"f/{scope_info['focal_ratio']:.1f})"
+                )
+            elif scope_info is not None and scope_state == "MATCH":
+                parts.append(f"Scope unchanged: {scope_info['name']}")
+            if lrgb_names:
+                parts.append(f"LRGB filters: {', '.join(lrgb_names)}")
+            if nb_names:
+                bw_note = f" @ {bw_display} nm" if bw_display else ""
+                parts.append(f"Narrowband filters: {', '.join(nb_names)}{bw_note}")
+
             messagebox.showinfo(
-                "Filters Imported",
-                f"Successfully imported {len(filters)} filter(s):\n\n"
-                + "\n".join(parts)
-                + (f"\n\nNarrowband bandwidth set to {bw_display} nm." if nb_names and bw_display else "")
+                "Profile Imported",
+                "Import complete.\n\n" + "\n\n".join(parts)
             )
 
-        btn_row = ttk.Frame(dlg)
-        btn_row.pack(pady=(4, 16))
-        ttk.Button(btn_row, text="Import",  command=_do_import).pack(side="left", padx=6)
-        ttk.Button(btn_row, text="Cancel",  command=dlg.destroy).pack(side="left", padx=6)
-
-        self._theme_popup(dlg)
+        # Action buttons — right-aligned
+        btn_row = tk.Frame(body, bg=DLG_BG)
+        btn_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btn_row, text="Import all", command=_do_import).pack(side="right")
+        dlg.bind("<Return>", lambda e: _do_import())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
 
     # ═══════════════════════════════════════════════════════════════════
     # ANALYSIS PLUMBING (deferred/dirty-flag dispatch)
@@ -6342,73 +6732,157 @@ class AstroApp:
     # CATALOG LOADER
     # ═══════════════════════════════════════════════════════════════════
 
-    def load_target_catalog(self):
-        """Read the NGC/IC CSV into self.targets, self.common_names_map, self.searchable_names.
+    def _identify_catalogs(self, name, common):
+        """Return the set of catalog tags a target belongs to.
 
-        Populates three parallel structures:
+        Used during catalog load to pre-tag each entry so the suggestion popup
+        and filter logic don't have to re-derive this on every render. Tags
+        used elsewhere in the UI: 'NGC', 'IC', 'Messier', 'Caldwell',
+        'Sharpless', 'Other'.
+
+        Detection rules:
+          NGC/IC/Sharpless — primary name starts with the catalog prefix.
+          Messier/Caldwell — primary name OR any common-name alias matches
+                             the M<n> / C<n> shape. (Most M/C designations
+                             live in the Common names field as aliases on
+                             the corresponding NGC/IC row.)
+        """
+        cats = set()
+        n = (name or "").upper().strip()
+        if n.startswith("NGC"):
+            cats.add("NGC")
+        if n.startswith("IC"):
+            cats.add("IC")
+        if n.startswith("SH2-"):
+            cats.add("Sharpless")
+        # Addendum-form primary names like 'M040' or 'C009'
+        if re.match(r"^M\d+$", n):
+            cats.add("Messier")
+        if re.match(r"^C\d{1,3}$", n):
+            cats.add("Caldwell")
+        # Common-names aliases (e.g. "Andromeda Galaxy; M31; C..." )
+        for token in re.split(r"[;,]", (common or "").upper()):
+            token = token.strip()
+            if re.match(r"^M\s*\d+$", token):
+                cats.add("Messier")
+            elif re.match(r"^C\s*\d{1,3}$", token):
+                cats.add("Caldwell")
+        if not cats:
+            cats.add("Other")
+        return cats
+
+    def load_target_catalog(self):
+        """Read the NGC/IC CSV plus addendum and bundled Sharpless into the catalog dicts.
+
+        Populates three parallel structures from up to three CSV files:
           targets          — keyed by compact catalog ID (e.g. 'NGC224')
           common_names_map — keyed by uppercase common name (e.g. 'ANDROMEDAGALAXY')
           searchable_names — sorted list used by the suggestion popup
 
-        Silently returns on any I/O or parse error so startup can still complete;
-        _update_catalog_status() will then display a warning in the Settings panel.
+        Sources, all using the same 32-column OpenNGC schema:
+          1. self.catalog_path           — NGC + IC (~14,000 entries, downloaded)
+          2. self.addendum_path          — non-NGC/IC notable objects (~64 entries,
+                                            downloaded; supplies C9/C14/C41/C99,
+                                            M40, M45, etc.)
+          3. SHARPLESS_CATALOG_FILE      — 313 H II regions (bundled with the app)
+
+        Each source is optional: missing files are silently skipped so a
+        partial / offline install still works.  Silently swallows I/O and
+        parse errors so startup can still complete; _update_catalog_status()
+        will then display a warning in the Settings panel.
         """
         self.targets, self.common_names_map, self.searchable_names = {}, {}, []
-        try:
-            with open(self.catalog_path, 'r', encoding='utf-8-sig') as f:
-                reader = csv.DictReader(f, delimiter=';')
-                if reader.fieldnames:
-                    reader.fieldnames = [n.strip().lower() for n in reader.fieldnames]
-                for row in reader:
-                    name = row.get('name', '').strip().upper()
-                    if not name:
-                        continue
-                    ra_deg  = self._parse_ra(row.get('ra', '') or '')
-                    dec_deg = self._parse_dec(row.get('dec', '') or '')
-                    obj_type_raw = row.get('type', '').strip()
-                    obj_category = NGC_TYPE_CATEGORIES.get(obj_type_raw, "Other")
-                    def _try_float(val):
-                        """Coerce val to float, returning None for empty/invalid input."""
-                        try:
-                            return float(val) if val and str(val).strip() else None
-                        except (ValueError, TypeError):
-                            return None
-                    info = {
-                        "id": name,
-                        "common": row.get('common names', ''),
-                        "size_maj": float(row.get('majax') or 0),
-                        "size_min": float(row.get('minax') or 0),
-                        "ra_deg": ra_deg,
-                        "dec_deg": dec_deg,
-                        "obj_type": obj_category,
-                        "v_mag": _try_float(row.get('v-mag') or row.get('vmag') or ''),
-                        "surf_br": _try_float(row.get('surfbr') or row.get('surf_br') or ''),
-                    }
-                    self.targets[name.replace(" ", "")] = info
-                    self.searchable_names.append(name)
-                    match = re.match(r'([A-Z]+)\s*(\d+)', name)
-                    if match:
-                        self.targets[f"{match.group(1)}{int(match.group(2))}"] = info
-                    if info["common"]:
-                        for n in re.split(';|,', info["common"]):
-                            c = n.strip().upper()
-                            compact = c.replace(" ", "")
-                            if c:
-                                if c not in self.searchable_names:
-                                    self.searchable_names.append(c)
-                                self.common_names_map[compact] = info
-                                if compact.startswith('M') and compact[1:].isdigit():
-                                    norm = f"M{int(compact[1:])}"
-                                    self.common_names_map[norm] = info
-                                    if norm not in self.searchable_names:
-                                        self.searchable_names.append(norm)
-            self.searchable_names = sorted(list(set(self.searchable_names)))
-        except (OSError, csv.Error, UnicodeDecodeError, ValueError, KeyError):
-            # Missing, unreadable, or malformed catalog CSV — leave self.targets empty;
-            # the Settings panel will surface a warning via _update_catalog_status().
-            pass
+
+        # Build list of sources to ingest in priority order. Later sources
+        # cannot overwrite an earlier source's primary key (we check with
+        # `setdefault`-style logic), which keeps NGC.csv canonical.
+        sources = [self.catalog_path, self.addendum_path]
+        bundled_sharpless = _resource_path(SHARPLESS_CATALOG_FILE)
+        if bundled_sharpless.exists():
+            sources.append(bundled_sharpless)
+
+        for src in sources:
+            try:
+                if not src.exists():
+                    continue
+                self._ingest_catalog_csv(src)
+            except (OSError, csv.Error, UnicodeDecodeError, ValueError, KeyError):
+                # Missing, unreadable, or malformed CSV — keep going; remaining
+                # sources may still load successfully.
+                pass
+
+        self.searchable_names = sorted(list(set(self.searchable_names)))
         # Update settings panel status if it exists
         self._update_catalog_status()
+
+    def _ingest_catalog_csv(self, path):
+        """Parse one OpenNGC-schema CSV and merge its rows into the catalog dicts.
+
+        Used by load_target_catalog() to handle the main NGC.csv, the
+        addendum.csv, and the bundled Sharpless catalog through a single
+        shared code path.  All three files use the same 32-column schema.
+        """
+        with open(path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f, delimiter=';')
+            if reader.fieldnames:
+                reader.fieldnames = [n.strip().lower() for n in reader.fieldnames]
+            for row in reader:
+                name = row.get('name', '').strip().upper()
+                if not name:
+                    continue
+                ra_deg  = self._parse_ra(row.get('ra', '') or '')
+                dec_deg = self._parse_dec(row.get('dec', '') or '')
+                obj_type_raw = row.get('type', '').strip()
+                obj_category = NGC_TYPE_CATEGORIES.get(obj_type_raw, "Other")
+                def _try_float(val):
+                    """Coerce val to float, returning None for empty/invalid input."""
+                    try:
+                        return float(val) if val and str(val).strip() else None
+                    except (ValueError, TypeError):
+                        return None
+                info = {
+                    "id": name,
+                    "common": row.get('common names', ''),
+                    "size_maj": float(row.get('majax') or 0),
+                    "size_min": float(row.get('minax') or 0),
+                    "ra_deg": ra_deg,
+                    "dec_deg": dec_deg,
+                    "obj_type": obj_category,
+                    "v_mag": _try_float(row.get('v-mag') or row.get('vmag') or ''),
+                    "surf_br": _try_float(row.get('surfbr') or row.get('surf_br') or ''),
+                }
+                # Tag with catalog memberships for the search filter + badges.
+                info["catalogs"] = self._identify_catalogs(name, info["common"])
+                # Don't let later sources overwrite earlier primary keys
+                # (NGC.csv wins over addendum wins over Sharpless).
+                primary_key = name.replace(" ", "")
+                if primary_key not in self.targets:
+                    self.targets[primary_key] = info
+                self.searchable_names.append(name)
+                match = re.match(r'([A-Z]+)\s*(\d+)', name)
+                if match:
+                    alias_key = f"{match.group(1)}{int(match.group(2))}"
+                    if alias_key not in self.targets:
+                        self.targets[alias_key] = info
+                if info["common"]:
+                    for n in re.split(';|,', info["common"]):
+                        c = n.strip().upper()
+                        compact = c.replace(" ", "")
+                        if c:
+                            if c not in self.searchable_names:
+                                self.searchable_names.append(c)
+                            self.common_names_map[compact] = info
+                            if compact.startswith('M') and compact[1:].isdigit():
+                                norm = f"M{int(compact[1:])}"
+                                self.common_names_map[norm] = info
+                                if norm not in self.searchable_names:
+                                    self.searchable_names.append(norm)
+                            # Same normalization for Caldwell ("C09" → "C9")
+                            elif compact.startswith('C') and compact[1:].isdigit():
+                                norm = f"C{int(compact[1:])}"
+                                self.common_names_map[norm] = info
+                                if norm not in self.searchable_names:
+                                    self.searchable_names.append(norm)
 
     # ═══════════════════════════════════════════════════════════════════
     # TAB CHANGE & MISC UI HELPERS
@@ -7908,13 +8382,19 @@ class AstroApp:
         self._update_floating_suggestions()
 
     def _update_floating_suggestions(self):
-        """Build and show/hide the floating suggestion popup below the search entry."""
+        """Build and show/hide the floating suggestion popup below the search entry.
+
+        Respects self.catalog_filter — targets whose `catalogs` set has no
+        overlap with the user's enabled catalogs are excluded from results.
+        """
         typed = self.target_search.get().upper().replace(" ", "")
         if not typed:
             self._hide_suggestions()
             return
         if typed.startswith('M') and typed[1:].isdigit():
             typed = f"M{int(typed[1:])}"
+
+        enabled = {c for c, on in self.catalog_filter.items() if on}
 
         matches = []
         for name in self.searchable_names:
@@ -7923,6 +8403,13 @@ class AstroApp:
                 lkp = f"M{int(clean[1:])}" if clean.startswith('M') and clean[1:].isdigit() else clean
                 t = self.targets.get(lkp) or self.common_names_map.get(lkp)
                 if t and t not in [m[1] for m in matches]:
+                    # Catalog filter: include only when the target's catalog
+                    # tags have at least one entry in the user's enabled set.
+                    # No "rides along" exception — if the user unchecks
+                    # everything except Messier, only Messier entries show.
+                    t_cats = t.get("catalogs") or {"Other"}
+                    if not (t_cats & enabled):
+                        continue
                     display = f"{t['id']}  —  {t['common'].split(';')[0].strip()}" if t['common'] else t['id']
                     matches.append((display, t))
             if len(matches) >= 12:
@@ -7949,7 +8436,9 @@ class AstroApp:
         self.target_search.update_idletasks()
         x = self.target_search.winfo_rootx()
         y = self.target_search.winfo_rooty() + self.target_search.winfo_height()
-        w = self.target_search.winfo_width() + 80  # extend a bit wider for type badges
+        # Extra width: ~80px for type badge + magnitude, plus ~100px for the
+        # catalog badges that can appear (Messier/Caldwell/NGC/IC/Sharpless)
+        w = self.target_search.winfo_width() + 180
 
         popup.wm_geometry(f"{w}x{min(len(matches) * 28 + 4, 340)}+{x}+{y}")
         popup.configure(bg="#1e2d3e")
@@ -7962,6 +8451,23 @@ class AstroApp:
             "Nebula": "#8bc34a", "Planetary Nebula": "#8bc34a",
             "Galaxy": "#64b5f6", "Open Cluster": "#ce93d8",
             "Globular Cluster": "#ce93d8", "Other": "#778899",
+        }
+        # Per-catalog badge colors (fg / bg pairs). Picked to read well on
+        # the dark popup chrome and to be distinct from the type badge palette.
+        CATALOG_COLORS = {
+            "NGC":      ("#aed0ed", "#1d4972"),
+            "IC":       ("#9fd8c7", "#1d6258"),
+            "Messier":  ("#fad29a", "#8a5a18"),
+            "Caldwell": ("#d6c5ef", "#5d3b8a"),
+            "Sharpless":("#efb6a0", "#8c4528"),
+        }
+        # Show badges in a stable order so multi-catalog targets read consistently
+        # (e.g. M31 always shows M then NGC; never NGC then M one row, M then NGC the next).
+        CATALOG_ORDER = ["Messier", "Caldwell", "NGC", "IC", "Sharpless"]
+        # Short labels for the badges (saves horizontal space in the popup)
+        CATALOG_LABELS = {
+            "NGC": "NGC", "IC": "IC", "Messier": "M",
+            "Caldwell": "C", "Sharpless": "Sh2",
         }
 
         for i, (display, t) in enumerate(matches):
@@ -7993,9 +8499,24 @@ class AstroApp:
                                  font=("Helvetica", 8), padx=6, pady=1)
             type_lbl.pack(side="right", padx=(0, 4))
 
+            # Catalog badges (small, between name and type badge).
+            # Pack right-to-left so they appear in CATALOG_ORDER reading
+            # left-to-right against the type badge.
+            cats = t.get("catalogs") or set()
+            cat_widgets = []
+            for cat in reversed(CATALOG_ORDER):
+                if cat in cats:
+                    fg, bgc = CATALOG_COLORS[cat]
+                    cat_lbl = tk.Label(row, text=CATALOG_LABELS[cat],
+                                        bg=bgc, fg=fg,
+                                        font=("Helvetica", 8, "bold"),
+                                        padx=4, pady=1)
+                    cat_lbl.pack(side="right", padx=(0, 3))
+                    cat_widgets.append(cat_lbl)
+
             # Click binding — bind to all sub-widgets
             target_id = t['id']
-            for widget in (row, name_lbl, type_lbl):
+            for widget in (row, name_lbl, type_lbl, *cat_widgets):
                 widget.bind("<Button-1>", lambda e, tid=target_id: self._select_suggestion(tid))
             if mag_str:
                 mag_lbl.bind("<Button-1>", lambda e, tid=target_id: self._select_suggestion(tid))
@@ -8013,6 +8534,292 @@ class AstroApp:
         if self._suggestion_popup and self._suggestion_popup.winfo_exists():
             self._suggestion_popup.destroy()
         self._suggestion_popup = None
+
+    # ─────────────────────────────────────────────────────────────────────
+    # CATALOG FILTER POPUP
+    # ─────────────────────────────────────────────────────────────────────
+    def _update_catalog_filter_btn_label(self):
+        """Refresh the catalog filter button's label to reflect current state.
+
+        Shows just the funnel icon "▽" when every catalog is enabled,
+        and "▽•" (with a small dot indicator) when any catalog is filtered
+        out. Stays compact and unobtrusive next to the search entry.
+        """
+        if not hasattr(self, "_catalog_filter_btn"):
+            return
+        total = len(self.catalog_filter) if self.catalog_filter else 6
+        on = sum(1 for v in (self.catalog_filter or {}).values() if v)
+        if on == total:
+            self._catalog_filter_btn.config(text="▽")
+        else:
+            self._catalog_filter_btn.config(text="▽•")
+
+    def _toggle_catalog_filter_popup(self):
+        """Show or hide the catalog filter checkbox popup."""
+        if self._catalog_filter_popup and self._catalog_filter_popup.winfo_exists():
+            self._catalog_filter_popup.destroy()
+            self._catalog_filter_popup = None
+            return
+        self._show_catalog_filter_popup()
+
+    def _show_catalog_filter_popup(self):
+        """Show the catalog filter checkbox popup beneath the filter button.
+
+        Five checkboxes (NGC / IC / Messier / Caldwell / Sharpless / Other),
+        each with the live entry count for that catalog. Toggling immediately
+        re-runs the suggestion popup, persists the choice to disk, and
+        updates the button label.
+
+        Dismissal: click anywhere outside the popup, click the filter
+        button again, or press Escape.
+
+        Implementation note: we use an embedded tk.Frame placed with .place()
+        instead of a Toplevel + wm_overrideredirect. On macOS, two
+        overrideredirect Toplevels (this popup and the filter button's
+        tooltip) fight over z-order in non-fullscreen mode, causing the
+        popup to disappear when the mouse moves toward it. An embedded
+        Frame is just a normal widget inside the main window so none of
+        the Toplevel window-server quirks apply.
+        """
+        # Close any prior instance
+        if self._catalog_filter_popup and self._catalog_filter_popup.winfo_exists():
+            self._close_catalog_filter_popup()
+
+        # Embedded Frame, parented to root so it can overlay any tab content
+        # ── Pick the right palette for the current theme ─────────────────
+        # Hardcoded colors here (rather than the DAY_*/NIGHT_* module
+        # constants) because the popup uses several intermediate shades
+        # that aren't named in the global palette.
+        nm = getattr(self, "night_mode", False)
+        bg_panel    = "#2a0000" if nm else "#1e2d3e"   # popup body + rows
+        bg_active   = "#330000" if nm else "#263545"   # checkbox hover/active
+        border_col  = "#882222" if nm else "#2e4a63"   # popup outline
+        fg_primary  = "#cc0000" if nm else "#cbd9e5"   # checkbox text
+        fg_dim      = "#882222" if nm else "#6a8aa8"   # header, links, counts
+        fg_muted    = "#552222" if nm else "#445566"   # center dot separator
+
+        popup = tk.Frame(self.root, bg=bg_panel,
+                          highlightthickness=1, highlightbackground=border_col)
+        self._catalog_filter_popup = popup
+
+        # Position via place() using absolute coords *relative to root*.
+        # rootx/rooty are screen coords; subtract root's own screen origin
+        # to get coords within the root window.
+        self.root.update_idletasks()
+        self._catalog_filter_btn.update_idletasks()
+        btn_x = self._catalog_filter_btn.winfo_rootx() - self.root.winfo_rootx()
+        btn_y = self._catalog_filter_btn.winfo_rooty() - self.root.winfo_rooty()
+        btn_h = self._catalog_filter_btn.winfo_height()
+        popup.place(x=btn_x, y=btn_y + btn_h + 2, width=220, height=245)
+        popup.lift()  # ensure it overlays sibling widgets
+
+        # Header row: section label on the left, "All" / "None" quick-action
+        # mini-buttons on the right. The mini-buttons are styled as small
+        # underlined labels (link aesthetic) rather than ttk.Buttons so they
+        # don't dominate the popup chrome.
+        header = tk.Frame(popup, bg=bg_panel)
+        header.pack(fill="x", padx=10, pady=(8, 4))
+
+        tk.Label(header, text="LIMIT SEARCH TO",
+                 bg=bg_panel, fg=fg_dim,
+                 font=("Helvetica", 8, "bold")).pack(side="left")
+
+        # 'None' on far right; 'All' just left of it. Hover brightens to
+        # signal interactivity (color flip handled in _bind_link_hover).
+        none_lbl = tk.Label(header, text="None",
+                             bg=bg_panel, fg=fg_dim,
+                             font=("Helvetica", 8, "underline"),
+                             cursor="hand2")
+        none_lbl.pack(side="right")
+        none_lbl.bind("<Button-1>", lambda e: self._set_all_catalog_filters(False))
+        self._bind_link_hover(none_lbl, normal=fg_dim, hover=fg_primary)
+
+        tk.Label(header, text="·", bg=bg_panel, fg=fg_muted,
+                 font=("Helvetica", 8)).pack(side="right", padx=5)
+
+        all_lbl = tk.Label(header, text="All",
+                            bg=bg_panel, fg=fg_dim,
+                            font=("Helvetica", 8, "underline"),
+                            cursor="hand2")
+        all_lbl.pack(side="right")
+        all_lbl.bind("<Button-1>", lambda e: self._set_all_catalog_filters(True))
+        self._bind_link_hover(all_lbl, normal=fg_dim, hover=fg_primary)
+
+        # Pre-compute live counts so users see catalog sizes alongside the toggle
+        counts = self._count_targets_by_catalog()
+
+        cat_order = ["NGC", "IC", "Messier", "Caldwell", "Sharpless", "Other"]
+        self._catalog_filter_vars = {}
+        for cat in cat_order:
+            row = tk.Frame(popup, bg=bg_panel, cursor="hand2")
+            row.pack(fill="x", padx=4, pady=1)
+
+            var = tk.BooleanVar(value=self.catalog_filter.get(cat, True))
+            self._catalog_filter_vars[cat] = var
+
+            # Native Checkbutton with theme-aware styling
+            cb = tk.Checkbutton(
+                row, text=cat, variable=var,
+                bg=bg_panel, fg=fg_primary, selectcolor=bg_panel,
+                activebackground=bg_active, activeforeground=fg_primary,
+                font=("Helvetica", 11), anchor="w", padx=4,
+                command=lambda c=cat: self._on_catalog_filter_change(c))
+            cb.pack(side="left", padx=(4, 0))
+
+            count = counts.get(cat, 0)
+            count_lbl = tk.Label(row, text=f"{count:,}",
+                                  bg=bg_panel, fg=fg_dim,
+                                  font=("Helvetica", 9))
+            count_lbl.pack(side="right", padx=(0, 10))
+
+        # ── Dismissal: click outside the popup ───────────────────────────
+        # Bind on root with add="+" so any existing handlers still fire.
+        # The handler checks whether the click landed inside the popup or
+        # on the filter button itself; if not, it closes.
+        self._popup_click_binding = self.root.bind(
+            "<Button-1>", self._maybe_close_catalog_filter_popup, add="+")
+
+        # Escape closes too (keyboard users). Frames don't capture keyboard
+        # focus the way Toplevels do, so bind on root with the same guard
+        # pattern — the binding gets removed when the popup is dismissed.
+        self._popup_escape_binding = self.root.bind(
+            "<Escape>", lambda e: self._close_catalog_filter_popup(), add="+")
+
+    def _maybe_close_catalog_filter_popup(self, event):
+        """Close the filter popup if the click landed outside its bounds.
+
+        Bound to root <Button-1>. Tkinter dispatches the click to the most
+        specific widget first (e.g. a checkbox inside the popup, which
+        toggles itself), and the event then propagates up to root. By the
+        time this handler runs the checkbox interaction is already done,
+        so we just need to decide whether to dismiss.
+        """
+        popup = self._catalog_filter_popup
+        if not popup or not popup.winfo_exists():
+            return
+
+        # Was the click inside the popup? Then keep it open.
+        px = popup.winfo_rootx()
+        py = popup.winfo_rooty()
+        pw = popup.winfo_width()
+        ph = popup.winfo_height()
+        if px <= event.x_root <= px + pw and py <= event.y_root <= py + ph:
+            return
+
+        # Was the click on the filter button itself? Let _toggle_catalog_filter_popup
+        # handle it — that path also closes us. Avoid a double-close race.
+        if hasattr(self, "_catalog_filter_btn"):
+            btn = self._catalog_filter_btn
+            bx = btn.winfo_rootx()
+            by = btn.winfo_rooty()
+            bw = btn.winfo_width()
+            bh = btn.winfo_height()
+            if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
+                return
+
+        self._close_catalog_filter_popup()
+
+    def _close_catalog_filter_popup(self):
+        """Tear down the filter popup and remove its root-level bindings."""
+        # Remove the root click handler we installed when the popup opened
+        if getattr(self, "_popup_click_binding", None):
+            try:
+                self.root.unbind("<Button-1>", self._popup_click_binding)
+            except (tk.TclError, AttributeError):
+                pass
+            self._popup_click_binding = None
+        # And the Escape handler
+        if getattr(self, "_popup_escape_binding", None):
+            try:
+                self.root.unbind("<Escape>", self._popup_escape_binding)
+            except (tk.TclError, AttributeError):
+                pass
+            self._popup_escape_binding = None
+        if self._catalog_filter_popup and self._catalog_filter_popup.winfo_exists():
+            self._catalog_filter_popup.destroy()
+        self._catalog_filter_popup = None
+
+    def _on_catalog_filter_change(self, catalog):
+        """User toggled a catalog checkbox — persist + re-run suggestions."""
+        if hasattr(self, "_catalog_filter_vars") and catalog in self._catalog_filter_vars:
+            self.catalog_filter[catalog] = self._catalog_filter_vars[catalog].get()
+        # Persist to settings so the choice survives restart
+        self.data.setdefault("settings", {})["catalog_filter"] = dict(self.catalog_filter)
+        try:
+            self.save_data()
+        except Exception:
+            pass
+        # Refresh button label and the suggestion popup
+        self._update_catalog_filter_btn_label()
+        if self.target_search.get().strip():
+            self._update_floating_suggestions()
+
+    def _set_all_catalog_filters(self, value):
+        """Set every catalog filter to value (True for All, False for None).
+
+        Backs the "All" / "None" mini-buttons in the filter popup header.
+        Updates both the live BooleanVars (so the checkboxes redraw) and
+        self.catalog_filter, then runs the same persist + refresh path as
+        a single-checkbox toggle.
+        """
+        for cat in self.catalog_filter:
+            self.catalog_filter[cat] = value
+        # Sync the visible BooleanVars if the popup is currently shown
+        if hasattr(self, "_catalog_filter_vars"):
+            for var in self._catalog_filter_vars.values():
+                var.set(value)
+        # Persist + UI refresh — same code path as _on_catalog_filter_change
+        self.data.setdefault("settings", {})["catalog_filter"] = dict(self.catalog_filter)
+        try:
+            self.save_data()
+        except Exception:
+            pass
+        self._update_catalog_filter_btn_label()
+        if self.target_search.get().strip():
+            self._update_floating_suggestions()
+
+    def _bind_link_hover(self, label_widget,
+                          normal="#6a8aa8", hover="#cbd9e5"):
+        """Wire Enter/Leave to brighten a Label that's acting as a link.
+
+        Used by the All/None mini-buttons in the catalog filter popup.
+        Two-color flip — same `add="+"` discipline as ToolTip so it
+        coexists with any other bindings on the label.
+        """
+        label_widget.bind("<Enter>",
+                          lambda e: label_widget.config(fg=hover), add="+")
+        label_widget.bind("<Leave>",
+                          lambda e: label_widget.config(fg=normal), add="+")
+
+    def _count_targets_by_catalog(self):
+        """Return a dict of catalog → unique-target count.
+
+        Walks self.targets (deduped by id) and tallies by `catalogs` tag.
+        Skips OpenNGC letter-suffixed sub-components (NGC0247A/B/C/D, which
+        are sub-knots of NGC 247) so the displayed count matches the
+        canonical catalog sizes astronomers expect — e.g. 109 Caldwell,
+        not 122 (the +13 are all sub-components of objects already counted).
+
+        Used both by the filter popup row counts and by the settings panel
+        per-catalog status breakdown.
+        """
+        counts = {"NGC": 0, "IC": 0, "Messier": 0,
+                  "Caldwell": 0, "Sharpless": 0, "Other": 0}
+        seen = set()
+        for t in self.targets.values():
+            tid = t.get("id")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            # OpenNGC sub-component names end with one or more letters
+            # following digits (e.g. NGC0247A). The primary object is
+            # already counted; skip the variants.
+            if re.search(r'\d+[A-Z]+$', tid):
+                continue
+            for cat in (t.get("catalogs") or {"Other"}):
+                if cat in counts:
+                    counts[cat] += 1
+        return counts
 
     # Keep legacy methods for API compatibility (called by Visible Tonight popup etc.)
     def update_suggestions(self, event):

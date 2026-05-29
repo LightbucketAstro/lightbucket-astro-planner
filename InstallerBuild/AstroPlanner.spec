@@ -5,6 +5,7 @@ PyInstaller spec for Lightbucket Astro Planner (script: AstroPlanner.py).
 Project layout assumed:
     ~/AstroPlannerDev/
         AstroPlanner.py               <- main script
+	sharpless_catalog.csv         <- included sharpless catalog
         logo.png                      <- runtime header logo
         logo.ico                      <- Windows window/app icon
         logo.icns                     <- macOS .app bundle icon
@@ -26,16 +27,20 @@ SCRIPT      = str(PROJECT_DIR / "AstroPlanner.py")
 LOGO_PNG    = PROJECT_DIR / "logo.png"
 LOGO_ICO    = PROJECT_DIR / "logo.ico"
 LOGO_ICNS   = PROJECT_DIR / "logo.icns"
+SHARPLESS_CSV = PROJECT_DIR / "sharpless_catalog.csv"
 
 # Files to bundle inside the frozen app.  logo.png is loaded at runtime via
 # _resource_path() and must always be included.  logo.ico is bundled on
 # Windows so root.iconbitmap() can find it; macOS uses the .icns at the
-# bundle level instead.
+# bundle level instead.  sharpless_catalog.csv is the bundled 313-entry
+# Sharpless catalog, also loaded via _resource_path() at startup.
 datas = []
 if LOGO_PNG.exists():
     datas.append((str(LOGO_PNG), "."))
 if sys.platform == "win32" and LOGO_ICO.exists():
     datas.append((str(LOGO_ICO), "."))
+if SHARPLESS_CSV.exists():
+    datas.append((str(SHARPLESS_CSV), "."))
 
 # Choose the executable icon for the current platform.
 if sys.platform == "win32" and LOGO_ICO.exists():
@@ -106,8 +111,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName":              "Lightbucket Astro Planner",
             "CFBundleDisplayName":       "Lightbucket Astro Planner",
-            "CFBundleShortVersionString": "1.0.1",
-            "CFBundleVersion":           "1.0.1",
+            "CFBundleShortVersionString": "1.0.2",
+            "CFBundleVersion":           "1.0.2",
             "NSHighResolutionCapable":   True,
         },
     )

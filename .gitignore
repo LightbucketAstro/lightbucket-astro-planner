@@ -25,6 +25,7 @@ Thumbs.db
 # User data — never commit
 astro_gear.json
 ngc_catalog.csv
+ngc_addendum.csv
 sessions/
 dss_cache/
 crash.log

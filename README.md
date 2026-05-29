@@ -26,12 +26,13 @@ Lightbucket is a free, local desktop app that closes the gap between **"what sho
 
 In one window it:
 
-- 🔭 **Searches the full NGC / IC catalog** with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976)
+- 🔭 **Searches NGC, IC, Messier, Caldwell, and Sharpless** from one box, with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976) and a per-catalog filter to narrow suggestions to just the lists you care about
 - 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
 - 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
 - 📊 **Builds a multi-target Gantt schedule** for the night, with per-rig support for dual-scope setups
 - 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
+- 🧩 **Imports your NINA profile** — pulls in filter-wheel names (LRGB + narrowband, with a bandwidth prompt) and your configured telescope, showing a preview of exactly what will be added or updated before anything is saved
 - 🛠️ **Stores your equipment inventory** — cameras, telescopes, and reducers — so every new session starts with the right gear pre-filled
 - 💾 **Saves and reloads sessions** as JSON, with a prompt on close so an evening's planning is never lost by accident
 - 🔴 **Switches between day and night themes** so it's legible outdoors under a red torch and indoors at a desk
@@ -82,7 +83,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.0.1.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.0.2.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -101,7 +102,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.0.1-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.0.2-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -152,13 +153,25 @@ manually and click **Save**, or click **📍 Auto-detect** to try again.
 Accurate coordinates matter for twilight times, moon altitude, and the
 per-target imaging window, so it's worth getting right.
 
-### 4. (Optional) Import your NINA filter names — *Settings* tab
+### 4. (Optional) Import your NINA profile — *Settings* tab
 
-In the **Data Management** card, click **Import Filter Names** and point the
+In the **Data Management** card, click **Import NINA Profile** and point the
 dialog at your NINA `.profile` file. On Windows the picker opens in
-`%LOCALAPPDATA%\NINA\profiles` by default. Imported filter names are used
-throughout the planner and written into the NINA export so the exported
-targets slot straight into your filter wheel setup.
+`%LOCALAPPDATA%\NINA\profiles` by default.
+
+The importer reads three things:
+
+- **Filter-wheel names**, sorted into LRGB and narrowband. If narrowband
+  filters are found, you'll be asked for their **bandwidth in nm** — this
+  sharpens the sub-exposure recommendation, since narrower filters suppress
+  sky background more.
+- **Your telescope** (name, focal length, f-ratio; aperture is derived).
+  It's added to — or updated in — your Equip inventory.
+
+Before anything is saved, a preview lists every item with a **NEW**,
+**UPDATE**, or **EXISTS** badge so you can confirm exactly what will change.
+Imported filter names are also written into the NINA export so exported
+targets slot straight into your filter wheel.
 
 ### 5. (Optional) Tune your analysis preferences — *Settings* tab
 
@@ -208,6 +221,12 @@ The right side of the tab shows:
 When the analysis looks good, click **Add to Plan** to push it onto
 **Tonight's Plan**.
 
+Next to the search box is a **▽ catalog filter**. Tap it to limit
+auto-complete to any combination of NGC, IC, Messier, Caldwell, Sharpless,
+or Other — each shown with its live object count. The button gains a dot
+(▽•) whenever a catalog is switched off, and your choice is remembered
+between sessions.
+
 ### ⭐ Targets
 
 A multi-target queue. Use this to build up a shortlist of candidates — for
@@ -236,7 +255,7 @@ Values entered here populate the equipment dropdowns throughout the app.
 
 ### ⚙ Settings
 
-Observer location, analysis preferences, and data management (NINA filter
+Observer location, analysis preferences, and data management (NINA profile
 import, NGC / IC catalog re-download, DSS image cache clear). See the
 [First-Run Setup](#first-run-setup) section for details on each field.
 
@@ -257,12 +276,45 @@ Inside that folder you'll find:
 
 - `astro_gear.json` — equipment, preferences, last session state
 - `ngc_catalog.csv` — downloaded NGC / IC catalog
+- `ngc_addendum.csv` — extra non-NGC/IC objects (downloaded alongside the main catalog)
 - `sessions/` — saved `.json` session plans
 - `dss_cache/` — cached DSS thumbnails (safe to delete)
 - `crash.log` — only present if the app has crashed; useful for bug reports
 
 To fully reset the app, quit it and delete the folder above. It will be
 re-created on next launch.
+
+---
+
+## Upgrading From an Earlier Version
+
+Upgrading is safe: install the new build over the top of the old one. All
+your data — equipment, sessions, preferences, and catalog — lives outside
+the app in your data folder (see [Where Your Data Lives](#where-your-data-lives))
+and is never touched by an install.
+
+Two notes on the new catalogs:
+
+- **Sharpless arrives automatically.** It ships inside the app, so it's
+  available the first time the new version launches. No action needed.
+- **Messier and Caldwell need a one-time catalog refresh.** These are merged
+  into the NGC/IC data when the catalog is downloaded, so your existing
+  catalog file won't include them yet. Open **Settings → Data Management**
+  and click **Re-download** next to *NGC/IC catalog*. This also pulls in a
+  few non-NGC/IC objects (e.g. the Double Cluster) and refreshes the Messier
+  cross-references.
+
+  > **Do this while connected to the internet.** If the re-download runs
+  > offline it falls back to a built-in 110-object Messier list until you
+  > retry online.
+
+After the refresh, the status line under *NGC/IC catalog* shows a per-catalog
+breakdown (NGC · IC · Messier · Caldwell · Sharpless counts) — a quick way to
+confirm everything loaded.
+
+Nothing needs migrating for NINA: any filter names you imported previously
+still work. To pick up the new telescope-import and bandwidth features, just
+re-run **Import NINA Profile**.
 
 ---
 
@@ -298,4 +350,6 @@ license text travel with it. The software is provided as-is, with no warranty.
 
 Target catalog derived from the [OpenNGC](https://github.com/mattiaverga/OpenNGC)
 project. DSS thumbnails courtesy of the STScI Digitized Sky Survey. NINA
-interoperability via the public `.ninaTargetSet` XML schema.
+interoperability via the public `.ninaTargetSet` XML schema. Sharpless H II
+regions derived from VizieR VII/20. Caldwell cross-references per Patrick
+Moore (Sky & Telescope, 1995).
