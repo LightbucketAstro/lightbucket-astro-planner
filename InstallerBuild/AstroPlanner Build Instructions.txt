@@ -1,6 +1,6 @@
 ================================================================================
               LIGHTBUCKET ASTRO PLANNER - BUILD INSTRUCTIONS
-                              Version 1.0.2
+                              Version 1.1.0
 ================================================================================
 
 These instructions cover building Lightbucket Astro Planner from source on
@@ -25,6 +25,7 @@ Set up the following structure under your home directory on each machine:
             AstroPlanner.spec  <-- PyInstaller spec
             MakeSetupFile.iss       <-- Inno Setup script (Windows only)
 	    MakeDmgFile.sh		macOS script to create DMG (Mac only)
+	SkyMap/			<-- files needed for display of sky map
 
 Full paths:
     Mac:     /Users/<you>/AstroPlannerDev/
@@ -44,6 +45,7 @@ BOTH PLATFORMS
 Install Python 3 (3.10 or newer recommended), then:
 
     pip install pyinstaller pillow
+    Pip install pywebview
     brew install create-dmg (Mac only)
     chmod +x MakeDmgFile.sh
 
@@ -60,6 +62,8 @@ Install Inno Setup 6 from:
     https://jrsoftware.org/isdl.php
 
 The default install options are fine.
+
+Download the WebView2 Evergreen Bootstrapper (MicrosoftEdgeWebview2Setup.exe) from Microsoft's WebView2 page and put it in InstallerBuild/
 
 
 ================================================================================
@@ -93,7 +97,7 @@ Step 3.  Verify the output:
 Step 4. Create a .dmg file for distribution:
 	Run the script: ./MakeDmgFile.sh
 
-	Output should be in: ~/AstroPlannerDev/InstallerBuild/installer/LightbucketAstroPlanner-1.0.2.dmg
+	Output should be in: ~/AstroPlannerDev/InstallerBuild/installer/LightbucketAstroPlanner-1.1.0.dmg
 
 
 ================================================================================
@@ -127,7 +131,7 @@ Step 3.  Build the installer in Inno Setup:
          Output:
 
              ...\InstallerBuild\installer\
-                 LightbucketAstroPlanner-1.0.2-setup.exe
+                 LightbucketAstroPlanner-1.1.0-setup.exe
 
 Step 4.  Test the installer:
 

@@ -46,7 +46,31 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.0.3-dev"
+__version__ = "1.1.0"
+
+# ── Sky-map catalog tiers (optional downloads) ─────────────────────────────
+# Pinned to the d3-celestial commit our bundled engine + stars.6 came from, so
+# downloaded data matches the renderer.  Files land in the user data dir and
+# are served (overriding the bundled lean set) by the local sky-map server.
+SKYMAP_CATALOG_PIN = "7e720a3de062059d4c5400a379146a601d9010e0"
+SKYMAP_CATALOG_BASE = ("https://raw.githubusercontent.com/ofrohn/d3-celestial/"
+                       + SKYMAP_CATALOG_PIN + "/data/")
+SKYMAP_TIERS = {
+    "lean": {
+        "label": "Lean", "blurb": "stars ≤ 6, Messier", "bundled": True,
+        "stars": "stars.6.json", "dsos": "messier.json", "maglimit": 6, "files": [],
+    },
+    "extended": {
+        "label": "Extended", "blurb": "stars ≤ 8, DSOs ≤ 6  ·  ~7 MB", "bundled": False,
+        "stars": "stars.8.json", "dsos": "dsos.6.json", "maglimit": 8,
+        "files": ["stars.8.json", "dsos.6.json", "starnames.json", "dsonames.json"],
+    },
+    "full": {
+        "label": "Full", "blurb": "stars ≤ 14, DSOs ≤ 14  ·  ~19 MB", "bundled": False,
+        "stars": "stars.14.json", "dsos": "dsos.14.json", "maglimit": 14,
+        "files": ["stars.14.json", "dsos.14.json", "starnames.json", "dsonames.json"],
+    },
+}
 
 
 def _resource_path(relative):
@@ -65,6 +89,39 @@ def _resource_path(relative):
     """
     base = getattr(sys, "_MEIPASS", None) or Path(__file__).resolve().parent
     return Path(base) / relative
+
+
+def _run_skymap_child(url):
+    """Sky-map viewer subprocess entry point.
+
+    The main app relaunches itself with ``--skymap-url <url>`` so the
+    interactive sky map runs in its own process.  pywebview must own the
+    main thread (Cocoa requires it), so a separate process is the only way
+    for it to coexist with Tkinter.  If pywebview is unavailable or its
+    renderer can't start (e.g. missing WebView2 on Windows), fall back to
+    the default browser — the URL is served over localhost either way.
+    """
+    try:
+        import webview
+        webview.create_window("Lightbucket Sky Map", url,
+                              width=1100, height=750, resizable=True)
+        webview.start()
+    except Exception:
+        # Record why the embedded window couldn't open — a silent fallback is
+        # otherwise impossible to diagnose — then open the browser instead.
+        try:
+            import tempfile, traceback
+            logp = os.path.join(tempfile.gettempdir(), "lightbucket_skymap.log")
+            with open(logp, "w", encoding="utf-8") as fh:
+                fh.write("Embedded sky map (pywebview) could not start; "
+                         "fell back to the browser.\n\n")
+                fh.write(traceback.format_exc())
+        except Exception:
+            pass
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
 
 
 def _macos_should_force_clam():
@@ -1239,7 +1296,23 @@ class AstroApp:
                 # Yes — save; abort close if user cancels the file picker or save fails
                 if not self._save_session_as():
                     return
+        self._close_skymap()
         self.root.destroy()
+
+    def _close_skymap(self):
+        """Close the sky-map viewer window when the planner exits.
+
+        The local static server runs in a daemon thread and stops with the
+        process, but the viewer is an independent child process, so it must be
+        terminated explicitly or it would outlive the planner.
+        """
+        proc = getattr(self, "_skymap_proc", None)
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        self._skymap_proc = None
 
     # ═══════════════════════════════════════════════════════════════════
     # SIDEBAR NAVIGATION
@@ -2823,7 +2896,7 @@ class AstroApp:
         ToolTip(visible_btn, "Search the full catalog for objects\nvisible tonight from your location,\nfiltered by type, altitude, and season")
         skymap_btn = ttk.Button(btn_frame, text="Show Sky Map", command=self.open_sky_map)
         skymap_btn.pack(side="left", padx=(0, 4))
-        ToolTip(skymap_btn, "Open sky-map.org in your browser\ncentred on the current target")
+        ToolTip(skymap_btn, "Open the interactive sky map\ncentred on the current target")
 
         results_frame = ttk.Frame(left_box)
         results_frame.pack(anchor="w", fill="both", expand=True, pady=(6, 0))
@@ -2910,10 +2983,10 @@ class AstroApp:
         self._cached_dss_survey_deg = None
 
         # ── Bottom: altitude chart (compact inline strip) ─────────────────
-        self.alt_canvas = tk.Canvas(self.tab_planner, height=140, bg="#050810",
+        self.alt_canvas = tk.Canvas(self.tab_planner, height=168, bg="#050810",
                                     highlightthickness=1, highlightbackground="#2e4a63")
         self.alt_canvas.pack(padx=20, pady=(0, 8), fill="x")
-        self.alt_canvas.create_text(400, 70, text="Altitude chart — analyze a target to populate",
+        self.alt_canvas.create_text(400, 84, text="Altitude chart — analyze a target to populate",
                                     fill="#334455", font=("Helvetica", 10), justify="center")
 
         # Moon bar hover state
@@ -2924,8 +2997,29 @@ class AstroApp:
 
     def setup_session_tab(self):
         """Build the Targets List tab — Integration Plan preview + Tonight's Plan list."""
-        outer = ttk.Frame(self.tab_session)
-        outer.pack(fill="both", expand=True, padx=20, pady=10)
+        # Scrollable container so the whole tab (analysis + queue + schedule
+        # graph) scrolls as one page on shorter windows.  The inner queue-card
+        # list keeps its own wheel scroll — it's excluded from the page binding
+        # at the end of this method.
+        _ss_bg = ttk.Style().lookup("TFrame", "background") or "#1e2d3e"
+        self._session_canvas = tk.Canvas(self.tab_session, bg=_ss_bg,
+                                         highlightthickness=0)
+        _session_sb = ttk.Scrollbar(self.tab_session, orient="vertical",
+                                    command=self._session_canvas.yview)
+        self._session_canvas.configure(yscrollcommand=_session_sb.set)
+        _session_sb.pack(side="right", fill="y")
+        self._session_canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ttk.Frame(self._session_canvas, padding=(20, 10))
+        outer.bind("<Configure>", lambda e: self._session_canvas.configure(
+            scrollregion=self._session_canvas.bbox("all")))
+        self._session_canvas.create_window((0, 0), window=outer,
+                                           anchor="nw", tags="inner")
+        def _session_canvas_config(e):
+            self._session_canvas.itemconfig("inner", width=e.width)
+            self._session_canvas.configure(
+                scrollregion=self._session_canvas.bbox("all"))
+        self._session_canvas.bind("<Configure>", _session_canvas_config)
 
         # ── Integration Plan (preview of current analysis) ────────────────
         plan_card = tk.Frame(outer, bg="#131f2e", highlightthickness=0)
@@ -3095,7 +3189,7 @@ class AstroApp:
         self.queue_gantt.create_text(430, 100,
             text="Add targets to the queue and move them to Tonight's Plan to see the schedule timeline",
             fill="#445566", font=("Helvetica", 9))
-        ttk.Label(queue_outer, text="Tonight's Plan schedule  —  drag a bar to set its start time",
+        ttk.Label(queue_outer, text="Target Scheduling  —  drag a bar to set its start time",
                   font=("Helvetica", 11, "italic")).pack(anchor="w", padx=8, pady=(0, 2))
         self._gantt_note_lbl = ttk.Label(queue_outer, text="",
                                          font=("Helvetica", 9, "italic"), foreground="#cc8800")
@@ -3107,6 +3201,15 @@ class AstroApp:
         self.queue_gantt.bind("<Motion>",          self._gantt_motion)
         self.queue_gantt.bind("<Configure>",       lambda e: self._draw_queue_gantt())
         self.queue_gantt.bind("<Map>",             lambda e: self.root.after(20, self._draw_queue_gantt))
+
+        # Wheel-scroll the whole tab as one page, but leave the inner queue-card
+        # list to its own wheel scroll (drag the gantt bars still works — that's
+        # Button-1, not the wheel).
+        self._bind_session_mousewheel(self._session_canvas)
+        self._bind_session_mousewheel_recursive(
+            outer, exclude=(self._queue_cards_canvas,))
+        self._session_canvas.after_idle(lambda: self._session_canvas.configure(
+            scrollregion=self._session_canvas.bbox("all")))
 
     def setup_plan_tab(self):
         """Build the Tonight's Plan tab — the final output of the planning workflow."""
@@ -3262,11 +3365,80 @@ class AstroApp:
         for child in widget.winfo_children():
             self._bind_queue_mousewheel_recursive(child)
 
+    def _bind_settings_mousewheel(self, widget):
+        """Bind mousewheel / Linux scroll events so the wheel scrolls the
+        Settings panel.  Mirrors _bind_queue_mousewheel (see it for the
+        macOS delta quirk)."""
+        def _on_wheel(e):
+            if abs(e.delta) >= 120:
+                steps = int(-1 * (e.delta / 120))
+            elif e.delta:
+                steps = -1 if e.delta > 0 else 1
+            else:
+                steps = 0
+            if steps:
+                self._settings_canvas.yview_scroll(steps, "units")
+        widget.bind("<MouseWheel>", _on_wheel)
+        widget.bind("<Button-4>",
+            lambda e: self._settings_canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>",
+            lambda e: self._settings_canvas.yview_scroll(1, "units"))
+
+    def _bind_settings_mousewheel_recursive(self, widget):
+        """Recursively bind settings wheel-scroll on a widget and descendants."""
+        self._bind_settings_mousewheel(widget)
+        for child in widget.winfo_children():
+            self._bind_settings_mousewheel_recursive(child)
+
+    def _bind_session_mousewheel(self, widget):
+        """Bind mousewheel / Linux scroll so the wheel scrolls the Targets List
+        tab.  Mirrors _bind_queue_mousewheel."""
+        def _on_wheel(e):
+            if abs(e.delta) >= 120:
+                steps = int(-1 * (e.delta / 120))
+            elif e.delta:
+                steps = -1 if e.delta > 0 else 1
+            else:
+                steps = 0
+            if steps:
+                self._session_canvas.yview_scroll(steps, "units")
+        widget.bind("<MouseWheel>", _on_wheel)
+        widget.bind("<Button-4>",
+            lambda e: self._session_canvas.yview_scroll(-1, "units"))
+        widget.bind("<Button-5>",
+            lambda e: self._session_canvas.yview_scroll(1, "units"))
+
+    def _bind_session_mousewheel_recursive(self, widget, exclude=()):
+        """Recursively bind session wheel-scroll, skipping any widget (and its
+        subtree) in `exclude` so the inner queue list keeps its own scroll."""
+        if widget in exclude:
+            return
+        self._bind_session_mousewheel(widget)
+        for child in widget.winfo_children():
+            self._bind_session_mousewheel_recursive(child, exclude)
+
 
     def setup_settings_tab(self):
         """Build the Settings panel — observer location, analysis preferences, data management."""
-        outer = ttk.Frame(self.tab_settings)
-        outer.pack(fill="both", expand=True, padx=20, pady=10)
+        # Scrollable container so the panel fits shorter windows (the catalog
+        # section can run past the bottom).  `outer` stays a ttk.Frame, so the
+        # cards/labels render exactly as before — it just lives in the canvas.
+        _sb_bg = ttk.Style().lookup("TFrame", "background") or "#1e2d3e"
+        self._settings_canvas = tk.Canvas(self.tab_settings, bg=_sb_bg,
+                                          highlightthickness=0)
+        _settings_sb = ttk.Scrollbar(self.tab_settings, orient="vertical",
+                                     command=self._settings_canvas.yview)
+        self._settings_canvas.configure(yscrollcommand=_settings_sb.set)
+        _settings_sb.pack(side="right", fill="y")
+        self._settings_canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ttk.Frame(self._settings_canvas, padding=(20, 10))
+        outer.bind("<Configure>", lambda e: self._settings_canvas.configure(
+            scrollregion=self._settings_canvas.bbox("all")))
+        self._settings_canvas.create_window((0, 0), window=outer,
+                                            anchor="nw", tags="inner")
+        self._settings_canvas.bind("<Configure>", lambda e:
+            self._settings_canvas.itemconfig("inner", width=e.width))
 
         # Title
         ttk.Label(outer, text="Settings",
@@ -3407,9 +3579,43 @@ class AstroApp:
             font=("Helvetica", 9), foreground="#556677")
         self._settings_dss_label.grid(row=2, column=2, padx=(8, 4), pady=4, sticky="w")
 
+        # ── Sky-map catalog tiers ─────────────────────────────────────────
+        sky_card = self._make_settings_card(outer, "SKY-MAP CATALOG", "#5dcaa5")
+        ttk.Label(sky_card,
+                  text="Extra star & deep-sky detail for the embedded sky map.",
+                  font=("Helvetica", 9), foreground="#556677").pack(
+            anchor="w", padx=8, pady=(0, 2))
+        sky_grid = ttk.Frame(sky_card)
+        sky_grid.pack(fill="x", padx=8, pady=4)
+        self._skymap_tier_var = tk.StringVar(value=self._skymap_active_tier())
+        self._skymap_rows = {}
+        for _i, _tier in enumerate(("lean", "extended", "full")):
+            _spec = SKYMAP_TIERS[_tier]
+            _rb = ttk.Radiobutton(sky_grid, text=_spec["label"], value=_tier,
+                                  variable=self._skymap_tier_var,
+                                  command=lambda tr=_tier: self._skymap_select_tier(tr))
+            _rb.grid(row=_i, column=0, padx=4, pady=4, sticky="w")
+            ttk.Label(sky_grid, text=_spec["blurb"], font=("Helvetica", 9),
+                      foreground="#556677").grid(row=_i, column=1, padx=4, pady=4, sticky="w")
+            _btn = ttk.Button(sky_grid, text="Download",
+                              command=lambda tr=_tier: self._skymap_download_tier(tr))
+            _btn.grid(row=_i, column=2, padx=4, pady=4, sticky="w")
+            _prog = ttk.Progressbar(sky_grid, length=130, mode="determinate")
+            _prog.grid(row=_i, column=2, padx=4, pady=4, sticky="w")
+            _prog.grid_remove()
+            _status = ttk.Label(sky_grid, text="", font=("Helvetica", 9))
+            _status.grid(row=_i, column=3, padx=(8, 4), pady=4, sticky="w")
+            self._skymap_rows[_tier] = {"rb": _rb, "status": _status,
+                                        "prog": _prog, "btn": _btn}
+        self._update_skymap_catalog_ui()
+
         # About line
         ttk.Label(outer, text=f"Lightbucket Astro Planner  ·  Data: {self.data_path}",
                   font=("Helvetica", 9), foreground="#334455").pack(anchor="center", pady=(12, 0))
+
+        # Wheel-scroll the whole panel (canvas + every card widget).
+        self._bind_settings_mousewheel(self._settings_canvas)
+        self._bind_settings_mousewheel_recursive(outer)
 
     # ═══════════════════════════════════════════════════════════════════
     # SETTINGS PANEL HANDLERS
@@ -5959,6 +6165,9 @@ class AstroApp:
         sw, sh = float(c.get("sensor_w", 1)), float(c.get("sensor_h", 1))
         
         fw, fh = 2*math.degrees(math.atan(sw/(2*eff_fl))), 2*math.degrees(math.atan(sh/(2*eff_fl)))
+        # Remember the framed FOV (deg) for the sky-map window; the position
+        # angle is read live from self._fov_angle when the map is opened.
+        self._skymap_fovw, self._skymap_fovh = fw, fh
         scale = (ps / eff_fl) * 206.265
         t_maj, t_min = t['size_maj']/60.0, t['size_min']/60.0
 
@@ -6652,9 +6861,323 @@ class AstroApp:
                                              cw/2+t_maj*px_scale/2, ch/2+t_min*px_scale/2, outline="cyan", width=2)
 
     def open_sky_map(self):
-        """Open sky-map.org in the default browser centred on the current target."""
-        if self.current_target_info:
-            webbrowser.open(f"https://sky-map.org/?object={self.current_target_info['id'].replace(' ', '+')}")
+        """Open the interactive sky map centred on the current target.
+
+        Feeds the embedded d3-celestial explorer (a pywebview window in a
+        separate process) the target centre, framed FOV, position angle and
+        theme via a localhost URL.  Coordinates — not the object id — are
+        passed, so Sharpless/Caldwell targets resolve correctly.  Falls back
+        to the default browser when pywebview/WebView2 is unavailable.
+        """
+        t = self.current_target_info
+        if not t:
+            messagebox.showinfo(
+                "No Target",
+                "Select and analyze a target first, then open the sky map.")
+            return
+        ra, dec = t.get("ra_deg"), t.get("dec_deg")
+        if ra is None or dec is None:
+            messagebox.showinfo(
+                "No Coordinates",
+                "This target has no coordinates to centre the sky map on.")
+            return
+
+        skymap_dir = _resource_path("skymap")
+        if not skymap_dir.is_dir() or not (skymap_dir / "skymap.html").exists():
+            messagebox.showwarning(
+                "Sky Map Assets Missing",
+                "The sky-map files were not found next to the app.\n"
+                "Expected a 'skymap' folder containing skymap.html.")
+            return
+
+        import urllib.parse
+        params = {
+            "ra":      f"{float(ra):.5f}",
+            "dec":     f"{float(dec):.5f}",
+            "name":    t.get("id", ""),
+            "common":  t.get("common", "").split(";")[0].strip(),
+            "catalog": self._skymap_catalog_label(t.get("id", "")),
+            "fovw":    f"{getattr(self, '_skymap_fovw', 0.0) or 0.0:.4f}",
+            "fovh":    f"{getattr(self, '_skymap_fovh', 0.0) or 0.0:.4f}",
+            "pa":      f"{getattr(self, '_fov_angle', 0.0) or 0.0:.1f}",
+            "theme":   "night" if getattr(self, "night_mode", False) else "day",
+        }
+        # Active catalog tier → which star/DSO files the map loads + mag ceiling.
+        tier = SKYMAP_TIERS.get(self._skymap_active_tier(), SKYMAP_TIERS["lean"])
+        params["stars"] = tier["stars"]
+        params["dsos"] = tier["dsos"]
+        params["maglimit"] = str(tier["maglimit"])
+        port = self._ensure_skymap_server(skymap_dir)
+        if not port:
+            return
+        url = (f"http://127.0.0.1:{port}/skymap.html?"
+               + urllib.parse.urlencode(params))
+        self._spawn_skymap_viewer(url)
+
+    @staticmethod
+    def _skymap_catalog_label(name):
+        """Best-effort catalog name for the sky-map badge, from the object id."""
+        n = (name or "").upper().replace(" ", "")
+        if n.startswith("SH2"):
+            return "Sharpless"
+        if n.startswith("NGC"):
+            return "NGC"
+        if n.startswith("IC"):
+            return "IC"
+        if n.startswith("M") and n[1:].isdigit():
+            return "Messier"
+        if n.startswith("C") and n[1:].isdigit():
+            return "Caldwell"
+        return ""
+
+    def _ensure_skymap_server(self, skymap_dir):
+        """Lazily start a localhost static server rooted at the sky-map folder.
+
+        d3-celestial loads its catalog JSON via XHR, which file:// blocks, so
+        the assets must be served over http.  One server (daemon thread, alive
+        for the app's lifetime) feeds both the embedded window and any browser
+        fallback.  Returns the bound port, or None on failure.
+        """
+        port = getattr(self, "_skymap_port", None)
+        if port:
+            return port
+        try:
+            import functools, http.server, os
+            bundled_root = str(skymap_dir)
+            user_root = str(self._skymap_catalog_root())
+
+            class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def copyfile(self, source, outputfile):
+                    # The viewer may navigate away / close mid-transfer; treat
+                    # a dropped connection as normal rather than logging a trace.
+                    try:
+                        super().copyfile(source, outputfile)
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+
+                def translate_path(self, path):
+                    # Prefer a downloaded catalog file (Extended/Full, in the
+                    # user data dir) over the bundled lean asset of the same
+                    # name; fall back to bundled for everything else.
+                    bundled = super().translate_path(path)
+                    try:
+                        rel = os.path.relpath(bundled, bundled_root)
+                        cand = os.path.join(user_root, rel)
+                        if os.path.isfile(cand):
+                            return cand
+                    except Exception:
+                        pass
+                    return bundled
+
+            handler = functools.partial(_QuietHandler, directory=bundled_root)
+            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            httpd.daemon_threads = True
+            self._skymap_httpd = httpd
+            self._skymap_port = httpd.server_address[1]
+            threading.Thread(target=httpd.serve_forever, daemon=True).start()
+            return self._skymap_port
+        except Exception as exc:
+            messagebox.showerror(
+                "Sky Map Error",
+                f"Could not start the local sky-map server:\n{exc}")
+            return None
+
+    def _spawn_skymap_viewer(self, url):
+        """Launch the sky-map viewer in a separate process (single instance).
+
+        Relaunches this app with ``--skymap-url`` (frozen: the exe itself;
+        dev: the interpreter + this script).  The child shows the pywebview
+        window or, on failure, opens the browser.  A direct browser open is
+        the last-ditch fallback if the relaunch itself fails.
+
+        Only one sky-map window is kept: if one is already open, it is closed
+        first so re-opening (same or new target) always yields exactly one
+        window showing the current target.  (Browser-fallback tabs can't be
+        deduped — we don't control the browser — but that's the degraded path.)
+        """
+        import subprocess
+        prev = getattr(self, "_skymap_proc", None)
+        if prev is not None and prev.poll() is None:
+            try:
+                prev.terminate()
+            except Exception:
+                pass
+        try:
+            if getattr(sys, "frozen", False):
+                cmd = [sys.executable, "--skymap-url", url]
+            else:
+                cmd = [sys.executable, os.path.abspath(__file__),
+                       "--skymap-url", url]
+            self._skymap_proc = subprocess.Popen(cmd)
+        except Exception:
+            self._skymap_proc = None
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    # ─── Sky-map catalog tiers (optional Extended / Full downloads) ──────
+    def _skymap_catalog_root(self):
+        """User-writable folder holding downloaded sky-map catalog files."""
+        base = (Path(os.getenv("LOCALAPPDATA")) / "LightbucketAstroPlanner"
+                if platform.system() == "Windows"
+                else Path.home() / "LightbucketAstroPlanner")
+        root = base / "skymap_catalog"
+        (root / "data").mkdir(parents=True, exist_ok=True)
+        return root
+
+    def _skymap_tier_installed(self, tier):
+        """True if a tier's files are present (bundled tiers are always so)."""
+        spec = SKYMAP_TIERS.get(tier)
+        if not spec:
+            return False
+        if spec["bundled"]:
+            return True
+        data_dir = self._skymap_catalog_root() / "data"
+        return all((data_dir / f).exists() for f in spec["files"])
+
+    def _skymap_active_tier(self):
+        """Active catalog tier, falling back to lean if it isn't installed."""
+        tier = "lean"
+        try:
+            manifest = self._skymap_catalog_root() / "manifest.json"
+            if manifest.exists():
+                tier = json.loads(manifest.read_text()).get("active", "lean")
+        except Exception:
+            tier = "lean"
+        if tier not in SKYMAP_TIERS or not self._skymap_tier_installed(tier):
+            tier = "lean"
+        return tier
+
+    def _skymap_set_active_tier(self, tier):
+        """Persist the active catalog tier to the catalog manifest."""
+        try:
+            manifest = self._skymap_catalog_root() / "manifest.json"
+            manifest.write_text(json.dumps({"active": tier}))
+        except Exception:
+            pass
+
+    def _skymap_select_tier(self, tier):
+        """Radio handler — activate a tier only if it's installed."""
+        if not self._skymap_tier_installed(tier):
+            self._skymap_tier_var.set(self._skymap_active_tier())
+            return
+        self._skymap_set_active_tier(tier)
+        self._update_skymap_catalog_ui()
+
+    def _skymap_download_tier(self, tier):
+        """Begin a background download of an Extended/Full catalog tier."""
+        spec = SKYMAP_TIERS.get(tier)
+        if not spec or spec["bundled"] or self._skymap_tier_installed(tier):
+            return
+        row = self._skymap_rows.get(tier)
+        if row:
+            row["btn"].grid_remove()
+            row["status"].config(text="Starting…", foreground="#556677")
+            row["prog"]["value"] = 0
+            row["prog"].grid()
+        self._skymap_last_pct = {}
+        threading.Thread(target=self._skymap_download_worker,
+                         args=(tier,), daemon=True).start()
+
+    def _skymap_download_worker(self, tier):
+        """Download a tier's files with progress (runs off the UI thread)."""
+        spec = SKYMAP_TIERS[tier]
+        data_dir = self._skymap_catalog_root() / "data"
+        ua = {"User-Agent": f"LightbucketAstroPlanner/{__version__}"}
+        try:
+            total = 0
+            for f in spec["files"]:
+                req = urllib.request.Request(SKYMAP_CATALOG_BASE + f,
+                                             method="HEAD", headers=ua)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    total += int(resp.headers.get("Content-Length", 0) or 0)
+            total = total or 1
+            done = 0
+            for f in spec["files"]:
+                tmp = data_dir / (f + ".part")
+                req = urllib.request.Request(SKYMAP_CATALOG_BASE + f, headers=ua)
+                with urllib.request.urlopen(req, timeout=120) as resp, open(tmp, "wb") as out:
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done += len(chunk)
+                        self._skymap_progress(tier, done, total)
+                tmp.replace(data_dir / f)
+            self.root.after(0, lambda: self._skymap_download_done(tier, None))
+        except Exception as exc:
+            self.root.after(0, lambda e=exc: self._skymap_download_done(tier, e))
+
+    def _skymap_progress(self, tier, done, total):
+        """Throttled, thread-safe progress update for a downloading tier."""
+        pct = int(done * 100 / total)
+        d = getattr(self, "_skymap_last_pct", None)
+        if d is None:
+            d = {}
+            self._skymap_last_pct = d
+        if d.get(tier) == pct:
+            return
+        d[tier] = pct
+        mb, tmb = done / 1048576.0, total / 1048576.0
+
+        def _apply():
+            row = self._skymap_rows.get(tier)
+            if row:
+                row["prog"]["value"] = pct
+                row["status"].config(text=f"{mb:.1f} / {tmb:.1f} MB",
+                                     foreground="#556677")
+        self.root.after(0, _apply)
+
+    def _skymap_download_done(self, tier, error):
+        """Finalize a tier download on the UI thread (success or failure)."""
+        row = self._skymap_rows.get(tier)
+        if row:
+            row["prog"].grid_remove()
+        if error is not None:
+            if row:
+                row["status"].config(text="✗ download failed",
+                                     foreground="#e05555")
+                row["btn"].grid()
+            messagebox.showerror(
+                "Catalog Download Failed",
+                f"Could not download the {SKYMAP_TIERS[tier]['label']} "
+                f"catalog:\n{error}")
+            return
+        # Auto-activate the freshly downloaded tier.
+        self._skymap_set_active_tier(tier)
+        self._skymap_tier_var.set(tier)
+        self._update_skymap_catalog_ui()
+
+    def _update_skymap_catalog_ui(self):
+        """Refresh tier rows: status text, radio enablement, download buttons."""
+        rows = getattr(self, "_skymap_rows", None)
+        if not rows:
+            return
+        active = self._skymap_active_tier()
+        for tier, row in rows.items():
+            spec = SKYMAP_TIERS[tier]
+            installed = self._skymap_tier_installed(tier)
+            row["rb"].config(state="normal" if installed else "disabled")
+            row["btn"].grid_remove()
+            row["prog"].grid_remove()
+            if spec["bundled"]:
+                row["status"].config(
+                    text="bundled · active" if tier == active else "bundled",
+                    foreground="#4caf50")
+            elif installed:
+                row["status"].config(
+                    text="✓ installed · active" if tier == active else "✓ installed",
+                    foreground="#4caf50")
+            else:
+                row["status"].config(text="", foreground="#556677")
+                row["btn"].config(state="normal")
+                row["btn"].grid()
+        self._skymap_tier_var.set(active)
 
     # ═══════════════════════════════════════════════════════════════════
     # COORDINATE PARSING HELPERS
@@ -8992,6 +9515,13 @@ class AstroApp:
         self._refresh_plan_tree()
 
 if __name__ == "__main__":
+    # Sky-map viewer subprocess: when relaunched with --skymap-url, show the
+    # interactive map in its own pywebview window (separate process so its GUI
+    # loop doesn't collide with Tkinter's), then exit before any Tk starts.
+    if "--skymap-url" in sys.argv:
+        _run_skymap_child(sys.argv[sys.argv.index("--skymap-url") + 1])
+        sys.exit(0)
+
     root = tk.Tk()
     app = AstroApp(root)
     root.mainloop()

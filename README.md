@@ -22,12 +22,13 @@
 
 ## What it does
 
-Lightbucket is a free, local desktop app that closes the gap between **"what should I image tonight?"** and **"NINA, run this list."** Built for amateur deep-sky astrophotographers who already use [N.I.N.A.](https://nighttime-imaging.eu/) to drive their rigs.
+Lightbucket is a free, local desktop app that closes the gap between **"what should I image tonight?"** and **"NINA, run this list."** Built for amateur deep-sky astrophotographers who already use [N.I.N.A.](https://nighttime-imaging.eu/) to drive their rigs, but great for anyone who wants to plan their evening of astrophotography.
 
 In one window it:
 
 - 🔭 **Searches NGC, IC, Messier, Caldwell, and Sharpless** from one box, with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976) and a per-catalog filter to narrow suggestions to just the lists you care about
 - 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image
+- 🗺️ **Opens an interactive sky map** centred on your target — a wide-field view with constellations, the Milky Way, a coordinate grid, and your sensor frame drawn in, as the zoomed-out companion to the close-up DSS framing
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
 - 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
 - 📊 **Builds a multi-target Gantt schedule** for the night, with per-rig support for dual-scope setups
@@ -37,7 +38,7 @@ In one window it:
 - 💾 **Saves and reloads sessions** as JSON, with a prompt on close so an evening's planning is never lost by accident
 - 🔴 **Switches between day and night themes** so it's legible outdoors under a red torch and indoors at a desk
 
-No account, no cloud, no subscription. Your data stays on your machine. Built as a single-window Tkinter app and shipped as native installers — no Python install required on either platform.
+No account, no cloud, no subscription. Your data stays on your machine. Built as a Tkinter desktop app and shipped as native installers — no Python install required on either platform.
 
 ## Screenshots
 
@@ -83,7 +84,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.0.2.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.1.0.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -102,7 +103,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.0.2-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.1.0-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -227,6 +228,22 @@ or Other — each shown with its live object count. The button gains a dot
 (▽•) whenever a catalog is switched off, and your choice is remembered
 between sessions.
 
+The **Show Sky Map** button opens a wide-field, interactive sky map centred
+on the analyzed target — the zoomed-out companion to the DSS framing preview.
+It shows stars, constellation lines and names, Messier objects, the Milky Way
+band, and a coordinate grid (each toggleable), with a magnitude slider, zoom
+control, and an approximate field-of-view readout. Your sensor frame is drawn
+on the target at the right size and position angle, a **Recenter** button
+snaps back after you pan, and the map follows the app's day/night theme.
+Analyze a target first — the button needs coordinates to centre on.
+
+The map renders fully offline from assets bundled with the app and opens in
+its own window. On Windows that window uses the Microsoft Edge WebView2
+runtime, which ships with essentially all current Windows 10 / 11 systems; if
+it isn't available, the map falls back to opening in your default browser, so
+the button never dead-ends. macOS uses the built-in system web view — nothing
+extra to install.
+
 ### ⭐ Targets
 
 A multi-target queue. Use this to build up a shortlist of candidates — for
@@ -316,6 +333,10 @@ Nothing needs migrating for NINA: any filter names you imported previously
 still work. To pick up the new telescope-import and bandwidth features, just
 re-run **Import NINA Profile**.
 
+New in 1.1.0, the **Sky Map** needs nothing migrated — it's available as soon
+as you've installed the update and analyzed a target. On Windows, if the
+embedded window can't start, the map opens in your default browser instead.
+
 ---
 
 ## Reporting Bugs
@@ -352,4 +373,6 @@ Target catalog derived from the [OpenNGC](https://github.com/mattiaverga/OpenNGC
 project. DSS thumbnails courtesy of the STScI Digitized Sky Survey. NINA
 interoperability via the public `.ninaTargetSet` XML schema. Sharpless H II
 regions derived from VizieR VII/20. Caldwell cross-references per Patrick
-Moore (Sky & Telescope, 1995).
+Moore (Sky & Telescope, 1995). Interactive sky map powered by
+[d3-celestial](https://github.com/ofrohn/d3-celestial) by Olaf Frohn
+(BSD-3-Clause).
