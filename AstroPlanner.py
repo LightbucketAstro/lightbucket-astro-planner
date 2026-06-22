@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.1.0-dev"
+__version__ = "1.1.1"
 
 # ── Sky-map catalog tiers (optional downloads) ─────────────────────────────
 # Pinned to the d3-celestial commit our bundled engine + stars.6 came from, so
@@ -822,6 +822,57 @@ def _max_altitude_tonight(ra_deg, dec_deg, lat_deg, lon_deg, dark_range=None):
             max_alt = alt
 
     return max_alt
+
+
+def _alt_rise_tonight(ra_deg, dec_deg, lat_deg, lon_deg, min_alt, dark_range):
+    """Return (max_alt, rise_label) for tonight's nautical-darkness window.
+
+    *max_alt* is the highest altitude (deg) reached while dark.  *rise_label*
+    is the observable rise — the moment the object becomes usable:
+      • local "HH:MM" when it first climbs above *min_alt* during darkness,
+      • "up" when it is already above *min_alt* at the start of darkness
+        (rose before dusk, or circumpolar), or
+      • None when it never clears *min_alt* while dark.
+
+    Computed in the same single dark-window scan as the altitude, reusing the
+    pre-computed *dark_range* from :func:`_dark_jd_range`, so the batch
+    'Visible Tonight' search stays fast.
+    """
+    if not dark_range:
+        return -90.0, None
+    jd_dusk, jd_dawn, _ = dark_range
+    if jd_dusk is None or jd_dawn is None:
+        return -90.0, None   # no darkness tonight (polar day)
+
+    step_jd      = 5.0 / 1440.0  # 5-minute resolution
+    utc_offset_h = _utc_offset_hours()
+
+    max_alt    = -90.0
+    rise_jd    = None
+    already_up = False
+    first      = True
+
+    jd = jd_dusk
+    while jd <= jd_dawn:
+        alt = _ra_dec_to_altaz(ra_deg, dec_deg, lat_deg, lon_deg, jd)
+        if alt > max_alt:
+            max_alt = alt
+        if rise_jd is None and not already_up and alt >= min_alt:
+            if first:
+                already_up = True          # above the line before dark began
+            else:
+                rise_jd = jd               # first upward crossing while dark
+        first = False
+        jd += step_jd
+
+    if already_up:
+        rise_label = "up"
+    elif rise_jd is not None:
+        lh = (((rise_jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
+        rise_label = f"{int(lh):02d}:{int((lh % 1) * 60):02d}"
+    else:
+        rise_label = None
+    return max_alt, rise_label
 
 
 def _dark_jd_range(lat_deg, lon_deg):
@@ -1662,7 +1713,7 @@ class AstroApp:
 
     # Current gear-file schema version.  Bump this and add a new migration
     # step in _migrate_data whenever the shape of astro_gear.json changes.
-    _DATA_SCHEMA = 5
+    _DATA_SCHEMA = 6
 
     def load_data(self):
         """Load the gear JSON file, applying schema migrations; return an empty default on any failure."""
@@ -1686,6 +1737,8 @@ class AstroApp:
             "cameras":      {},
             "scopes":       {},
             "location":     {"lat": None, "lon": None},
+            "locations":    [],
+            "active_location": "",
             "session":      {},
             "nina_filters": {},
             "settings":     {"rigs": [], "active_rig": ""},
@@ -1725,6 +1778,11 @@ class AstroApp:
               so any non-empty value stored there is a stale leftover from
               the StringVar before the camera was switched.
             • Stamp ``schema: 5``
+        schema 5 → 6  (named locations)
+            • Add top-level ``locations`` (list) and ``active_location`` (str)
+              for named location profiles; fold the existing single
+              ``location`` into a default "Home" profile.
+            • Stamp ``schema: 6``
         """
         v = data.get("schema", 0)
 
@@ -1785,11 +1843,26 @@ class AstroApp:
             data["schema"] = 5
             v = 5
 
+        if v < 6:
+            # ── 5 → 6: introduce named location profiles ──
+            # Fold any existing single observer location into a default
+            # "Home" profile so dark-site travelers can save more sites.
+            data.setdefault("locations", [])
+            data.setdefault("active_location", "")
+            loc = data.get("location", {}) or {}
+            if (not data["locations"]
+                    and loc.get("lat") is not None and loc.get("lon") is not None):
+                data["locations"].append(
+                    {"name": "Home", "lat": loc["lat"], "lon": loc["lon"]})
+                data["active_location"] = "Home"
+            data["schema"] = 6
+            v = 6
+
         # Future migrations go here:
-        # if v < 6:
+        # if v < 7:
         #     ...
-        #     data["schema"] = 6
-        #     v = 6
+        #     data["schema"] = 7
+        #     v = 7
 
         return data
 
@@ -3449,6 +3522,25 @@ class AstroApp:
         # ── OBSERVER LOCATION ─────────────────────────────────────────────
         loc_card = self._make_settings_card(outer, "OBSERVER LOCATION", "#38bdf8")
 
+        # Location-profile selector — named sites for dark-site travelers
+        prof_row = ttk.Frame(loc_card)
+        prof_row.pack(fill="x", padx=8, pady=(4, 0))
+        ttk.Label(prof_row, text="Location:").grid(row=0, column=0, padx=4, pady=2, sticky="e")
+        self._settings_loc_choice = tk.StringVar(value=self.data.get("active_location", ""))
+        self._settings_loc_combo = ttk.Combobox(
+            prof_row, textvariable=self._settings_loc_choice, state="readonly",
+            width=22, values=self._location_names())
+        self._settings_loc_combo.grid(row=0, column=1, padx=4, pady=2, sticky="w")
+        self._settings_loc_combo.bind("<<ComboboxSelected>>", self._on_settings_location_selected)
+        ttk.Button(prof_row, text="☆ Save",
+                   command=self._open_save_location_dialog).grid(row=0, column=2, padx=(8, 2), pady=2)
+        ttk.Button(prof_row, text="⚙ Manage",
+                   command=self._open_manage_locations_dialog).grid(row=0, column=3, padx=2, pady=2)
+        ToolTip(self._settings_loc_combo,
+                "Switch between saved observing sites.\n"
+                "Save the current coordinates as a profile with ☆,\n"
+                "or rename/delete saved sites with ⚙.")
+
         loc_row = ttk.Frame(loc_card)
         loc_row.pack(fill="x", padx=8, pady=4)
 
@@ -3651,7 +3743,9 @@ class AstroApp:
             self.save_data()
             self.refresh_twilight_header()
             self.refresh_moon_header()
-            self._settings_loc_status.config(text="✅ Location detected and saved", foreground="#4caf50")
+            self._settings_loc_status.config(
+                text="✅ Detected — press ☆ Save to keep it as a named profile",
+                foreground="#4caf50")
         else:
             self._settings_loc_status.config(text="❌ Failed — enter manually and press Save", foreground="red")
 
@@ -3664,10 +3758,18 @@ class AstroApp:
             messagebox.showerror("Invalid", "Please enter valid latitude and longitude.")
             return
         self.data["location"] = {"lat": lat, "lon": lon}
+        # If a named profile is active, keep its stored coordinates in sync.
+        active = self.data.get("active_location", "")
+        prof = self._find_location(active) if active else None
+        if prof is not None:
+            prof["lat"], prof["lon"] = lat, lon
         self.save_data()
         self.refresh_twilight_header()
         self.refresh_moon_header()
-        self._settings_loc_status.config(text="✅ Location saved", foreground="#4caf50")
+        self._refresh_location_dropdowns()
+        self._settings_loc_status.config(
+            text=("✅ Location saved" + (f" to '{active}'" if prof is not None else "")),
+            foreground="#4caf50")
 
     def _settings_save_preferences(self):
         """Save analysis preferences to the data file."""
@@ -4355,8 +4457,14 @@ class AstroApp:
                               if e["target_id"] == tid and e.get("scope", "") == scope_key]
             first = target_entries[0]
 
-            ra_deg  = first.get("ra_deg", 0.0)
-            dec_deg = first.get("dec_deg", 0.0)
+            # Prefer the FOV-framed centre (catalog centre adjusted for any pan
+            # of the framing box); fall back to the catalog centre when absent.
+            ra_deg  = first.get("framed_ra_deg")
+            if ra_deg is None:
+                ra_deg = first.get("ra_deg", 0.0)
+            dec_deg = first.get("framed_dec_deg")
+            if dec_deg is None:
+                dec_deg = first.get("dec_deg", 0.0)
             rah, ram, ras             = _ra_parts(ra_deg)
             decd, decm, decs, neg_dec = _dec_parts(dec_deg)
             pos_angle = first.get("rotation_angle", 0.0)
@@ -4392,7 +4500,7 @@ class AstroApp:
                 lines.append('      <ImageType>LIGHT</ImageType>')
                 if filt_name:
                     lines.append('      <FilterType>')
-                    lines.append(f'        <n>{filt_name}</n>')
+                    lines.append(f'        <Name>{filt_name}</Name>')
                     lines.append('      </FilterType>')
                 lines.append('      <Binning>')
                 lines.append('        <X>1</X>')
@@ -4534,6 +4642,71 @@ class AstroApp:
             return float(lat), float(lon)
         return None, None
 
+    # ── Named location profiles ───────────────────────────────────────────
+
+    def _location_names(self):
+        """Return saved location-profile names, in order."""
+        return [p.get("name", "") for p in self.data.get("locations", []) if p.get("name")]
+
+    def _find_location(self, name):
+        """Return the saved location profile dict with this name, or None."""
+        for p in self.data.get("locations", []):
+            if p.get("name") == name:
+                return p
+        return None
+
+    def _apply_location(self, name):
+        """Make the named profile the active observer location.
+
+        Copies the profile's lat/lon into ``data['location']`` — the single
+        resolved location every calculation already reads — records it as the
+        active profile, persists, and refreshes the twilight/moon headers.
+        Keeps the Settings fields/dropdown in sync when that tab exists.
+        Returns (lat, lon), or (None, None) if the name is unknown.
+        """
+        p = self._find_location(name)
+        if p is None:
+            return None, None
+        lat, lon = p.get("lat"), p.get("lon")
+        self.data["location"] = {"lat": lat, "lon": lon}
+        self.data["active_location"] = name
+        self._persist_data()
+        self.refresh_twilight_header()
+        self.refresh_moon_header()
+        if hasattr(self, "_settings_lat_var") and lat is not None:
+            self._settings_lat_var.set(f"{float(lat):.4f}")
+            self._settings_lon_var.set(f"{float(lon):.4f}")
+        if hasattr(self, "_settings_loc_choice"):
+            self._settings_loc_choice.set(name)
+        return (float(lat), float(lon)) if lat is not None else (None, None)
+
+    def _refresh_location_dropdowns(self):
+        """Repopulate location dropdowns (Settings + any open Visible Tonight popup)."""
+        names  = self._location_names()
+        active = self.data.get("active_location", "")
+        if hasattr(self, "_settings_loc_combo"):
+            try:
+                self._settings_loc_combo["values"] = names
+                self._settings_loc_choice.set(active)
+            except tk.TclError:
+                pass
+        combo = getattr(self, "_vt_loc_combo", None)
+        if combo is not None:
+            try:
+                combo["values"] = names
+            except tk.TclError:
+                pass
+
+    def _on_settings_location_selected(self, event=None):
+        """Settings location dropdown changed — activate the picked profile."""
+        name = self._settings_loc_choice.get()
+        if not name:
+            return
+        lat, lon = self._apply_location(name)
+        if lat is not None:
+            self._settings_loc_status.config(
+                text=f"✅ Active location: {name}", foreground="#4caf50")
+
     def _alt_canvas_motion(self, event):
         """Crosshair + tooltip showing time & altitude at the hovered chart position."""
         meta = getattr(self, "_chart_meta", None)
@@ -4637,7 +4810,7 @@ class AstroApp:
         """Open the 'Visible Tonight' popup — scans the catalog for objects above min altitude."""
         popup = tk.Toplevel(self.root)
         popup.title("🌙 Visible Tonight")
-        popup.geometry("660x620")
+        popup.geometry("740x620")
         popup.resizable(True, True)
 
         # --- Location frame ---
@@ -4646,22 +4819,42 @@ class AstroApp:
 
         saved_lat, saved_lon = self._get_saved_location()
 
-        ttk.Label(loc_frame, text="Latitude:").grid(row=0, column=0, padx=5, pady=(6,2), sticky="e")
+        ttk.Label(loc_frame, text="Location:").grid(row=0, column=0, padx=5, pady=(6,2), sticky="e")
+        loc_prof_var = tk.StringVar(value=self.data.get("active_location", ""))
+        self._vt_loc_combo = ttk.Combobox(loc_frame, textvariable=loc_prof_var,
+                                          state="readonly", width=20,
+                                          values=self._location_names())
+        self._vt_loc_combo.grid(row=0, column=1, columnspan=3, padx=5, pady=(6,2), sticky="w")
+        ToolTip(self._vt_loc_combo, "Switch saved observing sites — re-runs the search.\n"
+                                    "Manage sites in Settings → Observer Location.")
+
+        ttk.Label(loc_frame, text="Latitude:").grid(row=1, column=0, padx=5, pady=2, sticky="e")
         lat_var = tk.StringVar(value=str(saved_lat) if saved_lat is not None else "")
         lat_entry = ttk.Entry(loc_frame, textvariable=lat_var, width=12)
-        lat_entry.grid(row=0, column=1, padx=5, pady=(6,2))
+        lat_entry.grid(row=1, column=1, padx=5, pady=2)
 
-        ttk.Label(loc_frame, text="Longitude:").grid(row=0, column=2, padx=5, pady=(6,2), sticky="e")
+        ttk.Label(loc_frame, text="Longitude:").grid(row=1, column=2, padx=5, pady=2, sticky="e")
         lon_var = tk.StringVar(value=str(saved_lon) if saved_lon is not None else "")
         lon_entry = ttk.Entry(loc_frame, textvariable=lon_var, width=12)
-        lon_entry.grid(row=0, column=3, padx=5, pady=(6,2))
+        lon_entry.grid(row=1, column=3, padx=5, pady=2)
 
         ttk.Button(loc_frame, text="Auto-detect", command=lambda: do_autodetect()).grid(
-            row=0, column=4, padx=(10,5), pady=(6,2))
+            row=1, column=4, padx=(10,5), pady=2)
+
+        def _on_vt_loc_selected(event=None):
+            name = loc_prof_var.get()
+            p = self._find_location(name)
+            if not p:
+                return
+            lat_var.set(f"{float(p['lat']):.4f}")
+            lon_var.set(f"{float(p['lon']):.4f}")
+            self._apply_location(name)
+            _run_search()
+        self._vt_loc_combo.bind("<<ComboboxSelected>>", _on_vt_loc_selected)
 
         # Status row — pre-allocated so the dialog never shifts when text appears
         loc_status = ttk.Label(loc_frame, text="", width=30)
-        loc_status.grid(row=1, column=0, columnspan=5, padx=8, pady=(0,6), sticky="w")
+        loc_status.grid(row=2, column=0, columnspan=5, padx=8, pady=(0,6), sticky="w")
 
         def do_autodetect():
             loc_status.config(text="  Detecting…", foreground="orange")
@@ -4797,18 +4990,20 @@ class AstroApp:
         res_frame = ttk.Frame(popup)
         res_frame.pack(fill="both", expand=True, padx=12, pady=4)
 
-        cols = ("Name", "Common Name", "Type", "Max Alt", "Mag", "Size")
+        cols = ("Name", "Common Name", "Type", "Max Alt", "Rise", "Mag", "Size")
         tree = ttk.Treeview(res_frame, columns=cols, show="headings", height=16)
         tree.heading("Name", text="Name")
         tree.heading("Common Name", text="Common Name")
         tree.heading("Type", text="Type")
         tree.heading("Max Alt", text="Max Alt °")
+        tree.heading("Rise", text="Rise")
         tree.heading("Mag", text="Mag")
         tree.heading("Size", text="Size (′)")
         tree.column("Name", width=90)
         tree.column("Common Name", width=150)
         tree.column("Type", width=110)
         tree.column("Max Alt", width=70, anchor="center")
+        tree.column("Rise", width=70, anchor="center")
         tree.column("Mag", width=55, anchor="center")
         tree.column("Size", width=70, anchor="center")
 
@@ -4816,6 +5011,73 @@ class AstroApp:
         tree.configure(yscrollcommand=vsb.set)
         tree.pack(side="left", fill="both", expand=True)
         vsb.pack(side="right", fill="y")
+
+        # ── Click-to-sort on column headers (single click; toggles asc/desc) ──
+        _sort_state = {"col": "Max Alt", "desc": True}
+
+        def _natural_key(s):
+            parts = re.split(r'(\d+)', s or "")
+            return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+        def _col_key(col, val):
+            if col == "Max Alt":
+                try:
+                    return float(val.rstrip("°"))
+                except ValueError:
+                    return -999.0
+            if col == "Rise":
+                if val == "up":
+                    return -1.0                  # observable from dusk -> earliest
+                if val in ("—", ""):
+                    return 1e9                   # never rises while dark -> last
+                try:
+                    hh, mm = val.split(":")
+                    mins = int(hh) * 60 + int(mm)
+                    if mins < 12 * 60:           # after-midnight times come later
+                        mins += 24 * 60
+                    return float(mins)
+                except ValueError:
+                    return 1e9
+            if col == "Mag":
+                try:
+                    return float(val)
+                except ValueError:
+                    return 1e9                   # unknown magnitude -> last
+            if col == "Size":
+                try:
+                    return float(val.split("×")[0].strip())
+                except (ValueError, IndexError):
+                    return -1.0
+            return _natural_key(val)             # Name / Common Name / Type
+
+        def _update_sort_indicators():
+            mag_label = "SB" if use_surf_br_var.get() else "Mag"
+            base = {"Name": "Name", "Common Name": "Common Name", "Type": "Type",
+                    "Max Alt": "Max Alt °", "Rise": "Rise",
+                    "Mag": mag_label, "Size": "Size (′)"}
+            arrow = " ▼" if _sort_state["desc"] else " ▲"
+            for c, txt in base.items():
+                tree.heading(c, text=txt + (arrow if c == _sort_state["col"] else ""))
+
+        def _apply_sort():
+            col = _sort_state["col"]
+            rows = [(_col_key(col, tree.set(iid, col)), iid)
+                    for iid in tree.get_children("")]
+            rows.sort(key=lambda r: r[0], reverse=_sort_state["desc"])
+            for idx, (_, iid) in enumerate(rows):
+                tree.move(iid, "", idx)
+            _update_sort_indicators()
+
+        def _sort_by(col):
+            if _sort_state["col"] == col:
+                _sort_state["desc"] = not _sort_state["desc"]
+            else:
+                _sort_state["col"] = col
+                _sort_state["desc"] = False      # new column defaults to ascending
+            _apply_sort()
+
+        for _c in cols:
+            tree.heading(_c, command=lambda cc=_c: _sort_by(cc))
 
         prog_label = ttk.Label(popup, text="")
         prog_label.pack()
@@ -4930,10 +5192,10 @@ class AstroApp:
                         if mag_val is None or mag_val > mag_limit:
                             continue
 
-                    max_alt = _max_altitude_tonight(t["ra_deg"], t["dec_deg"],
-                                                    lat, lon, dark_range=dark_range)
+                    max_alt, rise_label = _alt_rise_tonight(
+                        t["ra_deg"], t["dec_deg"], lat, lon, min_alt, dark_range)
                     if max_alt >= min_alt:
-                        results.append((t, max_alt))
+                        results.append((t, max_alt, rise_label))
 
                 # Sort by altitude descending
                 results.sort(key=lambda x: x[1], reverse=True)
@@ -4942,13 +5204,16 @@ class AstroApp:
                     tree.delete(*tree.get_children())
                     mag_col_label = "SB" if use_surf_br else "Mag"
                     tree.heading("Mag", text=mag_col_label)
-                    for t, alt in results:
+                    for t, alt, rise_label in results:
                         common = t["common"].split(";")[0].strip() if t["common"] else ""
                         size = f"{t['size_maj']:.1f} × {t['size_min']:.1f}" if t["size_maj"] else "—"
                         mag_val = t.get("surf_br") if use_surf_br else t.get("v_mag")
                         mag_str = f"{mag_val:.1f}" if mag_val is not None else "—"
+                        rise_str = rise_label if rise_label else "—"
                         tree.insert("", "end", values=(
-                            t["id"], common, t.get("obj_type", ""), f"{alt:.0f}°", mag_str, size))
+                            t["id"], common, t.get("obj_type", ""),
+                            f"{alt:.0f}°", rise_str, mag_str, size))
+                    _apply_sort()
                     prog_label.config(
                         text=f"{fallback_note}Found {len(results)} visible target{'s' if len(results) != 1 else ''} tonight.",
                         foreground="green")
@@ -4987,7 +5252,8 @@ class AstroApp:
                 self.analyze_framing()
 
         tree.bind("<Double-1>", on_select)
-        ttk.Label(popup, text="Double-click a target to load it into the planner.",
+        ttk.Label(popup,
+                  text="Click a column header to sort  ·  Double-click a target to load it  ·  “up” = already above the horizon at dark",
                   font=("Helvetica", 8)).pack(pady=(0, 6))
 
         # Apply current day/night theme to the popup window and its widgets
@@ -6081,6 +6347,259 @@ class AstroApp:
 
         self._theme_popup(dlg)
 
+    def _open_save_location_dialog(self):
+        """Modal 'Save Location' dialog — name the current coordinates as a profile."""
+        try:
+            lat = float(self._settings_lat_var.get())
+            lon = float(self._settings_lon_var.get())
+        except (ValueError, AttributeError):
+            messagebox.showerror(
+                "No coordinates",
+                "Enter a latitude and longitude (or use Auto-detect) before saving a location.")
+            return
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Save Location")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        ttk.Label(dlg, text="Name this location:",
+                  font=("Helvetica", 11, "bold")).pack(padx=20, pady=(14, 4), anchor="w")
+
+        name_var = tk.StringVar(value=self.data.get("active_location", ""))
+        name_entry = ttk.Entry(dlg, textvariable=name_var, width=34, font=("Helvetica", 11))
+        name_entry.pack(padx=20, pady=(0, 12), fill="x")
+        name_entry.focus_set()
+        name_entry.select_range(0, tk.END)
+
+        ttk.Label(dlg, text="Will save:", font=("Helvetica", 9, "bold"),
+                  foreground="#778899").pack(padx=20, pady=(2, 4), anchor="w")
+        preview = tk.Frame(dlg, bg="#0e1a28")
+        preview.pack(padx=20, pady=(0, 10), fill="x")
+        for i, (k, vv) in enumerate([("Latitude", f"{lat:.4f}"), ("Longitude", f"{lon:.4f}")]):
+            tk.Label(preview, text=f"{k}:", bg="#0e1a28", fg="#8a94a3",
+                     font=("Helvetica", 10), anchor="w", width=9
+                     ).grid(row=i, column=0, sticky="w", padx=(8, 4), pady=1)
+            tk.Label(preview, text=vv, bg="#0e1a28", fg="#cfd4dc",
+                     font=("Helvetica", 10), anchor="w"
+                     ).grid(row=i, column=1, sticky="w", padx=(0, 8), pady=1)
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(padx=20, pady=(6, 14), fill="x")
+
+        def _do_save():
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showerror("Invalid name",
+                                     "Please enter a name for this location.", parent=dlg)
+                return
+            locations = self.data.setdefault("locations", [])
+            existing = next((p for p in locations if p.get("name") == name), None)
+            if existing is not None:
+                if not messagebox.askyesno(
+                        "Overwrite location?",
+                        f"A location named '{name}' already exists.\n\n"
+                        "Overwrite its coordinates with the current values?",
+                        parent=dlg):
+                    return
+                existing["lat"], existing["lon"] = lat, lon
+                toast_msg = f"Updated location: {name}"
+            else:
+                locations.append({"name": name, "lat": lat, "lon": lon})
+                toast_msg = f"Saved location: {name}"
+            self.data["active_location"] = name
+            self.data["location"] = {"lat": lat, "lon": lon}
+            self._persist_data()
+            self.refresh_twilight_header()
+            self.refresh_moon_header()
+            self._refresh_location_dropdowns()
+            if hasattr(self, "_settings_loc_status"):
+                self._settings_loc_status.config(
+                    text=f"✅ Active location: {name}", foreground="#4caf50")
+            self._show_toast(toast_msg)
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btn_row, text="Save",   command=_do_save   ).pack(side="right")
+        dlg.bind("<Return>", lambda e: _do_save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        self._theme_popup(dlg)
+
+    def _open_manage_locations_dialog(self):
+        """Modal 'Manage Locations' dialog — set active / rename / update / delete."""
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Manage Locations")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        main = ttk.Frame(dlg)
+        main.pack(padx=16, pady=14, fill="both", expand=True)
+
+        left = ttk.Frame(main)
+        left.pack(side="left", fill="y", padx=(0, 14))
+        ttk.Label(left, text="Saved locations:", font=("Helvetica", 9, "bold"),
+                  foreground="#778899").pack(anchor="w", pady=(0, 4))
+        lb = tk.Listbox(left, height=8, width=24, font=("Helvetica", 11),
+                        bg="#1e2d3e", fg="#ffffff",
+                        selectbackground="#1e3a5f", selectforeground="#aaddff",
+                        relief="flat", borderwidth=1, exportselection=False, activestyle="none")
+        lb.pack(fill="y")
+        name_list = []
+
+        right = ttk.Frame(main)
+        right.pack(side="left", fill="both", expand=True)
+        ttk.Label(right, text="Coordinates:", font=("Helvetica", 9, "bold"),
+                  foreground="#778899").pack(anchor="w", pady=(0, 4))
+        details = tk.Frame(right, bg="#0e1a28", width=200, height=90)
+        details.pack(fill="both", expand=True)
+        details.pack_propagate(False)
+        detail_labels = {}
+        for i, k in enumerate(["Latitude", "Longitude"]):
+            tk.Label(details, text=f"{k}:", bg="#0e1a28", fg="#8a94a3",
+                     font=("Helvetica", 10), anchor="w", width=9
+                     ).grid(row=i, column=0, sticky="w", padx=(10, 4), pady=4)
+            lbl = tk.Label(details, text="—", bg="#0e1a28", fg="#cfd4dc",
+                           font=("Helvetica", 10), anchor="w")
+            lbl.grid(row=i, column=1, sticky="w", padx=(0, 10), pady=4)
+            detail_labels[k.lower()] = lbl
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(padx=16, pady=(0, 14), fill="x")
+
+        def _selected_name():
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(name_list):
+                return None
+            return name_list[sel[0]]
+
+        def _refresh_list(preserve_name=None):
+            active = self.data.get("active_location", "")
+            lb.delete(0, tk.END)
+            name_list.clear()
+            for p in self.data.get("locations", []):
+                name = p.get("name", "")
+                if not name:
+                    continue
+                prefix = "★ " if name == active else "   "
+                lb.insert(tk.END, f"{prefix}{name}")
+                name_list.append(name)
+            if preserve_name and preserve_name in name_list:
+                idx = name_list.index(preserve_name)
+                lb.selection_set(idx)
+                lb.see(idx)
+            elif name_list:
+                lb.selection_set(0)
+            _on_select()
+
+        def _on_select(event=None):
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(name_list):
+                for lbl in detail_labels.values():
+                    lbl.configure(text="—")
+                return
+            p = self._find_location(name_list[sel[0]])
+            if p is None:
+                return
+            lat, lon = p.get("lat"), p.get("lon")
+            detail_labels["latitude"].configure(text=f"{float(lat):.4f}" if lat is not None else "—")
+            detail_labels["longitude"].configure(text=f"{float(lon):.4f}" if lon is not None else "—")
+
+        lb.bind("<<ListboxSelect>>", _on_select)
+
+        def _do_set_active():
+            name = _selected_name()
+            if not name:
+                return
+            self._apply_location(name)
+            self._refresh_location_dropdowns()
+            _refresh_list(preserve_name=name)
+            self._show_toast(f"Active location: {name}")
+
+        def _do_rename():
+            name = _selected_name()
+            if not name:
+                return
+            new_name = simpledialog.askstring("Rename Location",
+                                              f"Rename '{name}' to:",
+                                              parent=dlg, initialvalue=name)
+            if new_name is None:
+                return
+            new_name = new_name.strip()
+            if not new_name or new_name == name:
+                return
+            if self._find_location(new_name):
+                messagebox.showerror("Name exists",
+                                     f"A location named '{new_name}' already exists.",
+                                     parent=dlg)
+                return
+            p = self._find_location(name)
+            p["name"] = new_name
+            if self.data.get("active_location") == name:
+                self.data["active_location"] = new_name
+            self._persist_data()
+            _refresh_list(preserve_name=new_name)
+            self._refresh_location_dropdowns()
+
+        def _do_update():
+            name = _selected_name()
+            if not name:
+                return
+            try:
+                lat = float(self._settings_lat_var.get())
+                lon = float(self._settings_lon_var.get())
+            except (ValueError, AttributeError):
+                messagebox.showerror(
+                    "No coordinates",
+                    "The Settings latitude/longitude fields don't contain valid numbers to save.",
+                    parent=dlg)
+                return
+            if not messagebox.askyesno(
+                    "Update Location",
+                    f"Overwrite '{name}' with the coordinates currently in Settings "
+                    f"({lat:.4f}, {lon:.4f})?", parent=dlg):
+                return
+            p = self._find_location(name)
+            p["lat"], p["lon"] = lat, lon
+            if self.data.get("active_location") == name:
+                self.data["location"] = {"lat": lat, "lon": lon}
+                self.refresh_twilight_header()
+                self.refresh_moon_header()
+            self._persist_data()
+            _refresh_list(preserve_name=name)
+            self._show_toast(f"Updated location: {name}")
+
+        def _do_delete():
+            name = _selected_name()
+            if not name:
+                return
+            if not messagebox.askyesno(
+                    "Delete Location",
+                    f"Delete the location '{name}'?\n\nThis cannot be undone.", parent=dlg):
+                return
+            locations = self.data.setdefault("locations", [])
+            locations[:] = [p for p in locations if p.get("name") != name]
+            if self.data.get("active_location") == name:
+                self.data["active_location"] = ""
+            self._persist_data()
+            _refresh_list()
+            self._refresh_location_dropdowns()
+            self._show_toast(f"Deleted location: {name}")
+
+        ttk.Button(btn_row, text="Set Active", command=_do_set_active).pack(side="left")
+        ttk.Button(btn_row, text="Rename",     command=_do_rename    ).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Update",     command=_do_update    ).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Delete",     command=_do_delete    ).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Close",      command=dlg.destroy   ).pack(side="right")
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+
+        active = self.data.get("active_location", "")
+        _refresh_list(preserve_name=active if active else None)
+
+        self._theme_popup(dlg)
+
     def on_parameter_change(self, *args):
         """Called whenever a planner Combobox changes — clears queue-edit link, marks dirty if auto-update is on."""
         # Skip if we're programmatically restoring equipment from a queue row
@@ -6773,6 +7292,39 @@ class AstroApp:
         """Return the current (x, y) centre of the FOV overlay on the preview canvas."""
         cw, ch = 240, 240
         return cw / 2 + self._fov_offset_x, ch / 2 + self._fov_offset_y
+
+    def _framed_center(self, ra0_deg, dec0_deg):
+        """Return (ra_deg, dec_deg) of the FOV box centre after any pan.
+
+        The preview maps sky to canvas as px_per_deg = 240 / survey_deg * zoom,
+        and the pan is accumulated in canvas pixels (self._fov_offset_x/y).
+        SkyView DSS2 images are North-up / East-left, so screen +x is West and
+        screen +y is South.  The box centre is positioned before the box
+        rotation is applied, so the rotation angle is not needed here.
+
+        Falls back to the catalog centre when there is no pan or the survey
+        scale is unknown.
+        """
+        offset_x   = getattr(self, "_fov_offset_x", 0.0) or 0.0
+        offset_y   = getattr(self, "_fov_offset_y", 0.0) or 0.0
+        survey_deg = getattr(self, "_cached_dss_survey_deg", None)
+        zoom       = getattr(self, "_zoom_level", 1.0) or 1.0
+
+        # No pan, or no scale to convert pixels to degrees -> catalog centre.
+        if (offset_x == 0.0 and offset_y == 0.0) or not survey_deg:
+            return ra0_deg, dec0_deg
+
+        deg_per_px  = survey_deg / (240.0 * zoom)
+        d_east_deg  = -offset_x * deg_per_px   # screen +x (right) = West  = -East
+        d_north_deg = -offset_y * deg_per_px   # screen +y (down)  = South = -North
+
+        framed_dec = max(-90.0, min(90.0, dec0_deg + d_north_deg))
+        cos_dec    = math.cos(math.radians(dec0_deg))
+        if abs(cos_dec) < 1e-6:                # guard near the poles
+            framed_ra = ra0_deg % 360.0
+        else:
+            framed_ra = (ra0_deg + d_east_deg / cos_dec) % 360.0
+        return framed_ra, framed_dec
 
     def _fov_mouse_down(self, event):
         """Begin a pan or rotate drag — picks rotate if the mouse is over a corner handle."""
@@ -7698,6 +8250,8 @@ class AstroApp:
         except ValueError:
             reduction = 1.0
 
+        framed_ra, framed_dec = self._framed_center(t["ra_deg"], t["dec_deg"])
+
         entry = {
             "target_id":      t["id"],
             "common":         t.get("common", "").split(";")[0].strip(),
@@ -7723,6 +8277,8 @@ class AstroApp:
             "exp_s":          None,
             "computed":       False,
             "rotation_angle": getattr(self, "_fov_angle", 0.0),
+            "framed_ra_deg":  framed_ra,
+            "framed_dec_deg": framed_dec,
         }
         # ── Short-window / no-window warning ──────────────────────────────
         win_hrs_now = self._last_win_hrs or 0.0  # None means no window tonight
@@ -8595,6 +9151,8 @@ class AstroApp:
                     "added":         datetime.now().strftime("%Y-%m-%d %H:%M"),
                     "report_text":   e.get("report_text", ""),
                     "rotation_angle": e.get("rotation_angle", 0.0),
+                    "framed_ra_deg":  e.get("framed_ra_deg"),
+                    "framed_dec_deg": e.get("framed_dec_deg"),
                 })
             added += 1
 
@@ -8693,6 +9251,8 @@ class AstroApp:
                 "added":         datetime.now().strftime("%Y-%m-%d %H:%M"),
                 "report_text":   e.get("report_text", ""),
                 "rotation_angle": e.get("rotation_angle", 0.0),
+                "framed_ra_deg":  e.get("framed_ra_deg"),
+                "framed_dec_deg": e.get("framed_dec_deg"),
             })
 
         self._refresh_plan_tree()
