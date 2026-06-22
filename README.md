@@ -27,10 +27,11 @@ Lightbucket is a free, local desktop app that closes the gap between **"what sho
 In one window it:
 
 - 🔭 **Searches NGC, IC, Messier, Caldwell, and Sharpless** from one box, with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976) and a per-catalog filter to narrow suggestions to just the lists you care about
-- 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image
+- 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image — and your final framing carries through to the export, so if you nudge the frame off-centre or rotate it, NINA centres and rotates to match
 - 🗺️ **Opens an interactive sky map** centred on your target — a wide-field view with constellations, the Milky Way, a coordinate grid, and your sensor frame drawn in, as the zoomed-out companion to the close-up DSS framing
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
 - 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
+- 📍 **Saves named location profiles** so dark-site travelers can switch between home and remote sites in a click — every twilight, moon, and altitude calculation follows the active site
 - 📊 **Builds a multi-target Gantt schedule** for the night, with per-rig support for dual-scope setups
 - 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
 - 🧩 **Imports your NINA profile** — pulls in filter-wheel names (LRGB + narrowband, with a bandwidth prompt) and your configured telescope, showing a preview of exactly what will be added or updated before anything is saved
@@ -84,7 +85,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.1.0.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.1.1.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -103,7 +104,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.1.0-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.1.1-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -153,6 +154,14 @@ manually and click **Save**, or click **📍 Auto-detect** to try again.
 
 Accurate coordinates matter for twilight times, moon altitude, and the
 per-target imaging window, so it's worth getting right.
+
+If you observe from more than one place, save each as a **named location
+profile**: get the coordinates right, then use the **Location** dropdown's
+**☆ Save** to name the site (your first one is created automatically as
+*Home*). Switch sites anytime from that dropdown — or from the Visible
+Tonight dialog — and use **⚙ Manage** to rename, update, or delete them.
+Auto-detect fills the fields and leaves saving to you, so detecting a new
+spot never overwrites a saved site.
 
 ### 4. (Optional) Import your NINA profile — *Settings* tab
 
@@ -213,7 +222,9 @@ auto-completes against the NGC / IC catalog and the bundled common-name map
 The right side of the tab shows:
 
 - A **DSS thumbnail** of the target with a draggable, rotatable sensor frame
-  that previews exactly how the object will land on your sensor.
+  that previews exactly how the object will land on your sensor. Pan the frame
+  off the catalog centre or rotate it, and that exact centre and position
+  angle are what get written to the NINA export.
 - A **text analysis** panel with recommended sub-exposure, moon conditions,
   the night's imaging window for that target, and integration math.
 - An **altitude track** showing the target's altitude across the night with
@@ -244,6 +255,17 @@ it isn't available, the map falls back to opening in your default browser, so
 the button never dead-ends. macOS uses the built-in system web view — nothing
 extra to install.
 
+The **🌙 Visible Tonight** button scans the whole catalog for objects that
+clear your altitude floor during tonight's dark window, filtered by object
+type and magnitude (or surface brightness). Each result shows its peak
+altitude and a **Rise** column — the local time the object first climbs above
+your minimum altitude while the sky is dark, or *up* if it's already above the
+line at dusk. **Single-click any column header to sort** (click again to
+reverse); names sort naturally (M9 before M13) and rise times read dusk-to-dawn
+in order. A **Location** dropdown at the top switches saved sites and re-runs
+the scan, so you can compare what's up from home versus a darker site.
+Double-click a row to load that target into the Planner.
+
 ### ⭐ Targets
 
 A multi-target queue. Use this to build up a shortlist of candidates — for
@@ -260,7 +282,11 @@ schedule, and the exports:
   a notes app or print.
 - **Export to NINA** — writes a `.ninaTargetSet` file you can open directly
   in NINA's Sequencer. If your plan spans multiple telescopes, the app
-  detects this and writes one file per scope into a folder you choose.
+  detects this and writes one file per scope into a folder you choose. Each
+  target carries J2000 coordinates — the framed centre if you moved the FOV
+  box, otherwise the catalog position — the FOV rotation as NINA's position
+  angle, and your filter names (LRGB, narrowband, and mono luminance) so
+  sequences drop in already framed and matched to your filter wheel.
 
 Plans are saved as JSON session files in a `sessions` subfolder. When you
 close the app with entries still in the plan, you're prompted to save first.
@@ -272,9 +298,11 @@ Values entered here populate the equipment dropdowns throughout the app.
 
 ### ⚙ Settings
 
-Observer location, analysis preferences, and data management (NINA profile
-import, NGC / IC catalog re-download, DSS image cache clear). See the
-[First-Run Setup](#first-run-setup) section for details on each field.
+Observer location — including named **location profiles** for multiple
+observing sites, with ☆ to save the current coordinates and ⚙ to rename,
+update, or delete saved sites — analysis preferences, and data management
+(NINA profile import, NGC / IC catalog re-download, DSS image cache clear).
+See the [First-Run Setup](#first-run-setup) section for details on each field.
 
 ---
 
@@ -336,6 +364,21 @@ re-run **Import NINA Profile**.
 New in 1.1.0, the **Sky Map** needs nothing migrated — it's available as soon
 as you've installed the update and analyzed a target. On Windows, if the
 embedded window can't start, the map opens in your default browser instead.
+
+New in 1.1.1, nothing needs migrating either:
+
+- **Your location becomes a profile automatically.** On first launch the
+  update folds your existing coordinates into a named *Home* profile, so
+  nothing changes until you add more sites. Save extra dark-site profiles from
+  **Settings → Observer Location**.
+- **FOV framing now reaches NINA.** Panning or rotating the framing box on the
+  Planner is carried into the `.ninaTargetSet` as the target centre and
+  position angle (J2000) — no setup required.
+- **Mono filters export correctly.** Filter names for mono LRGB/narrowband
+  sequences now match NINA's target-set format, so they slot straight into the
+  filter wheel on import. Re-export any older plans to pick this up.
+- **Visible Tonight gained a Rise column and sortable headers.** No migration
+  needed — open the dialog and click a header to sort.
 
 ---
 
