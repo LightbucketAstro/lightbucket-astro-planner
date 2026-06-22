@@ -172,8 +172,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName":              "Lightbucket Astro Planner",
             "CFBundleDisplayName":       "Lightbucket Astro Planner",
-            "CFBundleShortVersionString": "1.1.0",
-            "CFBundleVersion":           "1.1.0",
+            "CFBundleShortVersionString": "1.1.1",
+            "CFBundleVersion":           "1.1.1",
             "NSHighResolutionCapable":   True,
         },
     )
