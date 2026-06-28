@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.1.1-dev"
+__version__ = "1.1.2"
 
 # ── Sky-map catalog tiers (optional downloads) ─────────────────────────────
 # Pinned to the d3-celestial commit our bundled engine + stars.6 came from, so
@@ -3010,7 +3010,7 @@ class AstroApp:
         ctrl_row.pack(fill="x", pady=(3, 0))
         tk.Label(ctrl_row, text="Rot:", bg="#131f2e", fg="#778899",
                  font=("Helvetica", 9)).pack(side="left", padx=(6, 2))
-        self._rot_label = tk.Label(ctrl_row, text="0.0°", bg="#131f2e", fg="#ffffff",
+        self._rot_label = tk.Label(ctrl_row, text=f"{self._screen_to_sky_pa(0.0):.1f}°", bg="#131f2e", fg="#ffffff",
                                     font=("Helvetica", 9), width=5)
         self._rot_label.pack(side="left")
         tk.Label(ctrl_row, text="|", bg="#131f2e", fg="#2e4a63",
@@ -3366,7 +3366,7 @@ class AstroApp:
         export_btn = ttk.Button(btn_frame, text="📄 Export Session",
                                 command=self._export_session)
         export_btn.pack(side="left", padx=(0, 6))
-        ToolTip(export_btn, "Save tonight's plan as a formatted\ntext report (.txt) for printing or sharing.")
+        ToolTip(export_btn, "Save tonight's plan as a text or HTML report.\nThe HTML report embeds a per-target altitude chart;\nchoose the format in the Save dialog's file-type list.\nPrint the HTML to PDF from your browser if needed.")
         nina_btn = ttk.Button(btn_frame, text="🔭 Export as NINA",
                               command=self._export_nina)
         nina_btn.pack(side="left")
@@ -4331,15 +4331,37 @@ class AstroApp:
                 "Tonight's plan is empty — add some targets first.")
             return
         default = datetime.now().strftime("Session_%Y-%m-%d")
+        ftype_var = tk.StringVar()
         path = filedialog.asksaveasfilename(
-            title="Save Session",
+            title="Export Session",
             initialdir=str(self._get_sessions_dir()),
             initialfile=default,
-            defaultextension=".txt",
-            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            defaultextension="",
+            filetypes=[("Text report", "*.txt"), ("HTML report", "*.html"), ("All files", "*.*")],
+            typevariable=ftype_var,
         )
         if not path:
             return
+        # A typed, recognised extension wins; otherwise the file-type dropdown
+        # selection decides the format and we append the matching extension.
+        ext = Path(path).suffix.lower()
+        if ext in (".html", ".htm"):
+            fmt = "html"
+        elif ext == ".txt":
+            fmt = "text"
+        else:
+            fmt = "html" if "html" in (ftype_var.get() or "").lower() else "text"
+            path = path + (".html" if fmt == "html" else ".txt")
+
+        if fmt == "html":
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(self._build_session_html(Path(path).stem))
+                messagebox.showinfo("Exported", f"Session exported to:\n{path}")
+            except OSError as e:
+                messagebox.showerror("Export Failed", f"Could not write file.\n\nDetail: {e}")
+            return
+
         try:
             now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
             date_str = datetime.now().strftime("%Y-%m-%d")
@@ -4420,6 +4442,326 @@ class AstroApp:
         except OSError as e:
             messagebox.showerror("Save Failed", f"Could not write file.\n\nDetail: {e}")
 
+
+    def _build_session_html(self, session_name):
+        """Build a self-contained, light-theme HTML plan report with a per-target
+        altitude chart drawn as inline SVG.
+
+        No external assets and no extra dependencies — the file opens in any
+        browser, and a PDF copy is just Print -> Save as PDF.
+        """
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+        lat, lon = self._get_saved_location()
+        site = (self.data.get("active_location") or "").strip()
+
+        def esc(x):
+            return (str(x if x is not None else "")
+                    .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+
+        # Group entries by (target_id, scope), in encounter order — same rule as
+        # the text report: same object on two rigs gets two sections.
+        seen_groups = []
+        for e in self._plan_entries:
+            key = (e["target_id"], e.get("scope", ""))
+            if key not in seen_groups:
+                seen_groups.append(key)
+        total_targets = len(seen_groups)
+
+        total_subs  = sum(e["n_subs"]        for e in self._plan_entries)
+        total_alloc = sum(e["allocated_hrs"] for e in self._plan_entries)
+        total_int   = sum(e["total_int_hrs"] for e in self._plan_entries)
+
+        if site and lat is not None and lon is not None:
+            loc_str = f"{esc(site)} &middot; {lat:.4f}, {lon:.4f}"
+        elif lat is not None and lon is not None:
+            loc_str = f"{lat:.4f}, {lon:.4f}"
+        else:
+            loc_str = "location not set"
+
+        css = (
+            "*{box-sizing:border-box}"
+            "body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;"
+            "color:#1f2730;margin:0;padding:28px;background:#f4f5f3;line-height:1.5}"
+            ".page{max-width:880px;margin:0 auto;background:#fff;border:1px solid #d8dde3;"
+            "border-radius:10px;padding:26px 32px}"
+            ".hdr{border-bottom:2px solid #0f6e56;padding-bottom:10px;margin-bottom:16px}"
+            ".hdr h1{font-size:20px;font-weight:600;margin:0}"
+            ".hdr .sub{font-size:12px;color:#5f6b78;margin-top:4px}"
+            ".totals{display:flex;flex-wrap:wrap;gap:20px;font-size:13px;margin-bottom:24px}"
+            ".totals .k{color:#7a8593}.totals b{font-weight:600}"
+            ".target{margin-bottom:30px;page-break-inside:avoid}"
+            ".target h2{font-size:16px;font-weight:600;margin:0 0 10px;color:#16323b}"
+            ".fields{display:grid;grid-template-columns:auto 1fr auto 1fr;gap:5px 16px;"
+            "font-size:13px;margin-bottom:14px}"
+            ".fields .k{color:#7a8593;white-space:nowrap}"
+            "table.subs{width:100%;border-collapse:collapse;font-size:12.5px;margin-bottom:14px}"
+            "table.subs th{text-align:left;font-weight:600;color:#5f6b78;"
+            "border-bottom:1px solid #d8dde3;padding:4px 10px 6px 0}"
+            "table.subs td{padding:4px 10px 4px 0;border-bottom:1px solid #eef1f4}"
+            ".chart{border:1px solid #e2e7ec;border-radius:6px;background:#fbfcfd;padding:6px}"
+            ".note{font-size:12px;color:#9aa5b1;font-style:italic;padding:10px 0}"
+            ".foot{border-top:1px solid #e2e7ec;margin-top:18px;padding-top:10px;"
+            "font-size:11px;color:#9aa5b1;text-align:right}"
+            "@media print{body{background:#fff;padding:0}"
+            ".page{border:none;border-radius:0;max-width:none;padding:0}"
+            ".target{page-break-inside:avoid}}"
+        )
+
+        out = []
+        out.append("<!DOCTYPE html>")
+        out.append('<html lang="en"><head><meta charset="utf-8">')
+        out.append('<meta name="viewport" content="width=device-width, initial-scale=1">')
+        out.append(f"<title>{esc(session_name)} &mdash; Lightbucket Astro Planner</title>")
+        out.append(f"<style>{css}</style></head><body><div class=\"page\">")
+        out.append("<div class=\"hdr\"><h1>Lightbucket Astro Planner</h1>")
+        out.append(f"<div class=\"sub\">Session: {esc(session_name)} &middot; "
+                   f"generated {now_str} &middot; {loc_str}</div></div>")
+
+        out.append("<div class=\"totals\">"
+                   f"<span><span class=\"k\">Targets</span> <b>{total_targets}</b></span>"
+                   f"<span><span class=\"k\">Subs</span> <b>{total_subs}</b></span>"
+                   f"<span><span class=\"k\">Allocated</span> <b>{total_alloc:.1f} h</b></span>"
+                   f"<span><span class=\"k\">Integration</span> <b>{total_int:.1f} h</b></span>"
+                   "</div>")
+
+        num = 0
+        for (tid, scope_key) in seen_groups:
+            num += 1
+            group = [e for e in self._plan_entries
+                     if e["target_id"] == tid and e.get("scope", "") == scope_key]
+            first = group[0]
+            common = (first.get("common") or "").split(",")[0].strip()
+            title = esc(tid) + (f" &mdash; {esc(common)}" if common else "")
+
+            ra  = first.get("ra_deg")
+            dec = first.get("dec_deg")
+            ra_str  = self._fmt_ra_hms(ra)   if ra  is not None else "&mdash;"
+            dec_str = self._fmt_dec_dms(dec)  if dec is not None else "&mdash;"
+            pa  = first.get("rotation_angle", 0.0) or 0.0
+
+            out.append("<div class=\"target\">")
+            out.append(f"<h2>{num}. {title}</h2>")
+            out.append("<div class=\"fields\">"
+                       f"<span class=\"k\">RA / Dec</span><span>{ra_str} / {dec_str}</span>"
+                       f"<span class=\"k\">Position angle</span><span>{pa:.1f}&deg;</span>"
+                       f"<span class=\"k\">Scope</span><span>{esc(first.get('scope', ''))}</span>"
+                       f"<span class=\"k\">Camera</span><span>{esc(first.get('camera', ''))}</span>"
+                       f"<span class=\"k\">Reduction</span><span>{esc(first.get('reduction', '1.0×'))}</span>"
+                       f"<span class=\"k\">Bortle</span><span>{esc(first.get('bortle', ''))}</span>"
+                       "</div>")
+
+            out.append("<table class=\"subs\"><thead><tr>"
+                       "<th>Filter</th><th>Sub</th><th>Count</th>"
+                       "<th>Integration</th><th>Window</th></tr></thead><tbody>")
+            for e in group:
+                filt = esc(e.get("filter") or "&mdash;") if e.get("filter") else "&mdash;"
+                win  = (f"{e['win_start']}&ndash;{e['win_end']}"
+                        if e.get("win_start") and e.get("win_end") else "&mdash;")
+                out.append(f"<tr><td>{filt}</td>"
+                           f"<td>{(e.get('exp_s') or 0):.0f} s</td>"
+                           f"<td>{e.get('n_subs', 0)}</td>"
+                           f"<td>{e.get('total_int_hrs', 0.0):.2f} h</td>"
+                           f"<td>{win}</td></tr>")
+            out.append("</tbody></table>")
+
+            if lat is None or lon is None:
+                out.append("<div class=\"note\">Observer location not set &mdash; "
+                           "altitude chart omitted.</div>")
+            else:
+                svg = self._altitude_chart_svg(ra, dec, lat, lon,
+                                               first.get("win_start"), first.get("win_end"))
+                if svg:
+                    out.append(f"<div class=\"chart\">{svg}</div>")
+                else:
+                    out.append("<div class=\"note\">No astronomical-dark window at this "
+                               "site tonight &mdash; altitude chart omitted.</div>")
+            out.append("</div>")
+
+        out.append(f"<div class=\"foot\">Generated by Lightbucket Astro Planner &middot; "
+                   f"{now_str} &middot; coordinates J2000</div>")
+        out.append("</div></body></html>")
+        return "\n".join(out)
+
+    def _altitude_chart_svg(self, ra_deg, dec_deg, lat, lon,
+                            win_start=None, win_end=None, width=760, height=190):
+        """Return an inline-SVG altitude-vs-time chart for one target, styled for
+        the light HTML report.
+
+        Mirrors the Planner's live chart (nautical-dark window, altitude curve,
+        min-altitude and horizon lines, imaging-window markers, moon rise/set,
+        peak marker), using the same module-level astronomy helpers.  Returns ""
+        when coordinates/location are missing or there is no dark window, so the
+        caller can substitute a short note.
+        """
+        if ra_deg is None or dec_deg is None or lat is None or lon is None:
+            return ""
+
+        utc_offset_h = _utc_offset_hours()
+        jd_noon = _jd_local_noon()
+        step_jd = 5.0 / 1440.0
+        n_full  = int(30 * 60 / 5) + 1
+
+        # Nautical-dark bounds (sun below -12 deg)
+        dark_start_jd = dark_end_jd = None
+        been_dark = False
+        for i in range(n_full):
+            jd = jd_noon + i * step_jd
+            sun_ra, sun_dec = _sun_ra_dec(jd)
+            if _ra_dec_to_altaz(sun_ra, sun_dec, lat, lon, jd) < -12.0:
+                been_dark = True
+                if dark_start_jd is None:
+                    dark_start_jd = jd
+                dark_end_jd = jd
+            elif been_dark:
+                break
+        if dark_start_jd is None:
+            return ""
+
+        pad_jd     = 30.0 / 1440.0
+        scan_start = dark_start_jd - pad_jd
+        scan_end   = dark_end_jd   + pad_jd
+        total_jd   = scan_end - scan_start
+        n_steps    = max(120, int(total_jd * 1440 / 5))
+        step       = total_jd / (n_steps - 1)
+
+        times_h, alts = [], []
+        for i in range(n_steps):
+            jd = scan_start + i * step
+            times_h.append((((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0)
+            alts.append(_ra_dec_to_altaz(ra_deg, dec_deg, lat, lon, jd))
+
+        # Moon rise/set within the window
+        moon_rise_x = moon_set_x = None
+        moon_rise_lbl = moon_set_lbl = ""
+        prev = None
+        for i in range(n_steps):
+            jd = scan_start + i * step
+            m_ra, m_dec = _calc_moon_position(jd)
+            m_alt = _ra_dec_to_altaz(m_ra, m_dec, lat, lon, jd)
+            if prev is not None:
+                frac = i / (n_steps - 1)
+                lh = (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
+                if prev < 0 <= m_alt and moon_rise_x is None:
+                    moon_rise_x = frac
+                    moon_rise_lbl = f"{int(lh):02d}:{int((lh % 1) * 60):02d}"
+                elif prev >= 0 > m_alt and moon_set_x is None:
+                    moon_set_x = frac
+                    moon_set_lbl = f"{int(lh):02d}:{int((lh % 1) * 60):02d}"
+            prev = m_alt
+
+        # Layout
+        lm, rm, tm, bm = 42, 14, 18, 28
+        pw = width - lm - rm
+        ph = height - tm - bm
+        y_min = max(-10, min(alts) - 5)
+        y_max = min(90,  max(alts) + 8)
+        y_range = (y_max - y_min) or 1
+        min_alt = int(self.data.get("settings", {}).get("min_alt", 20))
+
+        def ix(i):  return lm + (i / (n_steps - 1)) * pw
+        def iy(a):  return tm + ph - ((a - y_min) / y_range) * ph
+        def cyf(y): return max(tm, min(tm + ph, y))
+        def fx(fr): return lm + fr * pw
+
+        dark_x0 = lm + ((dark_start_jd - scan_start) / total_jd) * pw
+        dark_x1 = lm + ((dark_end_jd   - scan_start) / total_jd) * pw
+
+        s = []
+        s.append(f'<svg viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" '
+                 f'style="width:100%;height:auto;font-family:sans-serif" role="img" '
+                 f'aria-label="Altitude versus time across tonight\'s dark window">')
+        # Background: twilight surround + darker nautical-dark band
+        s.append(f'<rect x="{lm:.1f}" y="{tm}" width="{pw:.1f}" height="{ph}" fill="#eef2f6"/>')
+        s.append(f'<rect x="{dark_x0:.1f}" y="{tm}" width="{(dark_x1 - dark_x0):.1f}" '
+                 f'height="{ph}" fill="#d9e2ec"/>')
+        # Altitude grid + labels
+        for a in range(0, 91, 15):
+            if y_min <= a <= y_max:
+                y = iy(a)
+                s.append(f'<line x1="{lm}" y1="{y:.1f}" x2="{lm + pw:.1f}" y2="{y:.1f}" '
+                         f'stroke="#dde4ec" stroke-width="1"/>')
+                s.append(f'<text x="{lm - 5}" y="{y + 3:.1f}" fill="#7a8593" '
+                         f'font-size="10" text-anchor="end">{a}&#176;</text>')
+        # Horizon (0 deg)
+        if y_min <= 0 <= y_max:
+            yh = iy(0)
+            s.append(f'<line x1="{lm}" y1="{yh:.1f}" x2="{lm + pw:.1f}" y2="{yh:.1f}" '
+                     f'stroke="#d6a6a6" stroke-width="1" stroke-dasharray="5 4"/>')
+        # Minimum-altitude line (from Settings)
+        if y_min <= min_alt <= y_max:
+            ym = iy(min_alt)
+            s.append(f'<line x1="{lm}" y1="{ym:.1f}" x2="{lm + pw:.1f}" y2="{ym:.1f}" '
+                     f'stroke="#c79a33" stroke-width="1" stroke-dasharray="4 5"/>')
+            s.append(f'<text x="{lm + 4}" y="{ym - 4:.1f}" fill="#9a7a1f" '
+                     f'font-size="10">{min_alt}&#176; min</text>')
+        # X-axis time labels
+        dark_span_h = (dark_end_jd - dark_start_jd) * 24.0
+        label_step_h = 1 if dark_span_h <= 8 else 2
+        scan_start_localh = (((scan_start + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
+        h = math.ceil(scan_start_localh / label_step_h) * label_step_h
+        guard = 0
+        while guard < 48:
+            guard += 1
+            h_frac = ((h - scan_start_localh) % 24) / (total_jd * 24.0)
+            if h_frac > 1.0:
+                break
+            x = lm + h_frac * pw
+            s.append(f'<line x1="{x:.1f}" y1="{tm}" x2="{x:.1f}" y2="{tm + ph}" '
+                     f'stroke="#e6ebf0" stroke-width="1"/>')
+            s.append(f'<text x="{x:.1f}" y="{tm + ph + 13}" fill="#7a8593" '
+                     f'font-size="10" text-anchor="middle">{int(h) % 24:02d}:00</text>')
+            if h_frac > 0.98:
+                break
+            h = (h + label_step_h) % 24
+        # Imaging-window markers
+        for wt in (win_start, win_end):
+            if wt:
+                try:
+                    p = wt.split(":")
+                    wh = float(p[0]) + float(p[1]) / 60.0
+                    wf = ((wh - scan_start_localh) % 24) / (total_jd * 24.0)
+                    if 0.0 <= wf <= 1.0:
+                        wx = lm + wf * pw
+                        s.append(f'<line x1="{wx:.1f}" y1="{tm}" x2="{wx:.1f}" '
+                                 f'y2="{tm + ph}" stroke="#3f9d4a" stroke-width="1.2" '
+                                 f'stroke-dasharray="4 4"/>')
+                except (ValueError, IndexError):
+                    pass
+        # Moon rise/set bars
+        for mx, mlbl, ta, ox in ((moon_rise_x, moon_rise_lbl, "start", 4),
+                                 (moon_set_x,  moon_set_lbl,  "end",  -4)):
+            if mx is not None:
+                x = fx(mx)
+                s.append(f'<line x1="{x:.1f}" y1="{tm}" x2="{x:.1f}" y2="{tm + ph}" '
+                         f'stroke="#b9a94a" stroke-width="2"/>')
+                s.append(f'<text x="{x + ox:.1f}" y="{tm + 11}" fill="#8a7d2a" '
+                         f'font-size="10" text-anchor="{ta}">\u263e {mlbl}</text>')
+        # Soft fill under the above-horizon curve
+        above = [(ix(i), cyf(iy(alts[i]))) for i in range(n_steps) if alts[i] >= 0]
+        if len(above) >= 2:
+            base_y = cyf(iy(0)) if y_min <= 0 <= y_max else tm + ph
+            inner = " ".join(f"{x:.1f},{y:.1f}" for x, y in above)
+            poly = f"{above[0][0]:.1f},{base_y:.1f} {inner} {above[-1][0]:.1f},{base_y:.1f}"
+            s.append(f'<polygon points="{poly}" fill="#e3f2ec"/>')
+        # Altitude curve
+        curve = " ".join(f"{ix(i):.1f},{cyf(iy(alts[i])):.1f}" for i in range(n_steps))
+        s.append(f'<polyline points="{curve}" fill="none" stroke="#0f6e56" stroke-width="2"/>')
+        # Peak marker
+        peak_i = max(range(n_steps), key=lambda i: alts[i])
+        px, py = ix(peak_i), cyf(iy(alts[peak_i]))
+        peak_h = int(times_h[peak_i]) % 24
+        peak_m = int((times_h[peak_i] % 1) * 60)
+        s.append(f'<circle cx="{px:.1f}" cy="{py:.1f}" r="3.5" fill="#ba7517"/>')
+        p_anchor = "start" if px < lm + pw * 0.6 else "end"
+        p_ox = 7 if p_anchor == "start" else -7
+        s.append(f'<text x="{px + p_ox:.1f}" y="{py - 7:.1f}" fill="#8a560f" '
+                 f'font-size="10" font-weight="500" text-anchor="{p_anchor}">'
+                 f'\u25b2 {alts[peak_i]:.0f}&#176; @ {peak_h:02d}:{peak_m:02d}</text>')
+        # Plot border
+        s.append(f'<rect x="{lm:.1f}" y="{tm}" width="{pw:.1f}" height="{ph}" '
+                 f'fill="none" stroke="#cdd5de" stroke-width="1"/>')
+        s.append('</svg>')
+        return "".join(s)
 
     def _build_nina_xml(self, entries):
         """Build NINA .ninaTargetSet XML content for the given plan entries.
@@ -6869,7 +7211,7 @@ class AstroApp:
             self._fov_offset_y = 0.0
             self._fov_angle    = 0.0
             self._zoom_level   = 1.0
-            self._rot_label.config(text="0°")
+            self._rot_label.config(text=f"{self._screen_to_sky_pa(0.0):.1f}°")
             self._zoom_label.config(text="1.0×")
             self.preview_canvas.delete("all")
             self.preview_canvas.create_text(cw//2, ch//2, text="Loading DSS image…", fill="yellow", font=("Helvetica", 9))
@@ -7183,42 +7525,56 @@ class AstroApp:
         survey_size = max(fov_w_deg, fov_h_deg, 0.1) * 1.6
         survey_size = min(survey_size, 5.0)  # SkyView cap
 
+        # DSS2 cutouts are assembled server-side from scanned photographic
+        # plates, and SkyView itself notes that optical fields of several
+        # degrees "can take a long time" to build.  A cold first fetch pegged
+        # at the survey-size cap can therefore exceed a short timeout, throw,
+        # and fall back to the geometric ellipse — independent of the camera,
+        # since any wide sensor clamps to the same cap.  So we give the full
+        # request real headroom, then retry once at a smaller, faster field
+        # before giving up: the FOV box may overflow the smaller image a little,
+        # but the user still sees real sky instead of a bare ellipse.
+        attempts = [(survey_size, 30), (min(survey_size, 3.0), 20)]
+
         def _fetch():
-            try:
-                pixels = 600  # fetch high-res, we'll downscale
-                url = (
-                    f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
-                    f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
-                    f"&Size={survey_size:.4f}&Pixels={pixels}&Return=GIF&Catalog=none"
-                )
-                req = urllib.request.Request(url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    raw = resp.read()
+            for size_deg, timeout_s in attempts:
+                try:
+                    pixels = 600  # fetch high-res, we'll downscale
+                    url = (
+                        f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
+                        f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
+                        f"&Size={size_deg:.4f}&Pixels={pixels}&Return=GIF&Catalog=none"
+                    )
+                    req = urllib.request.Request(url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
+                    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                        raw = resp.read()
 
-                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
 
-                def _apply():
-                    # Discard if the user has navigated to a different target
-                    # while this fetch was in flight.
-                    cur = self.current_target_info
-                    if cur is None or cur.get("id") != target_id:
-                        return
-                    self._cached_dss_img = img
-                    self._cached_dss_target = target_id
-                    self._cached_dss_survey_deg = survey_size
-                    self._draw_fov_overlay(img, survey_size, target_id)
+                    def _apply(img=img, fetched_deg=size_deg):
+                        # Discard if the user has navigated to a different target
+                        # while this fetch was in flight.
+                        cur = self.current_target_info
+                        if cur is None or cur.get("id") != target_id:
+                            return
+                        self._cached_dss_img = img
+                        self._cached_dss_target = target_id
+                        self._cached_dss_survey_deg = fetched_deg
+                        self._draw_fov_overlay(img, fetched_deg, target_id)
 
-                self.root.after(0, _apply)
-            except Exception:
-                # Same stale-result check for the error path — don't blank
-                # the canvas with "DSS image unavailable" if the user has
-                # already moved on to a target whose fetch may yet succeed.
-                def _apply_err():
-                    cur = self.current_target_info
-                    if cur is None or cur.get("id") != target_id:
-                        return
-                    self._fov_image_error()
-                self.root.after(0, _apply_err)
+                    self.root.after(0, _apply)
+                    return  # success — skip the smaller fallback attempt
+                except Exception:
+                    continue  # slow/failed — fall through to the next attempt
+
+            # Every attempt failed — show the geometric preview, but only if the
+            # user is still on this target (stale-result guard).
+            def _apply_err():
+                cur = self.current_target_info
+                if cur is None or cur.get("id") != target_id:
+                    return
+                self._fov_image_error()
+            self.root.after(0, _apply_err)
 
         threading.Thread(target=_fetch, daemon=True).start()
 
@@ -7275,7 +7631,7 @@ class AstroApp:
             self.preview_canvas.create_line(cx, cy-arm, cx, cy+arm, fill="yellow", width=1)
 
         fits = self._fov_params and self._fov_params[0] >= self._fov_params[2] and self._fov_params[1] >= self._fov_params[3]
-        label = f"{target_id}  {'✅ fits' if fits else '❌ too big'}  {self._fov_angle:.1f}°"
+        label = f"{target_id}  {'✅ fits' if fits else '❌ too big'}  {self._screen_to_sky_pa(self._fov_angle):.1f}°"
         self.preview_canvas.create_text(cw//2+1, ch-9,  text=label, fill="black", font=("Helvetica", 8, "bold"))
         self.preview_canvas.create_text(cw//2,   ch-10, text=label, fill="white", font=("Helvetica", 8, "bold"))
 
@@ -7292,6 +7648,30 @@ class AstroApp:
         """Return the current (x, y) centre of the FOV overlay on the preview canvas."""
         cw, ch = 240, 240
         return cw / 2 + self._fov_offset_x, ch / 2 + self._fov_offset_y
+
+    @staticmethod
+    def _screen_to_sky_pa(screen_angle):
+        """Convert the FOV box's on-screen rotation to NINA's sky position angle.
+
+        The framing box is drawn with a standard rotation matrix on a y-down
+        canvas, so a positive ``_fov_angle`` rotates the box *clockwise* on the
+        North-up / East-left DSS preview.  NINA — like the IAU position-angle
+        convention — measures PA *counter-clockwise*, from North through East,
+        starting from 0 with the frame upright (North up).
+
+        Our box is also upright at ``_fov_angle == 0``, so the two conventions
+        share a zero and differ only in handedness: ``(360 - angle) % 360``
+        (equivalently ``-angle`` mod 360) flips the direction while keeping the
+        zeros aligned.  An earlier calibration used ``180 - angle``, which fit a
+        single eyeballed test (app 55 ~ NINA 125) only because a rectangular
+        sensor frames identically at PA and PA+180 — so visual matching could
+        not distinguish 125 from 305 (= 360 - 55).  The upright zero point is
+        what actually pins it down: both tools read 0 there.
+
+        This is the single place the conversion lives; the mapping is its own
+        inverse, so the same call converts a sky PA back to the screen angle.
+        """
+        return (360.0 - screen_angle) % 360.0
 
     def _framed_center(self, ra0_deg, dec0_deg):
         """Return (ra_deg, dec_deg) of the FOV box centre after any pan.
@@ -7353,7 +7733,7 @@ class AstroApp:
             current_angle = math.degrees(math.atan2(event.y - cy, event.x - cx))
             delta = current_angle - self._rotate_start_angle
             self._fov_angle = (self._rotate_fov_start + delta) % 360
-            self._rot_label.config(text=f"{self._fov_angle:.1f}°")
+            self._rot_label.config(text=f"{self._screen_to_sky_pa(self._fov_angle):.1f}°")
             self._redraw_fov_overlay()
 
     def _fov_mouse_up(self, event):
@@ -7387,7 +7767,7 @@ class AstroApp:
         self._fov_offset_y = 0.0
         self._fov_angle    = 0.0
         self._zoom_level   = 1.0
-        self._rot_label.config(text="0.0°")
+        self._rot_label.config(text=f"{self._screen_to_sky_pa(0.0):.1f}°")
         self._zoom_label.config(text="1.0×")
         self._redraw_fov_overlay()
 
@@ -7451,7 +7831,7 @@ class AstroApp:
             "catalog": self._skymap_catalog_label(t.get("id", "")),
             "fovw":    f"{getattr(self, '_skymap_fovw', 0.0) or 0.0:.4f}",
             "fovh":    f"{getattr(self, '_skymap_fovh', 0.0) or 0.0:.4f}",
-            "pa":      f"{getattr(self, '_fov_angle', 0.0) or 0.0:.1f}",
+            "pa":      f"{self._screen_to_sky_pa(getattr(self, '_fov_angle', 0.0) or 0.0):.1f}",
             "theme":   "night" if getattr(self, "night_mode", False) else "day",
         }
         # Active catalog tier → which star/DSO files the map loads + mag ceiling.
@@ -8276,7 +8656,7 @@ class AstroApp:
             "reduction":      reduction,
             "exp_s":          None,
             "computed":       False,
-            "rotation_angle": getattr(self, "_fov_angle", 0.0),
+            "rotation_angle": self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0)),
             "framed_ra_deg":  framed_ra,
             "framed_dec_deg": framed_dec,
         }

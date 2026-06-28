@@ -1,11 +1,11 @@
 [Setup]
 AppName=Lightbucket Astro Planner
-AppVersion=1.1.1
+AppVersion=1.1.2
 AppPublisher=Lightbucket Astro [Gerald Walters]
 DefaultDirName={localappdata}\Programs\LightbucketAstroPlanner
 DefaultGroupName=Lightbucket Astro Planner
 OutputDir=installer
-OutputBaseFilename=LightbucketAstroPlanner-1.1.1-setup
+OutputBaseFilename=LightbucketAstroPlanner-1.1.2-setup
 Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest

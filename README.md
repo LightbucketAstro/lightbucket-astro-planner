@@ -34,6 +34,7 @@ In one window it:
 - 📍 **Saves named location profiles** so dark-site travelers can switch between home and remote sites in a click — every twilight, moon, and altitude calculation follows the active site
 - 📊 **Builds a multi-target Gantt schedule** for the night, with per-rig support for dual-scope setups
 - 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
+- 📄 **Exports a printable plan** as a plain-text summary or a self-contained HTML report that embeds each target's altitude chart and prints to PDF straight from your browser
 - 🧩 **Imports your NINA profile** — pulls in filter-wheel names (LRGB + narrowband, with a bandwidth prompt) and your configured telescope, showing a preview of exactly what will be added or updated before anything is saved
 - 🛠️ **Stores your equipment inventory** — cameras, telescopes, and reducers — so every new session starts with the right gear pre-filled
 - 💾 **Saves and reloads sessions** as JSON, with a prompt on close so an evening's planning is never lost by accident
@@ -64,6 +65,12 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
       <p align="center"><sub><b>Visible Tonight</b> — seasonal targets above your altitude floor, filtered by type and magnitude</sub></p>
     </td>
   </tr>
+  <tr>
+    <td colspan="2" align="center">
+      <img src="docs/screenshots/htmlExport.png" alt="Exported HTML plan report showing per-target details with an embedded altitude chart" width="70%">
+      <p align="center"><sub><b>HTML export</b> — a printable night's-plan report with each target's altitude chart, ready for Print → Save as PDF</sub></p>
+    </td>
+  </tr>
 </table>
 
 ## Why I built this
@@ -85,7 +92,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.1.1.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.1.2.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -104,7 +111,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.1.1-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.1.2-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -224,7 +231,9 @@ The right side of the tab shows:
 - A **DSS thumbnail** of the target with a draggable, rotatable sensor frame
   that previews exactly how the object will land on your sensor. Pan the frame
   off the catalog centre or rotate it, and that exact centre and position
-  angle are what get written to the NINA export.
+  angle are what get written to the NINA export. The rotation readout shows
+  the position angle in NINA's convention — counter-clockwise from north, 0°
+  upright — so the number on the preview matches NINA's framing assistant.
 - A **text analysis** panel with recommended sub-exposure, moon conditions,
   the night's imaging window for that target, and integration math.
 - An **altitude track** showing the target's altitude across the night with
@@ -278,8 +287,11 @@ promoted to the final plan.
 The final list for the evening. Shows a per-target summary, a Gantt-style
 schedule, and the exports:
 
-- **Export plain text** — a readable night's-plan summary you can paste into
-  a notes app or print.
+- **Export Session** — saves the night's plan as a readable report. Pick the
+  format in the Save dialog's file-type list: a plain-text summary you can
+  paste into a notes app, or a self-contained HTML page that embeds each
+  target's altitude chart and prints straight to PDF from any browser
+  (**Print → Save as PDF**).
 - **Export to NINA** — writes a `.ninaTargetSet` file you can open directly
   in NINA's Sequencer. If your plan spans multiple telescopes, the app
   detects this and writes one file per scope into a folder you choose. Each
@@ -379,6 +391,21 @@ New in 1.1.1, nothing needs migrating either:
   filter wheel on import. Re-export any older plans to pick this up.
 - **Visible Tonight gained a Rise column and sortable headers.** No migration
   needed — open the dialog and click a header to sort.
+
+New in 1.1.2, nothing needs migrating:
+
+- **Plans export to HTML, not just text.** The **Export Session** button now
+  offers a self-contained HTML report alongside the plain-text one — choose
+  the format from the Save dialog's file-type list. The HTML page embeds a
+  per-target altitude chart (dark window, the night's altitude track, moon
+  rise/set, and your imaging window) and is styled to print cleanly, so
+  **Print → Save as PDF** in any browser produces a PDF with no extra tools.
+- **FOV rotation matches NINA.** The framing box's rotation readout now shows
+  the sky position angle in NINA's convention — counter-clockwise from north,
+  0° with the frame upright — so the number on the preview matches NINA's
+  framing assistant, and the same value is written to the `.ninaTargetSet`.
+  Earlier builds used an internal screen angle that ran the opposite way; if a
+  plan's exact rotation matters, re-export it to pick up the corrected angle.
 
 ---
 
