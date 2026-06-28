@@ -67,7 +67,7 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
   </tr>
   <tr>
     <td colspan="2" align="center">
-      <img src="docs/screenshots/htmlExport.png" alt="Exported HTML plan report showing per-target details with an embedded altitude chart" width="70%">
+      <img src="docs/screenshots/html-export.png" alt="Exported HTML plan report showing per-target details with an embedded altitude chart" width="70%">
       <p align="center"><sub><b>HTML export</b> — a printable night's-plan report with each target's altitude chart, ready for Print → Save as PDF</sub></p>
     </td>
   </tr>
