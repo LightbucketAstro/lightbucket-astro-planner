@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.1.2"
+__version__ = "1.2.0"
 
 # ── Sky-map catalog tiers (optional downloads) ─────────────────────────────
 # Pinned to the d3-celestial commit our bundled engine + stars.6 came from, so
@@ -1191,12 +1191,14 @@ class AstroApp:
         self.tab_planner = ttk.Frame(self.tab_control)
         self.tab_session = ttk.Frame(self.tab_control)
         self.tab_plan    = ttk.Frame(self.tab_control)
+        self.tab_explore = ttk.Frame(self.tab_control)
         self.tab_settings = ttk.Frame(self.tab_control)
 
         self.tab_control.add(self.tab_planner, text='Target Planner')
         self.tab_control.add(self.tab_equip,   text='Manage Equipment')
         self.tab_control.add(self.tab_session, text='Targets List')
         self.tab_control.add(self.tab_plan,    text="Tonight's Plan")
+        self.tab_control.add(self.tab_explore, text='Explore')
         self.tab_control.add(self.tab_settings, text='Settings')
         self.tab_control.pack(expand=1, fill="both")
         self.tab_control.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -1207,6 +1209,7 @@ class AstroApp:
         self.setup_planner_tab()
         self.setup_session_tab()
         self.setup_plan_tab()
+        self.setup_explore_tab()
         self.setup_settings_tab()
         self._setup_day_styles()   # paint dark bg + white text on tabs before snapshot
         
@@ -1381,6 +1384,7 @@ class AstroApp:
             ("Planner",  self.tab_planner, "crosshair"),
             ("Targets",  self.tab_session, "star_list"),
             ("Tonight's\nPlan",  self.tab_plan,    "moon"),
+            ("Explore",  self.tab_explore, "compass"),
             ("Equip",    self.tab_equip,   "telescope"),
         ]
         self._sidebar_settings_tab = ("Settings", self.tab_settings, "gear")
@@ -1513,6 +1517,23 @@ class AstroApp:
             cv.create_line(cx, cy+2, cx-7, cy+11, fill=color, width=1.5)
             cv.create_line(cx, cy+2, cx+7, cy+11, fill=color, width=1.5)
             cv.create_line(cx-4, cy+7, cx+4, cy+7, fill=color, width=1.5)
+
+        elif icon_name == "compass":
+            # Compass — outer ring, cardinal ticks, needle (two opposed
+            # triangles) angled NE/SW to suggest exploration.
+            cv.create_oval(cx-9, cy-9, cx+9, cy+9, outline=color, width=1.5)
+            for angle_deg in (0, 90, 180, 270):
+                rad = math.radians(angle_deg)
+                x1 = cx + 9 * math.cos(rad)
+                y1 = cy + 9 * math.sin(rad)
+                x2 = cx + 12 * math.cos(rad)
+                y2 = cy + 12 * math.sin(rad)
+                cv.create_line(x1, y1, x2, y2, fill=color, width=1.5)
+            # Needle: NE half filled, SW half outline
+            cv.create_polygon(cx+5, cy-5, cx-1, cy+2, cx-2, cy-2,
+                              fill=color, outline=color)
+            cv.create_polygon(cx-5, cy+5, cx+1, cy-2, cx+2, cy+2,
+                              fill="", outline=color)
 
         elif icon_name == "gear":
             # Gear cog — inner circle + radiating teeth
@@ -2519,6 +2540,14 @@ class AstroApp:
             except Exception:
                 pass
 
+            # Explore legend cards — dynamic widgets, rebuilt night-aware so
+            # they get the deliberate red palette instead of the walker's
+            # generic recolor (which flattens their bg/fg distinctions).
+            try:
+                self._explore_refresh_cards()
+            except Exception:
+                pass
+
         else:
             # ── DAY MODE — restore exactly to startup state ───────────────────
             self.night_btn.configure(text="🔴 Night Mode")
@@ -2616,6 +2645,12 @@ class AstroApp:
                 pass
             try:
                 self._refresh_plan_tree()
+            except Exception:
+                pass
+            # Explore legend cards — same dynamic-widget situation as the
+            # queue/plan cards above: rebuild so they return to day colours.
+            try:
+                self._explore_refresh_cards()
             except Exception:
                 pass
 
@@ -2830,7 +2865,7 @@ class AstroApp:
         self.scope_dropdown.pack(side="left", padx=(0, 6))
 
         # Reducer chip
-        _reduction_values = ["0.63×", "0.67×", "0.70×", "0.80×", "1.0×", "1.5×", "2.0×", "2.5×", "3.0×"]
+        _reduction_values = ["0.63×", "0.67×", "0.70×", "0.75×", "0.80×", "1.0×", "1.5×", "2.0×", "2.5×", "3.0×"]
         self.reduction_entry = ttk.Combobox(chips_row, textvariable=self.reduction_factor,
                                             values=_reduction_values, state="readonly", width=6)
         self.reduction_entry.pack(side="left", padx=(0, 6))
@@ -6349,6 +6384,9 @@ class AstroApp:
         rigs = self.data.get("settings", {}).get("rigs", [])
         names = [r.get("name", "") for r in rigs if r.get("name")]
         self.rig_dropdown["values"] = names
+        # Explore's saved-rig quick-add mirrors the same list
+        if hasattr(self, "_explore_rig_pick"):
+            self._explore_rig_pick["values"] = names
         self._update_rig_indicator()
 
     def _update_rig_indicator(self):
@@ -7792,6 +7830,608 @@ class AstroApp:
             self.preview_canvas.create_oval(cw/2-t_maj*px_scale/2, ch/2-t_min*px_scale/2,
                                              cw/2+t_maj*px_scale/2, ch/2+t_min*px_scale/2, outline="cyan", width=2)
 
+    # ═══════════════════════════════════════════════════════════════════
+    # EXPLORE TAB — compare sensor FOVs of multiple rigs over one target
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # Each press of Analyze adds the current scope/camera/reduction combo
+    # as a colour-coded sensor frame over a shared DSS image, all centred
+    # on the target at PA 0°.  A legend card per rig doubles as the
+    # visibility/remove control.  Switching targets keeps the rig stack
+    # and re-frames it over the new object; when the DSS fetch fails
+    # (offline), the same geometric-ellipse fallback as the Planner is
+    # drawn and the frames overlay it at true angular scale.
+
+    # (colour, canvas dash pattern) per slot — dash doubles as a
+    # colour-blind-safe secondary distinguisher.
+    _EXPLORE_PALETTE = [
+        ("#4ade80", None),
+        ("#f59e0b", (6, 3)),
+        ("#f472b6", (2, 3)),
+        ("#38bdf8", None),
+        ("#a78bfa", (6, 3)),
+        ("#fb7185", (2, 3)),
+    ]
+    _EXPLORE_MAX_RIGS = 6
+    _EXPLORE_CANVAS_PX = 560   # square canvas edge, px
+
+    @staticmethod
+    def _dim_hex(color, factor=0.45):
+        """Return ``color`` (#rrggbb) darkened by ``factor`` — used to dim
+        non-highlighted frames while hovering a legend card."""
+        try:
+            r = int(color[1:3], 16)
+            g = int(color[3:5], 16)
+            b = int(color[5:7], 16)
+            return f"#{int(r*factor):02x}{int(g*factor):02x}{int(b*factor):02x}"
+        except Exception:
+            return color
+
+    def setup_explore_tab(self):
+        """Build the Explore tab — rig-comparison rail on the left, shared FOV canvas on the right."""
+        self._explore_rigs = []          # analyzed rigs, draw order = insertion order
+        self._explore_target = None      # target info dict (same shape as Planner's)
+        self._explore_view = None        # {"img": PIL|None, "deg": span, "target_id": id}
+        self._explore_fetch_seq = 0      # stale-fetch guard (monotonic counter)
+        self._explore_hilite = None      # key of hover-highlighted rig, or None
+        self._explore_photo = None       # keep PhotoImage alive
+        self._explore_photo_cache = None # (img id, deg) → avoid re-resizing per hover
+
+        RAIL_BG = "#131f2e"
+
+        outer = tk.Frame(self.tab_explore, bg="#0e1a28")
+        outer.pack(fill="both", expand=True)
+
+        # ── Left rail ─────────────────────────────────────────────────────
+        rail = tk.Frame(outer, bg=RAIL_BG, width=276)
+        rail.pack(side="left", fill="y")
+        rail.pack_propagate(False)
+
+        tk.Label(rail, text="TARGET", bg=RAIL_BG, fg="#cc8833",
+                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(12, 2))
+        self.explore_search = ttk.Entry(rail, font=("Helvetica", 11))
+        self.explore_search.pack(fill="x", padx=12)
+        ToolTip(self.explore_search,
+                "Search by catalog ID (M42, NGC 224)\nor common name (Orion Nebula).\n"
+                "Respects the Planner's catalog filter.")
+        self.explore_search.bind("<KeyRelease>", self._explore_on_search_key)
+        self.explore_search.bind("<Return>",
+                                 lambda e: (self._hide_suggestions(), self._explore_load_target()))
+        self.explore_search.bind("<Escape>",   lambda e: self._hide_suggestions())
+        self.explore_search.bind("<FocusOut>", lambda e: self.root.after(150, self._hide_suggestions))
+
+        self._explore_target_lbl = tk.Label(rail, text="No target selected", bg=RAIL_BG,
+                                            fg="#778899", font=("Helvetica", 9),
+                                            anchor="w", justify="left", wraplength=248)
+        self._explore_target_lbl.pack(fill="x", padx=12, pady=(3, 6))
+
+        tk.Frame(rail, bg="#2a3642", height=1).pack(fill="x", padx=12)
+
+        tk.Label(rail, text="RIG BUILDER", bg=RAIL_BG, fg="#cc8833",
+                 font=("Helvetica", 9, "bold")).pack(anchor="w", padx=12, pady=(8, 2))
+        self.explore_scope_var     = tk.StringVar()
+        self.explore_camera_var    = tk.StringVar()
+        self.explore_reduction_var = tk.StringVar(value="1.0×")
+
+        self.explore_scope_dropdown = ttk.Combobox(rail, textvariable=self.explore_scope_var,
+                                                   state="readonly")
+        self.explore_scope_dropdown.pack(fill="x", padx=12, pady=(0, 4))
+        self.explore_camera_dropdown = ttk.Combobox(rail, textvariable=self.explore_camera_var,
+                                                    state="readonly")
+        self.explore_camera_dropdown.pack(fill="x", padx=12, pady=(0, 4))
+        self.explore_reduction_dropdown = ttk.Combobox(
+            rail, textvariable=self.explore_reduction_var,
+            values=["0.63×", "0.67×", "0.70×", "0.75×", "0.80×", "1.0×", "1.5×", "2.0×", "2.5×", "3.0×"],
+            state="readonly")
+        self.explore_reduction_dropdown.pack(fill="x", padx=12, pady=(0, 6))
+
+        analyze_row = tk.Frame(rail, bg=RAIL_BG)
+        analyze_row.pack(fill="x", padx=12, pady=(0, 4))
+        explore_analyze_btn = ttk.Button(analyze_row, text="⊕ Analyze",
+                                         command=self._explore_analyze)
+        explore_analyze_btn.pack(side="left", fill="x", expand=True)
+        ToolTip(explore_analyze_btn,
+                "Overlay this scope/camera/reducer\ncombination's sensor frame on the\n"
+                "target image (max 6 rigs)")
+
+        self._explore_rig_pick = ttk.Combobox(rail, state="readonly")
+        self._explore_rig_pick.set("Add saved rig…")
+        self._explore_rig_pick.pack(fill="x", padx=12, pady=(0, 8))
+        self._explore_rig_pick.bind("<<ComboboxSelected>>", self._explore_saved_rig_picked)
+        ToolTip(self._explore_rig_pick,
+                "One-click add: applies a saved rig's\nscope/camera/reducer and analyzes it")
+
+        tk.Frame(rail, bg="#2a3642", height=1).pack(fill="x", padx=12)
+
+        hdr_row = tk.Frame(rail, bg=RAIL_BG)
+        hdr_row.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(hdr_row, text="ANALYZED RIGS", bg=RAIL_BG, fg="#cc8833",
+                 font=("Helvetica", 9, "bold")).pack(side="left")
+        self._explore_clear_lbl = tk.Label(hdr_row, text="✕ clear all", bg=RAIL_BG,
+                                           fg="#556677", font=("Helvetica", 8),
+                                           cursor="hand2")
+        self._explore_clear_lbl.pack(side="right")
+        self._explore_clear_lbl.bind("<Button-1>", lambda e: self._explore_clear())
+        ToolTip(self._explore_clear_lbl, "Remove all analyzed rigs")
+
+        self._explore_cards_frame = tk.Frame(rail, bg=RAIL_BG)
+        self._explore_cards_frame.pack(fill="both", expand=True, padx=10, pady=(2, 8))
+
+        # ── Right: status row + FOV canvas ────────────────────────────────
+        right = tk.Frame(outer, bg="#0e1a28")
+        right.pack(side="left", fill="both", expand=True)
+
+        status_row = tk.Frame(right, bg="#0e1a28")
+        status_row.pack(fill="x", padx=14, pady=(10, 4))
+        self._explore_span_lbl = tk.Label(status_row, text="", bg="#0e1a28",
+                                          fg="#7eb8d4", font=("Helvetica", 9))
+        self._explore_span_lbl.pack(side="left")
+        explore_reload_btn = ttk.Button(status_row, text="⟳", width=3,
+                                        command=lambda: self._explore_ensure_image(force=True))
+        explore_reload_btn.pack(side="right")
+        ToolTip(explore_reload_btn, "Re-download the DSS image\n(sized to the largest analyzed FOV)")
+        tk.Label(status_row, text="frames centred on target · PA 0° · N up / E left",
+                 bg="#0e1a28", fg="#556677", font=("Helvetica", 8)).pack(side="right", padx=(0, 10))
+
+        cpx = self._EXPLORE_CANVAS_PX
+        self.explore_canvas = tk.Canvas(right, width=cpx, height=cpx, bg="black",
+                                        highlightthickness=1, highlightbackground="#2e4a63")
+        self.explore_canvas.pack(padx=14, pady=(0, 10), anchor="n")
+        self._explore_draw_empty()
+
+    # ── Search plumbing (shares the Planner's floating suggestion popup) ──
+
+    def _explore_on_search_key(self, event):
+        """Key release in the Explore search — drive the shared suggestion popup."""
+        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
+            return
+        self._update_floating_suggestions(entry=self.explore_search,
+                                          on_select=self._explore_select_suggestion)
+
+    def _explore_select_suggestion(self, target_id):
+        """Suggestion clicked — fill the Explore search entry and load the target."""
+        self._hide_suggestions()
+        self.explore_search.delete(0, tk.END)
+        self.explore_search.insert(0, target_id)
+        self._explore_load_target()
+
+    def _explore_resolve_target(self):
+        """Resolve the Explore search entry to a target dict, or None."""
+        raw = self.explore_search.get().strip().upper().replace(" ", "")
+        if not raw:
+            return None
+        raw = self._normalize_catalog_key(raw)
+        return self.targets.get(raw) or self.common_names_map.get(raw)
+
+    def _explore_load_target(self, warn=True, fetch=True):
+        """Load the searched target: update the info label, re-frame the rig
+        stack over the new object, and (re)fetch the DSS image if needed.
+
+        ``fetch=False`` defers the image fetch — used by _explore_analyze,
+        which is about to change the needed span (new rig) and will call
+        _explore_ensure_image itself, avoiding a wasted double-download."""
+        t = self._explore_resolve_target()
+        if t is None:
+            if warn and self.explore_search.get().strip():
+                messagebox.showwarning("Not Found",
+                                       "No catalog object matches that search.")
+            return
+        changed = (self._explore_target is None
+                   or self._explore_target.get("id") != t.get("id"))
+        self._explore_target = t
+        common = t['common'].split(';')[0].strip() if t.get('common') else ""
+        size_str = ""
+        if t.get("size_maj"):
+            size_str = f"  ·  {t['size_maj']:.0f}′×{(t.get('size_min') or t['size_maj']):.0f}′"
+        self._explore_target_lbl.config(
+            text=f"{t['id']}{('  —  ' + common) if common else ''}\n"
+                 f"{t.get('obj_type', 'Object')}{size_str}")
+        self._explore_refresh_cards()
+        if fetch:
+            self._explore_ensure_image(force=changed)
+
+    # ── Analysis ──────────────────────────────────────────────────────────
+
+    def _explore_analyze(self):
+        """Add the current scope/camera/reduction combo as a colour-coded frame."""
+        # Make sure the searched target is loaded (user may have typed it
+        # manually without pressing Return).
+        t = self._explore_resolve_target()
+        if t is not None and (self._explore_target is None
+                              or self._explore_target.get("id") != t.get("id")):
+            # Load the new target but defer the image fetch — the rig we're
+            # about to add may enlarge the needed span, and the finally
+            # block below reconciles the image exactly once either way.
+            self._explore_load_target(warn=False, fetch=False)
+        if self._explore_target is None:
+            messagebox.showwarning("No Target",
+                                   "Select a target first — search by catalog ID or name.")
+            return
+
+        try:
+            s_name = self.explore_scope_var.get()
+            c_name = self.explore_camera_var.get()
+            red_str = self.explore_reduction_var.get() or "1.0×"
+            s = self.data["scopes"].get(s_name)
+            c = self.data["cameras"].get(c_name)
+            if not s or not c:
+                messagebox.showwarning("Incomplete", "Please select a Scope and a Camera.")
+                return
+
+            key = (s_name, c_name, red_str)
+            for r in self._explore_rigs:
+                if r["key"] == key:
+                    self._show_toast("Rig already analyzed — see its legend card")
+                    return
+            if len(self._explore_rigs) >= self._EXPLORE_MAX_RIGS:
+                self._show_toast(f"Limit of {self._EXPLORE_MAX_RIGS} rigs — remove one first")
+                return
+
+            try:
+                reduction = float(red_str.rstrip("×x"))
+            except ValueError:
+                reduction = 1.0
+            native_fl = float(s.get("native_fl", 1))
+            aperture  = float(s.get("aperture", 1)) or 1.0
+            eff_fl    = native_fl * reduction
+            ps        = float(c.get("pixel_size", 1))
+            sw, sh    = float(c.get("sensor_w", 1)), float(c.get("sensor_h", 1))
+            fov_w = 2 * math.degrees(math.atan(sw / (2 * eff_fl)))
+            fov_h = 2 * math.degrees(math.atan(sh / (2 * eff_fl)))
+            scale = (ps / eff_fl) * 206.265
+
+            used = {r["slot"] for r in self._explore_rigs}
+            slot = next(i for i in range(self._EXPLORE_MAX_RIGS) if i not in used)
+            color, dash = self._EXPLORE_PALETTE[slot]
+
+            self._explore_rigs.append({
+                "key": key, "scope": s_name, "camera": c_name, "reduction": red_str,
+                "fov_w": fov_w, "fov_h": fov_h, "scale": scale,
+                "eff_fl": eff_fl, "f_ratio": eff_fl / aperture,
+                "slot": slot, "color": color, "dash": dash, "visible": True,
+            })
+            self._explore_refresh_cards()
+        finally:
+            # Runs on success AND on every early return above, so the canvas
+            # never shows a stale target after a deferred-fetch load.
+            self._explore_ensure_image()
+
+    def _explore_saved_rig_picked(self, event=None):
+        """Saved-rig quick add — apply its scope/camera/reducer and analyze."""
+        name = self._explore_rig_pick.get()
+        self._explore_rig_pick.set("Add saved rig…")
+        rig = self._find_rig(name)
+        if rig is None:
+            return
+        if rig.get("scope") in self.data.get("scopes", {}):
+            self.explore_scope_var.set(rig["scope"])
+        if rig.get("camera") in self.data.get("cameras", {}):
+            self.explore_camera_var.set(rig["camera"])
+        if rig.get("reduction"):
+            self.explore_reduction_var.set(rig["reduction"])
+        self._explore_analyze()
+
+    # ── Image management ──────────────────────────────────────────────────
+
+    def _explore_target_span_deg(self):
+        """Target's larger angular dimension in degrees (10′ floor for point-ish objects)."""
+        t = self._explore_target
+        maj = (t.get("size_maj") or 10.0) / 60.0
+        mnr = (t.get("size_min") or t.get("size_maj") or 10.0) / 60.0
+        return max(maj, mnr, 10.0 / 60.0)
+
+    def _explore_needed_span(self):
+        """Sky span (deg) the image should cover: the largest visible FOV or
+        the target itself, plus padding, capped at SkyView's 5° limit."""
+        dims = [max(r["fov_w"], r["fov_h"]) for r in self._explore_rigs if r["visible"]]
+        base = max(dims + [self._explore_target_span_deg() * 1.2, 0.2])
+        return min(base * 1.35, 5.0)
+
+    def _explore_ensure_image(self, force=False):
+        """Fetch a DSS image if the current one is missing, for the wrong
+        target, too small (frames would clip), or absurdly oversized."""
+        t = self._explore_target
+        if t is None:
+            self._explore_draw_empty()
+            return
+        span = self._explore_needed_span()
+        v = self._explore_view
+        if (not force and v is not None
+                and v.get("target_id") == t["id"] and v.get("deg")
+                and v["deg"] * 0.45 <= span <= v["deg"] * 1.02):
+            self._explore_redraw()
+            return
+        self._explore_fetch(t, span)
+
+    def _explore_fetch(self, t, span_deg):
+        """Background DSS fetch with the Planner's two-attempt strategy and a
+        sequence-number stale guard.  Falls back to the geometric view."""
+        self._explore_fetch_seq += 1
+        seq = self._explore_fetch_seq
+        target_id = t["id"]
+        self._explore_view = None          # marks "loading" for _explore_redraw
+        self._explore_redraw()
+
+        attempts = [(span_deg, 30), (min(span_deg, 3.0), 20)]
+
+        def _fetch():
+            for size_deg, timeout_s in attempts:
+                try:
+                    url = (
+                        f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
+                        f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
+                        f"&Size={size_deg:.4f}&Pixels=600&Return=GIF&Catalog=none"
+                    )
+                    req = urllib.request.Request(
+                        url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
+                    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                        raw = resp.read()
+                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+
+                    def _apply(img=img, fetched=size_deg):
+                        if seq != self._explore_fetch_seq:
+                            return   # user moved on — discard
+                        self._explore_view = {"img": img, "deg": fetched,
+                                              "target_id": target_id}
+                        self._explore_redraw()
+                    self.root.after(0, _apply)
+                    return
+                except Exception:
+                    continue
+
+            def _apply_err():
+                if seq != self._explore_fetch_seq:
+                    return
+                self._explore_view = {"img": None, "deg": span_deg,
+                                      "target_id": target_id}
+                self._explore_redraw()
+            self.root.after(0, _apply_err)
+
+        threading.Thread(target=_fetch, daemon=True).start()
+
+    # ── Drawing ───────────────────────────────────────────────────────────
+
+    def _explore_draw_empty(self):
+        """Empty-state canvas message."""
+        cpx = self._EXPLORE_CANVAS_PX
+        cv = self.explore_canvas
+        cv.delete("all")
+        cv.create_text(cpx // 2, cpx // 2 - 12, text="Explore — compare rigs on a target",
+                       fill="#556677", font=("Helvetica", 11, "bold"))
+        cv.create_text(cpx // 2, cpx // 2 + 10,
+                       text="Search a target, pick a scope/camera/reducer, press ⊕ Analyze",
+                       fill="#445566", font=("Helvetica", 9))
+        self._explore_span_lbl.config(text="")
+
+    def _explore_redraw(self):
+        """Redraw the shared image (or fallback ellipse) and every visible rig frame."""
+        cpx = self._EXPLORE_CANVAS_PX
+        cv = self.explore_canvas
+        t = self._explore_target
+        if t is None:
+            self._explore_draw_empty()
+            return
+        cv.delete("all")
+        v = self._explore_view
+        if v is None or v.get("target_id") != t["id"]:
+            cv.create_text(cpx // 2, cpx // 2, text="Loading DSS image…",
+                           fill="yellow", font=("Helvetica", 10))
+            self._explore_span_lbl.config(text="")
+            return
+
+        span = v["deg"]
+        ppd = cpx / span   # pixels per degree
+        cxc = cyc = cpx / 2
+
+        if v["img"] is not None:
+            cache_key = (id(v["img"]), span)
+            if self._explore_photo_cache and self._explore_photo_cache[0] == cache_key:
+                photo = self._explore_photo_cache[1]
+            else:
+                resized = v["img"].resize((cpx, cpx), Image.Resampling.LANCZOS)
+                photo = ImageTk.PhotoImage(resized)
+                self._explore_photo_cache = (cache_key, photo)
+            self._explore_photo = photo
+            cv.create_image(0, 0, anchor="nw", image=photo)
+        else:
+            # Offline / fetch failed — geometric representation of the target
+            t_maj = (t.get("size_maj") or 10.0) / 60.0 * ppd
+            t_min = (t.get("size_min") or t.get("size_maj") or 10.0) / 60.0 * ppd
+            cv.create_oval(cxc - t_maj / 2, cyc - t_min / 2,
+                           cxc + t_maj / 2, cyc + t_min / 2,
+                           outline="cyan", width=2)
+            cv.create_text(cpx // 2, 16,
+                           text="DSS unavailable — geometric view (check network)",
+                           fill="#778899", font=("Helvetica", 9))
+
+        # Orientation marker — DSS cutouts are North-up / East-left
+        cv.create_line(cpx - 26, 34, cpx - 26, 16, fill="#94a3b8", width=1, arrow=tk.LAST)
+        cv.create_text(cpx - 17, 22, text="N", fill="#94a3b8", font=("Helvetica", 8))
+        cv.create_line(cpx - 26, 34, cpx - 44, 34, fill="#94a3b8", width=1, arrow=tk.LAST)
+        cv.create_text(cpx - 50, 34, text="E", fill="#94a3b8", font=("Helvetica", 8))
+
+        clipped = False
+        for r in self._explore_rigs:
+            if not r["visible"]:
+                continue
+            rw = r["fov_w"] * ppd / 2
+            rh = r["fov_h"] * ppd / 2
+            if 2 * rw > cpx + 1 or 2 * rh > cpx + 1:
+                clipped = True
+            color = r["color"]
+            width = 2
+            if self._explore_hilite is not None:
+                if r["key"] == self._explore_hilite:
+                    width = 3
+                else:
+                    color = self._dim_hex(r["color"])
+            kwargs = {"outline": color, "width": width, "fill": ""}
+            if r["dash"]:
+                kwargs["dash"] = r["dash"]
+            cv.create_rectangle(cxc - rw, cyc - rh, cxc + rw, cyc + rh, **kwargs)
+            # Slot number just inside the frame's top-left corner (clamped on-canvas)
+            tx = min(max(cxc - rw, 0) + 11, cpx - 10)
+            ty = min(max(cyc - rh, 0) + 10, cpx - 10)
+            cv.create_text(tx, ty, text=str(r["slot"] + 1), fill=color,
+                           font=("Helvetica", 9, "bold"))
+
+        if clipped:
+            cv.create_text(cpx // 2, cpx - 30,
+                           text="⚠ some frames exceed the image span — clipped",
+                           fill="#f59e0b", font=("Helvetica", 8, "bold"))
+
+        # Target label — shadowed like the Planner preview
+        common = t['common'].split(';')[0].strip() if t.get('common') else ""
+        label = f"{t['id']}{('  ·  ' + common) if common else ''}"
+        cv.create_text(cpx // 2 + 1, cpx - 9, text=label, fill="black",
+                       font=("Helvetica", 8, "bold"))
+        cv.create_text(cpx // 2, cpx - 10, text=label, fill="white",
+                       font=("Helvetica", 8, "bold"))
+
+        self._explore_span_lbl.config(text=f"Image span {span:.2f}° × {span:.2f}°")
+
+    # ── Legend cards ──────────────────────────────────────────────────────
+
+    def _explore_refresh_cards(self):
+        """Rebuild the legend cards (one per analyzed rig) in the left rail.
+
+        Night-aware: these cards are created after startup so they aren't in
+        the ``_orig_colors`` snapshot — instead of relying on the recolor
+        walker / day-restore loop, the builder picks its palette from
+        ``self.night_mode`` and ``_apply_night_mode`` rebuilds the cards on
+        every toggle (same pattern as the queue and plan card lists).
+        The rig colour swatch and border are kept in both modes since they
+        map 1:1 to the frame colours on the canvas.
+        """
+        nm = getattr(self, "night_mode", False)
+        card_bg    = "#2a0000" if nm else "#1e2d3e"
+        border_off = "#331111" if nm else "#2a3642"
+        name_on    = "#cc4444" if nm else "#dddddd"
+        name_off   = "#661111" if nm else "#667788"
+        stats_fg   = "#993333" if nm else "#8899aa"
+        eye_on     = "#cc4400" if nm else "#7eb8d4"
+        eye_off    = "#661111" if nm else "#556677"
+        del_fg     = "#993333" if nm else "#667788"
+        fits_fg    = "#cc6600" if nm else "#4caf50"
+        nofit_fg   = "#ff2222" if nm else "#ef5350"
+        empty_fg   = "#661111" if nm else "#556677"
+        empty_bg   = "#1a0000" if nm else self._explore_cards_frame.cget("bg")
+
+        frame = self._explore_cards_frame
+        for w in frame.winfo_children():
+            w.destroy()
+
+        if not self._explore_rigs:
+            tk.Label(frame, text="No rigs analyzed yet", bg=empty_bg,
+                     fg=empty_fg, font=("Helvetica", 9)).pack(anchor="w", padx=2, pady=4)
+            return
+
+        t = self._explore_target
+        for r in self._explore_rigs:
+            card = tk.Frame(frame, bg=card_bg,
+                            highlightthickness=1,
+                            highlightbackground=r["color"] if r["visible"] else border_off)
+            card.pack(fill="x", pady=3)
+
+            row1 = tk.Frame(card, bg=card_bg)
+            row1.pack(fill="x", padx=6, pady=(4, 0))
+            sw = tk.Canvas(row1, width=14, height=10, bg=card_bg,
+                           highlightthickness=0)
+            sw.pack(side="left", pady=1)
+            line_kwargs = {"fill": r["color"], "width": 2}
+            if r["dash"]:
+                line_kwargs["dash"] = r["dash"]
+            sw.create_line(0, 5, 14, 5, **line_kwargs)
+
+            name_fg = name_on if r["visible"] else name_off
+            title = f"{r['slot'] + 1}· {r['scope']} · {r['camera']}"
+            if len(title) > 34:
+                title = title[:33] + "…"
+            title += f" · {r['reduction']}"
+            name_lbl = tk.Label(row1, text=title, bg=card_bg,
+                                fg=name_fg, font=("Helvetica", 9, "bold"), anchor="w")
+            name_lbl.pack(side="left", padx=(4, 0), fill="x", expand=True)
+
+            del_lbl = tk.Label(row1, text="✕", bg=card_bg, fg=del_fg,
+                               font=("Helvetica", 9, "bold"), cursor="hand2")
+            del_lbl.pack(side="right", padx=(2, 0))
+            del_lbl.bind("<Button-1>", lambda e, k=r["key"]: self._explore_remove_rig(k))
+            ToolTip(del_lbl, "Remove this rig from the comparison")
+
+            eye_lbl = tk.Label(row1, text="👁" if r["visible"] else "‒",
+                               bg=card_bg,
+                               fg=eye_on if r["visible"] else eye_off,
+                               font=("Helvetica", 9), cursor="hand2", width=2)
+            eye_lbl.pack(side="right")
+            eye_lbl.bind("<Button-1>", lambda e, k=r["key"]: self._explore_toggle_rig(k))
+            ToolTip(eye_lbl, "Show / hide this rig's frame")
+
+            stats = (f"{r['fov_w']:.2f}°×{r['fov_h']:.2f}°  ·  "
+                     f"{r['scale']:.2f}\"/px  ·  f/{r['f_ratio']:.1f}  ·  "
+                     f"{r['eff_fl']:.0f}mm")
+            stats_lbl = tk.Label(card, text=stats, bg=card_bg,
+                                 fg=stats_fg, font=("Helvetica", 8), anchor="w")
+            stats_lbl.pack(fill="x", padx=24, pady=(0, 0))
+
+            extra_widgets = []
+            if t is not None:
+                t_maj = (t.get("size_maj") or 10.0) / 60.0
+                t_min = (t.get("size_min") or t.get("size_maj") or 10.0) / 60.0
+                fits = (t_maj <= r["fov_w"] and t_min <= r["fov_h"])
+                fill_pct = min(100.0, 100.0 * (math.pi / 4.0 * t_maj * t_min)
+                               / max(r["fov_w"] * r["fov_h"], 1e-9))
+                fit_txt = (f"✅ fits · target fills {fill_pct:.0f}%" if fits
+                           else "❌ too big for sensor")
+                fit_lbl = tk.Label(card, text=fit_txt, bg=card_bg,
+                                   fg=fits_fg if fits else nofit_fg,
+                                   font=("Helvetica", 8), anchor="w")
+                fit_lbl.pack(fill="x", padx=24, pady=(0, 4))
+                extra_widgets.append(fit_lbl)
+            else:
+                stats_lbl.pack_configure(pady=(0, 4))
+
+            # Hover — highlight this rig's frame on the canvas
+            hover_widgets = [card, row1, sw, name_lbl, stats_lbl, eye_lbl, del_lbl] + extra_widgets
+            for w in hover_widgets:
+                w.bind("<Enter>", lambda e, k=r["key"]: self._explore_set_hilite(k))
+                w.bind("<Leave>", lambda e: self._explore_set_hilite(None))
+
+    def _explore_set_hilite(self, key):
+        """Set / clear the hover-highlighted rig and redraw the frames."""
+        if key == self._explore_hilite:
+            return
+        self._explore_hilite = key
+        self._explore_redraw()
+
+    def _explore_toggle_rig(self, key):
+        """Toggle a rig frame's visibility (its colour slot is retained)."""
+        for r in self._explore_rigs:
+            if r["key"] == key:
+                r["visible"] = not r["visible"]
+                break
+        self._explore_refresh_cards()
+        self._explore_ensure_image()   # span may shrink/grow with visibility
+
+    def _explore_remove_rig(self, key):
+        """Remove a rig from the comparison, freeing its colour slot."""
+        self._explore_hilite = None
+        self._explore_rigs = [r for r in self._explore_rigs if r["key"] != key]
+        self._explore_refresh_cards()
+        self._explore_ensure_image()
+
+    def _explore_clear(self):
+        """Remove all analyzed rigs (keeps the target and image)."""
+        if not self._explore_rigs:
+            return
+        self._explore_hilite = None
+        self._explore_rigs = []
+        self._explore_refresh_cards()
+        self._explore_redraw()
+
+    def _kick_explore_paint(self):
+        """Kick the finicky Explore widgets into painting (macOS Cocoa Tk)."""
+        self._kick_paint([self.explore_canvas, self.explore_search])
+
     def open_sky_map(self):
         """Open the interactive sky map centred on the current target.
 
@@ -8421,6 +9061,11 @@ class AstroApp:
                 elif current == str(self.tab_plan):
                     self.root.after(10, self._draw_queue_gantt)
                     self.root.after(20, self._refresh_plan_tree)
+                elif current == str(self.tab_explore):
+                    # Redraw the comparison canvas (cheap — image is cached)
+                    # and kick the Cocoa Tk paint pipeline like other tabs.
+                    self.root.after(10, self._explore_redraw)
+                    self.root.after(50, self._kick_explore_paint)
                 elif current == str(self.tab_equip):
                     # Force layout refresh for grid-based equipment panel
                     self.root.after(10, self.refresh_inventory_tables)
@@ -9844,13 +10489,18 @@ class AstroApp:
             return
         self._update_floating_suggestions()
 
-    def _update_floating_suggestions(self):
+    def _update_floating_suggestions(self, entry=None, on_select=None):
         """Build and show/hide the floating suggestion popup below the search entry.
 
         Respects self.catalog_filter — targets whose `catalogs` set has no
         overlap with the user's enabled catalogs are excluded from results.
+
+        ``entry`` / ``on_select`` generalise the popup for other search
+        fields (the Explore tab reuses it); both default to the Planner's
+        search entry and select handler.
         """
-        typed = self.target_search.get().upper().replace(" ", "")
+        entry = entry if entry is not None else self.target_search
+        typed = entry.get().upper().replace(" ", "")
         if not typed:
             self._hide_suggestions()
             return
@@ -9882,10 +10532,12 @@ class AstroApp:
             self._hide_suggestions()
             return
 
-        self._show_suggestion_popup(matches)
+        self._show_suggestion_popup(matches, entry=entry, on_select=on_select)
 
-    def _show_suggestion_popup(self, matches):
+    def _show_suggestion_popup(self, matches, entry=None, on_select=None):
         """Show or update the floating suggestion Toplevel below the search entry."""
+        entry = entry if entry is not None else self.target_search
+        on_select = on_select if on_select is not None else self._select_suggestion
         # Destroy old popup if it exists
         if self._suggestion_popup and self._suggestion_popup.winfo_exists():
             self._suggestion_popup.destroy()
@@ -9896,12 +10548,12 @@ class AstroApp:
         self._suggestion_popup = popup
 
         # Position below the search entry
-        self.target_search.update_idletasks()
-        x = self.target_search.winfo_rootx()
-        y = self.target_search.winfo_rooty() + self.target_search.winfo_height()
+        entry.update_idletasks()
+        x = entry.winfo_rootx()
+        y = entry.winfo_rooty() + entry.winfo_height()
         # Extra width: ~80px for type badge + magnitude, plus ~100px for the
         # catalog badges that can appear (Messier/Caldwell/NGC/IC/Sharpless)
-        w = self.target_search.winfo_width() + 180
+        w = entry.winfo_width() + 180
 
         popup.wm_geometry(f"{w}x{min(len(matches) * 28 + 4, 340)}+{x}+{y}")
         popup.configure(bg="#1e2d3e")
@@ -9980,9 +10632,9 @@ class AstroApp:
             # Click binding — bind to all sub-widgets
             target_id = t['id']
             for widget in (row, name_lbl, type_lbl, *cat_widgets):
-                widget.bind("<Button-1>", lambda e, tid=target_id: self._select_suggestion(tid))
+                widget.bind("<Button-1>", lambda e, tid=target_id: on_select(tid))
             if mag_str:
-                mag_lbl.bind("<Button-1>", lambda e, tid=target_id: self._select_suggestion(tid))
+                mag_lbl.bind("<Button-1>", lambda e, tid=target_id: on_select(tid))
 
     def _select_suggestion(self, target_id):
         """User clicked a suggestion — fill the search entry and optionally analyze."""
@@ -10410,6 +11062,25 @@ class AstroApp:
         self.scope_dropdown['values'] = sorted(list(self.data["scopes"].keys()))
         self.camera_dropdown['values'] = sorted(list(self.data["cameras"].keys()))
 
+        # Explore tab shares the same inventory — keep its dropdowns in sync
+        # and seed sensible defaults from the last session when unset.
+        if hasattr(self, "explore_scope_dropdown"):
+            self.explore_scope_dropdown['values'] = sorted(list(self.data["scopes"].keys()))
+            self.explore_camera_dropdown['values'] = sorted(list(self.data["cameras"].keys()))
+            _sess = self.data.get("session", {})
+            if (not self.explore_scope_var.get()
+                    or self.explore_scope_var.get() not in self.data["scopes"]):
+                if _sess.get("scope") in self.data["scopes"]:
+                    self.explore_scope_var.set(_sess["scope"])
+                else:
+                    self.explore_scope_var.set("")
+            if (not self.explore_camera_var.get()
+                    or self.explore_camera_var.get() not in self.data["cameras"]):
+                if _sess.get("camera") in self.data["cameras"]:
+                    self.explore_camera_var.set(_sess["camera"])
+                else:
+                    self.explore_camera_var.set("")
+
         # Rebuild filter dropdown — start with the permanent entries, then inject
         # any imported narrowband bandwidth that isn't already in the list
         _base_filter_values = ["Mono Lum", "LRGB",
@@ -10440,8 +11111,9 @@ class AstroApp:
             if not saved_red.endswith("×"):
                 try:
                     val = float(saved_red)
-                    _red_map = {0.63: "0.63×", 0.67: "0.67×", 0.70: "0.70×", 0.80: "0.80×",
-                                1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×", 2.5: "2.5×", 3.0: "3.0×"}
+                    _red_map = {0.63: "0.63×", 0.67: "0.67×", 0.70: "0.70×", 0.75: "0.75×",
+                                0.80: "0.80×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×",
+                                2.5: "2.5×", 3.0: "3.0×"}
                     saved_red = _red_map.get(round(val, 2), "1.0×")
                 except ValueError:
                     saved_red = "1.0×"

@@ -29,6 +29,7 @@ In one window it:
 - 🔭 **Searches NGC, IC, Messier, Caldwell, and Sharpless** from one box, with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976) and a per-catalog filter to narrow suggestions to just the lists you care about
 - 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image — and your final framing carries through to the export, so if you nudge the frame off-centre or rotate it, NINA centres and rotates to match
 - 🗺️ **Opens an interactive sky map** centred on your target — a wide-field view with constellations, the Milky Way, a coordinate grid, and your sensor frame drawn in, as the zoomed-out companion to the close-up DSS framing
+- 🧭 **Compares rigs on a target** in the new Explore tab — overlay up to six colour-coded scope/camera/reducer sensor frames on one DSS image, with a legend showing each rig's FOV, image scale, and how well the target fills the frame
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
 - 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
 - 📍 **Saves named location profiles** so dark-site travelers can switch between home and remote sites in a click — every twilight, moon, and altitude calculation follows the active site
@@ -66,8 +67,12 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
     </td>
   </tr>
   <tr>
-    <td colspan="2" align="center">
-      <img src="docs/screenshots/html-export.png" alt="Exported HTML plan report showing per-target details with an embedded altitude chart" width="70%">
+    <td width="50%">
+      <img src="docs/screenshots/exploreview.png" alt="Explore tab comparing three colour-coded sensor frames overlaid on one target, with per-rig legend cards">
+      <p align="center"><sub><b>Explore</b> — stack colour-coded sensor frames from different rigs on one target to pick the best equipment for it</sub></p>
+    </td>
+    <td width="50%">
+      <img src="docs/screenshots/html-export.png" alt="Exported HTML plan report showing per-target details with an embedded altitude chart">
       <p align="center"><sub><b>HTML export</b> — a printable night's-plan report with each target's altitude chart, ready for Print → Save as PDF</sub></p>
     </td>
   </tr>
@@ -92,7 +97,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.1.2.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.2.0.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -111,7 +116,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.1.2-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.2.0-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -215,7 +220,7 @@ complete analysis.
 
 ## Using the App
 
-The app is organised as five tabs, selectable from the icon sidebar on the
+The app is organised as six tabs, selectable from the icon sidebar on the
 left.
 
 ### 🎯 Planner
@@ -302,6 +307,37 @@ schedule, and the exports:
 
 Plans are saved as JSON session files in a `sessions` subfolder. When you
 close the app with entries still in the plan, you're prompted to save first.
+
+### 🧭 Explore
+
+The equipment-comparison workspace: where the Planner asks *"how does this
+object frame on my rig?"*, Explore asks *"which of my rigs is best for this
+object?"*
+
+Search for a target — same auto-complete and catalog filter as the Planner —
+then pick a scope, camera, and reducer and press **⊕ Analyze**. The rig's
+sensor frame is drawn to true angular scale over a DSS image of the target,
+centred at position angle 0°. Press Analyze again with different equipment
+and each combination stacks up as another colour-coded frame (solid, dashed,
+and dotted outlines double as a colour-blind-safe distinguisher), up to six
+rigs side by side.
+
+Each analyzed rig gets a **legend card** in the left rail showing its FOV,
+image scale, focal ratio and effective focal length, plus whether the target
+fits the sensor and how much of the frame it fills — the number that usually
+settles the "which rig?" question. Hover a card to highlight its frame and
+dim the others; use the 👁 toggle to hide a frame without losing its colour,
+✕ to remove it, or **✕ clear all** to start over. If you've saved rig
+presets on the Planner, **Add saved rig…** applies and analyzes one in a
+single click.
+
+The image is fetched at whatever span fits your largest analyzed FOV (up to
+SkyView's 5° cap — anything wider clips at the edge with a warning) and
+re-downloads automatically when a bigger rig joins the comparison. Switching
+targets keeps your whole rig stack and re-frames it over the new object, so
+you can sweep one set of equipment across a season's worth of candidates.
+Offline, the tab falls back to the same geometric ellipse preview as the
+Planner, with the frames still drawn to scale.
 
 ### 🔭 Equip
 
@@ -406,6 +442,15 @@ New in 1.1.2, nothing needs migrating:
   framing assistant, and the same value is written to the `.ninaTargetSet`.
   Earlier builds used an internal screen angle that ran the opposite way; if a
   plan's exact rotation matters, re-export it to pick up the corrected angle.
+
+New in 1.2.0, nothing needs migrating:
+
+- **The Explore tab arrives ready to use.** It reads the cameras, telescopes,
+  and saved rig presets you already have — open the new 🧭 sidebar entry,
+  search a target, and start stacking sensor frames. See
+  [Explore](#-explore) for the full tour.
+- **A 0.75× reducer joins the reduction dropdown** on both the Planner and
+  Explore tabs. Sessions saved with it restore correctly on relaunch.
 
 ---
 
