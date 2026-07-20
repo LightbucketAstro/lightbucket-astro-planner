@@ -452,6 +452,9 @@ New in 1.2.0, nothing needs migrating:
 - **A 0.75× reducer joins the reduction dropdown** on both the Planner and
   Explore tabs. Sessions saved with it restore correctly on relaunch.
 
+New in 1.2.1, nothing needs migrating:
+Minor fix to Explore panel image update routine.  Images now refresh correctly when changing to different object with same FOV.
+
 ---
 
 ## Reporting Bugs
