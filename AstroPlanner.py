@@ -46,7 +46,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # ── Sky-map catalog tiers (optional downloads) ─────────────────────────────
 # Pinned to the d3-celestial commit our bundled engine + stars.6 came from, so
@@ -7875,7 +7875,7 @@ class AstroApp:
         self._explore_fetch_seq = 0      # stale-fetch guard (monotonic counter)
         self._explore_hilite = None      # key of hover-highlighted rig, or None
         self._explore_photo = None       # keep PhotoImage alive
-        self._explore_photo_cache = None # (img id, deg) → avoid re-resizing per hover
+        self._explore_photo_cache = None # (img ref, deg, photo) → avoid re-resizing per hover
 
         RAIL_BG = "#131f2e"
 
@@ -8224,13 +8224,18 @@ class AstroApp:
         cxc = cyc = cpx / 2
 
         if v["img"] is not None:
-            cache_key = (id(v["img"]), span)
-            if self._explore_photo_cache and self._explore_photo_cache[0] == cache_key:
-                photo = self._explore_photo_cache[1]
+            # Cache key holds a strong reference to the source image and is
+            # compared by identity (``is``).  Never key on id(img): after a
+            # target switch the old image is freed and CPython frequently
+            # reuses its address for the new one, so (id, span) collides and
+            # the canvas silently shows the previous target's picture.
+            cache = self._explore_photo_cache
+            if cache and cache[0] is v["img"] and cache[1] == span:
+                photo = cache[2]
             else:
                 resized = v["img"].resize((cpx, cpx), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(resized)
-                self._explore_photo_cache = (cache_key, photo)
+                self._explore_photo_cache = (v["img"], span, photo)
             self._explore_photo = photo
             cv.create_image(0, 0, anchor="nw", image=photo)
         else:
