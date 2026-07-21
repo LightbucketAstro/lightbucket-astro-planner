@@ -97,7 +97,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-1.2.0.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-1.2.1.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -116,7 +116,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-1.2.0-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-1.2.1-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -209,8 +209,33 @@ The **Analysis Preferences** card exposes:
 
 Click **Save Preferences** to persist. The NGC / IC catalog downloads
 automatically in the background on first launch; if the download fails, the
-app falls back to a built-in catalog of ~60 well-known targets and you can
+app falls back to a built-in catalog of all 110 Messier objects and you can
 retry from **Data Management → Re-download**.
+
+### 6. (Optional) Decide about update checking — *Settings* tab
+
+The app is distributed only through GitHub Releases, so it has no installer
+that can update itself. Instead, the **Updates** card checks GitHub once a day
+for a newer release and tells you if one exists.
+
+| Setting                          | Default | What it does                                                            |
+| -------------------------------- | ------- | ----------------------------------------------------------------------- |
+| **Check for updates on launch** | On      | Contacts GitHub at most once every 24 hours to compare release versions. |
+
+Nothing is ever downloaded or installed automatically. When a newer version is
+found, a dismissible strip appears under the header — **What's new** opens the
+release notes, **Download** opens the release page in your browser. You stay in
+control of when (and whether) to install.
+
+The check is a single request to GitHub's public releases API. It sends no
+personal data and no telemetry; the app version travels in the request's
+User-Agent string, as it does for the catalog and image downloads. If you'd
+rather it made no network calls at launch, untick the box — the change saves
+immediately, no **Save Preferences** click needed.
+
+If you're offline, the check fails silently and the app carries on normally.
+**Check now** runs an immediate check and reports what it finds, including
+"you're up to date."
 
 You are now ready to plan a session. Switch to the **Planner** tab and search
 for a target — for example, **M42**, **NGC 7000**, or **IC 1318** — to see a
@@ -348,8 +373,12 @@ Values entered here populate the equipment dropdowns throughout the app.
 
 Observer location — including named **location profiles** for multiple
 observing sites, with ☆ to save the current coordinates and ⚙ to rename,
-update, or delete saved sites — analysis preferences, and data management
-(NINA profile import, NGC / IC catalog re-download, DSS image cache clear).
+update, or delete saved sites — analysis preferences, data management
+(NINA profile import, NGC / IC catalog re-download, DSS image cache clear),
+sky-map catalog tiers, and **Updates**.
+
+The **Updates** card holds the *Check for updates on launch* toggle and a
+**Check now** button that runs an immediate check and reports the result.
 See the [First-Run Setup](#first-run-setup) section for details on each field.
 
 ---
@@ -453,7 +482,19 @@ New in 1.2.0, nothing needs migrating:
   Explore tabs. Sessions saved with it restore correctly on relaunch.
 
 New in 1.2.1, nothing needs migrating:
-Minor fix to Explore panel image update routine.  Images now refresh correctly when changing to different object with same FOV.
+
+- **Minor fix to Explore panel image update routine.  Images now refresh 
+  correctly when changing to different object with same FOV.
+
+New in 1.2.2, nothing needs migrating:
+
+- **The app now tells you when a new version is out.** On launch it checks
+  GitHub at most once a day and, if a newer release exists, shows a dismissible
+  strip under the header with **What's new** and **Download**. Nothing is
+  downloaded or installed automatically — the buttons just open the release
+  notes and the release page. Turn the whole thing off under
+  **Settings → Updates**, or run a check on demand with **Check now**.
+  This is the last upgrade you'll have to find out about on your own.
 
 ---
 
@@ -462,7 +503,7 @@ Minor fix to Explore panel image update routine.  Images now refresh correctly w
 If something breaks, please include:
 
 1. Your OS and version.
-2. The app version (shown in the title bar).
+2. The app version (shown in the title bar, and under **Settings → Updates**).
 3. A copy of `crash.log` from the data folder if one exists.
 4. A short description of what you were doing when the problem occurred.
 

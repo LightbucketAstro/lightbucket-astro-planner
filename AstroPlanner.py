@@ -46,7 +46,50 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
+
+# ── Update checking (GitHub Releases) ──────────────────────────────────────
+# The app is distributed solely through GitHub Releases, so the public,
+# unauthenticated releases API is all we need to find out whether a newer
+# build exists.  Rate limit for unauthenticated calls is 60/hour per IP —
+# far beyond our once-a-day check.
+#
+# Policy is deliberately "notify, don't install":  the builds are unsigned,
+# so silently downloading and swapping a running app would fight Gatekeeper
+# and SmartScreen and risk corrupting an install mid-session.  Instead we
+# surface a dismissible banner and hand the user to the release page.
+UPDATE_REPO         = "LightbucketAstro/lightbucket-astro-planner"
+UPDATE_API_URL      = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases/latest"
+# Minimum seconds between automatic checks (24 h).  Manual "Check now"
+# from Settings ignores this throttle.
+UPDATE_CHECK_INTERVAL_S = 86400
+# Network timeout for the version probe.  Kept short: a slow or captive
+# network must never delay startup, and a missed check is harmless.
+UPDATE_CHECK_TIMEOUT_S = 10
+
+
+def _parse_version(text):
+    """Parse a version string into a comparable tuple of ints.
+
+    Accepts the shapes GitHub tags actually take — ``v1.2.0``, ``1.2.0``,
+    ``1.2``, ``v1.2.0-beta2`` — and returns e.g. ``(1, 2, 0)``.  Any
+    pre-release suffix is ignored for ordering purposes, which is the
+    conservative choice: a user running ``1.2.0-beta2`` will not be nagged
+    to "update" to the ``1.2.0`` final, and will be told about ``1.2.1``.
+
+    Returns ``None`` when nothing numeric can be recovered, so callers can
+    treat an unparseable tag as "no update" rather than guessing.
+    """
+    if not text:
+        return None
+    m = re.match(r"\s*v?(\d+(?:\.\d+)*)", str(text))
+    if not m:
+        return None
+    try:
+        return tuple(int(p) for p in m.group(1).split("."))
+    except ValueError:
+        return None
 
 # ── Sky-map catalog tiers (optional downloads) ─────────────────────────────
 # Pinned to the d3-celestial commit our bundled engine + stars.6 came from, so
@@ -1120,6 +1163,17 @@ class AstroApp:
         self.current_target_info = None  
         self.auto_update_enabled = _saved_settings.get("auto_update", False)
 
+        # ── Update-checker state ─────────────────────────────────────────
+        # NOTE: deliberately NOT reusing the `auto_update` key above — that
+        # one controls "re-run the analysis when equipment chips change" and
+        # has nothing to do with software updates.  Separate key, separate
+        # meaning.  Defaults to on; users who dislike any network call can
+        # turn it off in Settings.
+        self.check_updates_enabled = _saved_settings.get("check_for_updates", True)
+        self._update_banner   = None   # tk.Frame when the banner is showing
+        self._update_info     = None   # dict of the latest release, once fetched
+        self._update_checking = False  # guard against overlapping checks
+
         # Catalog filter state — controls which catalogs are searched.
         # 'Other' covers addendum extras (PGC, ESO, Mel, Barnard, MWSC, HCG,
         # UGC, etc. — ~58 entries that don't carry an NGC/IC/M/C/Sh tag).
@@ -1236,6 +1290,10 @@ class AstroApp:
         # been set yet.  Runs off-thread so the UI stays responsive — the
         # main-thread save + header refresh is scheduled back via after().
         self.root.after(600, self._auto_detect_location_if_unset)
+        # Update check runs last and off-thread — startup, catalog load, and
+        # first paint all finish well before this fires, so a slow or absent
+        # network never delays the app becoming usable.
+        self.root.after(2500, self._maybe_check_for_updates)
 
         # macOS Cocoa Tk resets ttk styles when a modal dialog (messagebox)
         # returns focus to the main window.  Bind <FocusIn> on root so we
@@ -2548,6 +2606,13 @@ class AstroApp:
             except Exception:
                 pass
 
+            # Update banner — created after the colour snapshot, so rebuild it
+            # rather than relying on the recolor walker.
+            try:
+                self._retheme_update_banner()
+            except Exception:
+                pass
+
         else:
             # ── DAY MODE — restore exactly to startup state ───────────────────
             self.night_btn.configure(text="🔴 Night Mode")
@@ -2651,6 +2716,11 @@ class AstroApp:
             # queue/plan cards above: rebuild so they return to day colours.
             try:
                 self._explore_refresh_cards()
+            except Exception:
+                pass
+            # Update banner — same dynamic-widget situation as the cards above.
+            try:
+                self._retheme_update_banner()
             except Exception:
                 pass
 
@@ -3736,6 +3806,30 @@ class AstroApp:
                                         "prog": _prog, "btn": _btn}
         self._update_skymap_catalog_ui()
 
+        # ── UPDATES ───────────────────────────────────────────────────────
+        upd_card = self._make_settings_card(outer, "UPDATES", "#5dcaa5")
+        ttk.Label(upd_card,
+                  text=("Checks GitHub once a day for a newer release. "
+                        "Nothing is downloaded or installed automatically."),
+                  font=("Helvetica", 9), foreground="#556677").pack(
+            anchor="w", padx=8, pady=(0, 4))
+
+        self._settings_check_updates = tk.BooleanVar(
+            value=self.data.get("settings", {}).get("check_for_updates", True))
+        ttk.Checkbutton(upd_card, text="Check for updates on launch",
+                        variable=self._settings_check_updates,
+                        command=self._settings_toggle_update_check).pack(
+            anchor="w", padx=8, pady=(0, 4))
+
+        upd_row = ttk.Frame(upd_card)
+        upd_row.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(upd_row, text="Check now",
+                   command=lambda: self._check_for_updates(manual=True)).pack(side="left")
+        self._settings_update_status = ttk.Label(
+            upd_row, text=f"Current version {__version__}",
+            font=("Helvetica", 9), foreground="#556677")
+        self._settings_update_status.pack(side="left", padx=(10, 0))
+
         # About line
         ttk.Label(outer, text=f"Lightbucket Astro Planner  ·  Data: {self.data_path}",
                   font=("Helvetica", 9), foreground="#334455").pack(anchor="center", pady=(12, 0))
@@ -3743,6 +3837,329 @@ class AstroApp:
         # Wheel-scroll the whole panel (canvas + every card widget).
         self._bind_settings_mousewheel(self._settings_canvas)
         self._bind_settings_mousewheel_recursive(outer)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # UPDATE CHECKING
+    # ═══════════════════════════════════════════════════════════════════
+    #
+    # Flow:  _maybe_check_for_updates (throttle)  →  _check_for_updates
+    #        →  _update_check_worker (background thread, network)
+    #        →  _update_check_finished (back on the UI thread via after)
+    #        →  _show_update_banner  →  _show_update_dialog (on demand)
+    #
+    # Every network operation happens on a daemon thread and every widget
+    # touch happens on the Tk main thread.  Failures are silent for the
+    # automatic path (offline at a dark site is normal, not an error worth
+    # a dialog) and reported inline for the manual "Check now" path.
+
+    def _maybe_check_for_updates(self):
+        """Run the automatic update check if enabled and not checked recently."""
+        if not getattr(self, "check_updates_enabled", True):
+            return
+        last = self.data.get("settings", {}).get("last_update_check", 0)
+        try:
+            last = float(last)
+        except (TypeError, ValueError):
+            last = 0
+        if (datetime.now(timezone.utc).timestamp() - last) < UPDATE_CHECK_INTERVAL_S:
+            return
+        self._check_for_updates(manual=False)
+
+    def _check_for_updates(self, manual=False):
+        """Start a background update check.
+
+        ``manual=True`` comes from the Settings "Check now" button: it
+        bypasses the once-a-day throttle, ignores a previously-skipped
+        version, and reports its result (including "you're up to date" and
+        network errors) instead of failing silently.
+        """
+        if self._update_checking:
+            return
+        self._update_checking = True
+        if manual:
+            self._set_update_status("Checking…", "#7eb8d4")
+        threading.Thread(target=self._update_check_worker,
+                         args=(manual,), daemon=True).start()
+
+    def _update_check_worker(self, manual):
+        """Fetch the latest release from GitHub (runs off the UI thread)."""
+        info, error = None, None
+        try:
+            req = urllib.request.Request(
+                UPDATE_API_URL,
+                headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}",
+                         "Accept": "application/vnd.github+json"})
+            with urllib.request.urlopen(req, timeout=UPDATE_CHECK_TIMEOUT_S) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
+            info = {
+                "tag":   payload.get("tag_name", "") or "",
+                "name":  payload.get("name", "") or "",
+                "notes": payload.get("body", "") or "",
+                "url":   payload.get("html_url", "") or UPDATE_RELEASES_URL,
+            }
+        except Exception as exc:
+            error = exc
+        self.root.after(0, lambda: self._update_check_finished(info, error, manual))
+
+    def _update_check_finished(self, info, error, manual):
+        """Handle a completed update check on the UI thread."""
+        self._update_checking = False
+
+        # Stamp the attempt time even on failure so a machine that is
+        # offline every launch doesn't retry the network on every start.
+        self.data.setdefault("settings", {})["last_update_check"] = \
+            datetime.now(timezone.utc).timestamp()
+        try:
+            self._persist_data()
+        except Exception:
+            pass
+
+        if error is not None:
+            if manual:
+                self._set_update_status("Couldn't reach GitHub — check your connection.",
+                                        "#e05555")
+            return
+
+        latest  = _parse_version(info.get("tag"))
+        current = _parse_version(__version__)
+        if latest is None or current is None:
+            if manual:
+                self._set_update_status("Couldn't read the latest version number.",
+                                        "#e05555")
+            return
+
+        self._update_info = info
+
+        if latest <= current:
+            if manual:
+                self._set_update_status(f"You're up to date (v{__version__}).", "#4caf50")
+            return
+
+        # A newer release exists.  Honour a skip only on the automatic path —
+        # an explicit "Check now" should always show what's out there.
+        skipped = self.data.get("settings", {}).get("skipped_version", "")
+        if not manual and skipped and _parse_version(skipped) == latest:
+            return
+
+        version_txt = ".".join(str(p) for p in latest)
+        if manual:
+            self._set_update_status(f"Version {version_txt} is available.", "#5dcaa5")
+        self._show_update_banner(version_txt)
+
+    # ── Banner (Option A) ────────────────────────────────────────────────
+
+    def _update_banner_colors(self):
+        """Return (bg, accent, text, muted) for the banner in the current theme."""
+        if getattr(self, "night_mode", False):
+            return "#2a0000", "#cc0000", "#ff6633", "#993300"
+        return "#1b3a2e", "#5dcaa5", "#d8f0e6", "#7ea99a"
+
+    def _show_update_banner(self, version_txt):
+        """Show the dismissible 'update available' strip beneath the header.
+
+        Packed with ``before=self._main_frame`` so it slots between the header
+        and the sidebar/notebook area regardless of when it's created — the
+        main frame was packed long before this runs.
+        """
+        self._dismiss_update_banner()   # replace any existing banner
+
+        bg, accent, fg, muted = self._update_banner_colors()
+
+        bar = tk.Frame(self.root, bg=bg)
+        try:
+            bar.pack(fill="x", before=self._main_frame)
+        except Exception:
+            # Extremely defensive: if the main frame is gone, don't crash the
+            # app over a notification.
+            bar.destroy()
+            return
+        self._update_banner = bar
+
+        # Left accent stripe, mirroring the settings-card visual language.
+        tk.Frame(bar, bg=accent, width=3).pack(side="left", fill="y")
+
+        inner = tk.Frame(bar, bg=bg)
+        inner.pack(fill="x", padx=(11, 12), pady=7)
+
+        tk.Label(inner, text="⬆", bg=bg, fg=accent,
+                 font=("Helvetica", 12, "bold")).pack(side="left", padx=(0, 8))
+        tk.Label(inner, text=f"Version {version_txt} is available",
+                 bg=bg, fg=fg, font=("Helvetica", 11, "bold")).pack(side="left")
+        tk.Label(inner, text=f"you have {__version__}",
+                 bg=bg, fg=muted, font=("Helvetica", 10)).pack(side="left", padx=(9, 0))
+
+        # Dismiss sits at the far right; the two actions pack right-to-left
+        # beside it so the primary action lands closest to the edge content.
+        close = tk.Label(inner, text="✕", bg=bg, fg=muted,
+                         font=("Helvetica", 11), cursor="hand2", padx=6)
+        close.pack(side="right")
+        close.bind("<Button-1>", lambda e: self._dismiss_update_banner())
+        ToolTip(close, "Dismiss until the next check")
+
+        def _pill(text, command, primary):
+            """Build a flat clickable pill.
+
+            The outline on the secondary pill is drawn with a 1 px wrapper
+            Frame rather than ``highlightthickness`` — native macOS Tk
+            frequently refuses to paint highlight borders on a Label, which
+            would leave 'What's new' looking like unclickable text.
+            """
+            border = tk.Frame(inner, bg=accent)
+            border.pack(side="right", padx=(8, 0))
+            fill_bg = accent if primary else bg
+            fill_fg = ("#04342C" if not getattr(self, "night_mode", False)
+                       else "#1a0000") if primary else fg
+            lbl = tk.Label(border, text=text, cursor="hand2",
+                           font=("Helvetica", 10, "bold" if primary else "normal"),
+                           padx=11, pady=3, bg=fill_bg, fg=fill_fg)
+            lbl.pack(padx=0 if primary else 1, pady=0 if primary else 1)
+            for _w in (border, lbl):
+                _w.bind("<Button-1>", lambda e: command())
+            return border
+
+        _pill("Download", self._open_release_page, True)
+        _pill("What's new", self._show_update_dialog, False)
+
+    def _dismiss_update_banner(self):
+        """Remove the update banner if it's showing."""
+        bar = getattr(self, "_update_banner", None)
+        if bar is not None:
+            try:
+                bar.destroy()
+            except Exception:
+                pass
+            self._update_banner = None
+
+    def _retheme_update_banner(self):
+        """Rebuild the banner in the current theme after a day/night toggle.
+
+        The banner is created after ``_snapshot_original_colors`` runs, so it
+        isn't in ``_orig_colors`` and the theme-restore loop can't reach it —
+        same situation as the queue and plan cards, and handled the same way:
+        by rebuilding rather than recolouring in place.
+        """
+        if getattr(self, "_update_banner", None) is None:
+            return
+        info = getattr(self, "_update_info", None)
+        latest = _parse_version((info or {}).get("tag"))
+        if latest is None:
+            self._dismiss_update_banner()
+            return
+        self._show_update_banner(".".join(str(p) for p in latest))
+
+    # ── Release-notes dialog (Option B) ──────────────────────────────────
+
+    @staticmethod
+    def _plain_release_notes(md):
+        """Flatten GitHub-flavoured Markdown release notes to readable text.
+
+        Not a Markdown parser — just enough to stop headings, emphasis, and
+        link syntax from showing up as punctuation noise in a Tk Text widget.
+        """
+        if not md:
+            return "No release notes were provided for this version."
+        text = md.replace("\r\n", "\n").replace("\r", "\n")
+        text = re.sub(r"^\s{0,3}#{1,6}\s*", "", text, flags=re.MULTILINE)
+        text = re.sub(r"\[([^\]]+)\]\([^)]*\)", r"\1", text)   # [label](url) → label
+        text = re.sub(r"(\*\*|__)(.*?)\1", r"\2", text)        # bold
+        text = re.sub(r"`{1,3}([^`]*)`{1,3}", r"\1", text)     # code spans
+        text = re.sub(r"^\s*[-*+]\s+", "• ", text, flags=re.MULTILINE)
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text.strip() or "No release notes were provided for this version."
+
+    def _show_update_dialog(self):
+        """Open the release-notes dialog for the pending update."""
+        info = getattr(self, "_update_info", None)
+        if not info:
+            return
+        latest = _parse_version(info.get("tag"))
+        version_txt = ".".join(str(p) for p in latest) if latest else info.get("tag", "")
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Update Available")
+        dlg.transient(self.root)
+        dlg.grab_set()
+        dlg.resizable(False, False)
+
+        head = ttk.Frame(dlg, padding=(16, 14, 16, 6))
+        head.pack(fill="x")
+        ttk.Label(head, text=info.get("name") or f"Version {version_txt}",
+                  font=("Helvetica", 13, "bold")).pack(side="left")
+        ttk.Label(head, text=f"{__version__}  →  {version_txt}",
+                  font=("Helvetica", 10), foreground="#5dcaa5").pack(side="right")
+
+        body = ttk.Frame(dlg, padding=(16, 0, 16, 6))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="What's new", font=("Helvetica", 9, "bold"),
+                  foreground="#7eb8d4").pack(anchor="w", pady=(0, 4))
+
+        notes_wrap = ttk.Frame(body)
+        notes_wrap.pack(fill="both", expand=True)
+        notes_sb = ttk.Scrollbar(notes_wrap, orient="vertical")
+        notes_sb.pack(side="right", fill="y")
+        notes = tk.Text(notes_wrap, width=62, height=13, wrap="word",
+                        relief="flat", padx=10, pady=8,
+                        font=("Helvetica", 10),
+                        yscrollcommand=notes_sb.set)
+        notes.pack(side="left", fill="both", expand=True)
+        notes_sb.config(command=notes.yview)
+        notes.insert("1.0", self._plain_release_notes(info.get("notes")))
+        notes.config(state="disabled")
+        # Text isn't a ttk widget, so it needs explicit theme colours.
+        if getattr(self, "night_mode", False):
+            notes.config(bg="#200000", fg="#cc0000", insertbackground="#cc0000")
+        else:
+            notes.config(bg="#1b2836", fg="#c8d6e2", insertbackground="#c8d6e2")
+
+        foot = ttk.Frame(dlg, padding=(16, 4, 16, 14))
+        foot.pack(fill="x")
+
+        skip_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(foot, text="Skip this version", variable=skip_var).pack(side="left")
+
+        def _finish(open_page):
+            self.data.setdefault("settings", {})
+            if skip_var.get() and latest is not None:
+                self.data["settings"]["skipped_version"] = ".".join(str(p) for p in latest)
+                self._dismiss_update_banner()
+            else:
+                self.data["settings"].pop("skipped_version", None)
+            try:
+                self._persist_data()
+            except Exception:
+                pass
+            dlg.destroy()
+            if open_page:
+                self._open_release_page()
+
+        ttk.Button(foot, text="Open release page",
+                   command=lambda: _finish(True)).pack(side="right", padx=(6, 0))
+        ttk.Button(foot, text="Later",
+                   command=lambda: _finish(False)).pack(side="right")
+
+        self._theme_popup(dlg)
+        dlg.protocol("WM_DELETE_WINDOW", lambda: _finish(False))
+
+    def _open_release_page(self):
+        """Open the GitHub release page in the user's default browser."""
+        info = getattr(self, "_update_info", None) or {}
+        url = info.get("url") or UPDATE_RELEASES_URL
+        try:
+            webbrowser.open(url)
+        except Exception:
+            messagebox.showinfo(
+                "Download the Update",
+                f"Couldn't open your browser automatically.\n\n"
+                f"Visit:\n{url}")
+
+    def _set_update_status(self, text, color="#556677"):
+        """Update the Settings panel's update-status line, if it's been built."""
+        lbl = getattr(self, "_settings_update_status", None)
+        if lbl is not None:
+            try:
+                lbl.config(text=text, foreground=color)
+            except Exception:
+                pass
 
     # ═══════════════════════════════════════════════════════════════════
     # SETTINGS PANEL HANDLERS
@@ -3824,6 +4241,9 @@ class AstroApp:
         self.data["settings"]["min_alt"] = self._settings_min_alt.get()
         self.data["settings"]["auto_update"] = self._settings_auto_update.get()
         self.data["settings"]["c_value"] = C_VALUE
+        if hasattr(self, "_settings_check_updates"):
+            self.data["settings"]["check_for_updates"] = self._settings_check_updates.get()
+            self.check_updates_enabled = self._settings_check_updates.get()
 
         # Apply default bortle to the active Bortle choice
         if self._settings_default_bortle.get() in BORTLE_FACTORS:
@@ -3835,6 +4255,27 @@ class AstroApp:
 
         self.save_data()
         messagebox.showinfo("Saved", "Preferences saved successfully.")
+
+    def _settings_toggle_update_check(self):
+        """Persist the update-check toggle immediately.
+
+        Saved on click rather than waiting for 'Save Preferences' — a user
+        switching this off wants the network call to stop now, not after they
+        remember to press another button.  Turning it off also clears any
+        visible banner so the opt-out is immediately believable.
+        """
+        enabled = self._settings_check_updates.get()
+        self.check_updates_enabled = enabled
+        self.data.setdefault("settings", {})["check_for_updates"] = enabled
+        try:
+            self._persist_data()
+        except Exception:
+            pass
+        if enabled:
+            self._set_update_status(f"Current version {__version__}", "#556677")
+        else:
+            self._dismiss_update_banner()
+            self._set_update_status("Automatic checks are off.", "#556677")
 
     def _settings_redownload_catalog(self):
         """Delete existing catalog and re-download."""

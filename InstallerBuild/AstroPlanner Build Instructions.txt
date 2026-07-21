@@ -1,6 +1,6 @@
 ================================================================================
               LIGHTBUCKET ASTRO PLANNER - BUILD INSTRUCTIONS
-                              Version 1.2.1
+                              Version 1.2.2
 ================================================================================
 
 These instructions cover building Lightbucket Astro Planner from source on
@@ -97,7 +97,7 @@ Step 3.  Verify the output:
 Step 4. Create a .dmg file for distribution:
 	Run the script: ./MakeDmgFile.sh
 
-	Output should be in: ~/AstroPlannerDev/InstallerBuild/installer/LightbucketAstroPlanner-1.2.1.dmg
+	Output should be in: ~/AstroPlannerDev/InstallerBuild/installer/LightbucketAstroPlanner-1.2.2.dmg
 
 
 ================================================================================
@@ -131,7 +131,7 @@ Step 3.  Build the installer in Inno Setup:
          Output:
 
              ...\InstallerBuild\installer\
-                 LightbucketAstroPlanner-1.2.1-setup.exe
+                 LightbucketAstroPlanner-1.2.2-setup.exe
 
 Step 4.  Test the installer:
 
