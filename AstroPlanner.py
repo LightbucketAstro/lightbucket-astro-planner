@@ -13,9 +13,12 @@ Module-level astronomy helpers :
     Julian date, alt/az, moon phase & position, twilight, transit, and
     the nightly imaging-window scan.
 AstroApp (Tk class) :
-    Five-tab UI — Target Planner, Targets List, Tonight's Plan,
-    Manage Equipment, Settings — plus sidebar navigation, day/night
-    theming, DSS image thumbnail with FOV overlay, and catalog search.
+    Sidebar UI — Target Planner, Tonight's Plan, Explore, Manage
+    Equipment, Settings — plus day/night theming, DSS image thumbnail
+    with FOV overlay, and catalog search. The Plan tab merges target
+    browsing with tonight's committed plan and a collapsible schedule-
+    timeline strip (the retired Targets List tab's Gantt/reorder tools,
+    reattached to the committed plan).
 
 File layout on disk
 -------------------
@@ -26,12 +29,13 @@ File layout on disk
 """
 
 import tkinter as tk
-from tkinter import ttk, messagebox, filedialog, simpledialog
+from tkinter import ttk, messagebox, filedialog, simpledialog, font as tkfont
 import json
 import os
 import sys
 import platform
 import math
+import colorsys
 import csv
 import urllib.request
 import urllib.error
@@ -41,12 +45,13 @@ import webbrowser
 import ssl
 import threading
 import io
+import time
 import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "1.2.2"
+__version__ = "2.0.0"
 
 # ── Update checking (GitHub Releases) ──────────────────────────────────────
 # The app is distributed solely through GitHub Releases, so the public,
@@ -474,6 +479,33 @@ NGC_TYPE_CATEGORIES = {
 
 OBJECT_TYPE_FILTERS = ["All Types", "Galaxy", "Nebula", "Planetary Nebula", "Open Cluster", "Globular Cluster"]
 
+# Hard cap on how many target cards the Plan tab's browsing grid ever builds
+# in one pass. Each card does real per-target work (altitude sparkline,
+# imaging-window calc, moon separation) plus several Tk widgets, so building
+# thousands of them synchronously on the main thread (e.g. "🔭 All" mode with
+# no Type/Magnitude filter, ~13,000 catalog candidates) is what actually
+# freezes the UI — the scan itself is already backgrounded and isn't the
+# bottleneck. Results are pre-sorted by tonight's altitude descending, so the
+# cap keeps the best-placed/most relevant subset; search still reaches any
+# target regardless of the cap.
+GRID_CARD_CAP = 150
+
+# Fixed palette used to color-code Tonight's Plan cards by rig (scope+camera
+# pairing). Assigned on first sight of each distinct pairing, in order, and
+# kept stable for the rest of the session (see AstroApp._get_rig_accent_color)
+# rather than recomputed fresh on every refresh, so a rig's color doesn't
+# shift around as targets are added/removed from the plan.
+RIG_ACCENT_COLORS = [
+    "#38bdf8",  # blue
+    "#c084fc",  # purple
+    "#34d399",  # green
+    "#f59e0b",  # amber
+    "#f472b6",  # pink
+    "#2dd4bf",  # teal
+    "#fb7185",  # rose
+    "#a3e635",  # lime
+]
+
 # Built-in Messier catalog used as offline fallback when NGC download fails.
 # Columns: (name, type, RA h:m:s, Dec ±d:m:s, majax', minax', Vmag, SurfBr, common_names)
 # Types must match NGC_TYPE_CATEGORIES keys: E, Sa/Sb/Sc, S0, IG, OC, GC, EN, RN, PN, SNR, D*, Ast
@@ -670,6 +702,18 @@ def _calc_moon_phase():
     return name, illum_pct, emoji, round(age, 1), round(days_to_new, 1), round(days_to_full, 1)
 
 
+def _angular_sep_deg(ra1_deg, dec1_deg, ra2_deg, dec2_deg):
+    """Return the angular separation in degrees between two sky positions
+    (spherical law of cosines — same formula as ``_calc_moon_separation``,
+    kept as its own function since it's used for display purposes only:
+    showing how far a confirmed FOV pan moved off the catalog centre)."""
+    ra1, dec1 = math.radians(ra1_deg), math.radians(dec1_deg)
+    ra2, dec2 = math.radians(ra2_deg), math.radians(dec2_deg)
+    cos_d = (math.sin(dec1) * math.sin(dec2)
+             + math.cos(dec1) * math.cos(dec2) * math.cos(ra1 - ra2))
+    return math.degrees(math.acos(max(-1.0, min(1.0, cos_d))))
+
+
 def _calc_moon_separation(target_ra_deg, target_dec_deg):
     """Return the angular separation in degrees between the Moon and the target right now.
 
@@ -811,6 +855,49 @@ def _calc_best_imaging_window(ra_deg, dec_deg, lat_deg, lon_deg, min_alt=20.0):
             f"dark={been_dark} peak={peak_alt_found:.0f}° || " + "  ".join(diag_samples))
 
     return start_str, end_str, window_hrs, peak_str, round(peak_alt_found, 1), diag
+
+
+def _dss_survey_size_deg(fov_w_deg, fov_h_deg):
+    """Sky patch size (degrees, square) to fetch for a DSS thumbnail wide
+    enough to show a sensor of the given FOV with comfortable padding."""
+    return max(fov_w_deg, fov_h_deg, 0.1) * 1.6
+
+
+def _dss_fetch_plan(survey_size_deg):
+    """Build fetch_thumbnail's two-lane DSS fetch plan: a 'fast lane'
+    (size_deg, timeout_s) list, capped small enough to render promptly,
+    plus an optional 'slow lane' (size_deg, timeout_s) pair for the
+    FULL size the FOV actually needs, when that's bigger than the fast
+    lane covers.
+
+    An earlier version of this tried the real FOV size FIRST and only
+    fell back to something smaller if that timed out. Measured against
+    a live 9.81deg request, that single attempt genuinely timed out at
+    45s (DSS2 cutouts are assembled server-side from scanned
+    photographic plates, and SkyView itself notes optical fields of
+    several degrees "can take a long time" to build) — so the user sat
+    through a 45s stall and STILL only ended up with the small fallback
+    image, i.e. strictly worse than before: same clipped frame, slower.
+
+    Running the two lanes CONCURRENTLY fixes that: the fast lane (same
+    small size as before) gives the user a picture almost immediately,
+    while the slow lane requests the real size in the background with a
+    much longer timeout and — if/when it actually lands — silently
+    upgrades the preview to the full, unclipped frame. If it never
+    lands, the user still has the fast lane's (possibly clipped)
+    picture instead of nothing.
+    """
+    fast_cap = 5.0
+    fast_size = min(survey_size_deg, fast_cap)
+    fast_lane = [(fast_size, 30)]
+    if fast_size > 3.0:
+        fast_lane.append((3.0, 20))
+    else:
+        # FOV was already small — retry once more at the same size
+        # rather than dropping further (3deg would be no faster).
+        fast_lane.append((fast_size, 20))
+    slow_lane = (survey_size_deg, 90) if survey_size_deg > fast_size else None
+    return fast_lane, slow_lane
 
 
 def _max_altitude_tonight(ra_deg, dec_deg, lat_deg, lon_deg, dark_range=None):
@@ -1039,8 +1126,6 @@ def _calc_moon_riseset(lat_deg, lon_deg):
 
 def _calc_transit_time(ra_deg, lon_deg):
     """Return local HH:MM string for the next meridian transit of ra_deg."""
-    utc_offset_h = _utc_offset_hours()
-
     plan_local = _planning_local_noon()
     jd       = _jd_now()
     T        = (jd - 2451545.0) / 36525.0
@@ -1083,16 +1168,18 @@ def _write_fallback_catalog(path):
 class AstroApp:
     """Main Tk application — Lightbucket Astro Planner.
 
-    Five-tab desktop planner for deep-sky astrophotography sessions.
-    Holds all UI state, equipment inventory, catalog, and the shared
-    Tk root.  Instantiated once at startup from ``__main__``.
+    Desktop planner for deep-sky astrophotography sessions.  Holds all
+    UI state, equipment inventory, catalog, and the shared Tk root.
+    Instantiated once at startup from ``__main__``.
 
     Tabs (in display order via sidebar)
-        Target Planner  — analyse a single object: FOV, exposure, window
-        Targets List — multi-target queue + per-target integration plan
-        Tonight's Plan  — the final list, with Gantt schedule + exports
+        Target Planner   — analyse a single object: FOV, exposure, window
+        Tonight's Plan   — browsing grid + tonight's committed plan,
+                            with a collapsible Gantt schedule strip
+                            (drag-to-reschedule, reorder tools) + exports
+        Explore          — compare targets side by side
         Manage Equipment — cameras, telescopes, reducers
-        Settings        — observer location, preferences, catalog, NINA
+        Settings         — observer location, preferences, catalog, NINA
     """
 
     # ═══════════════════════════════════════════════════════════════════
@@ -1107,10 +1194,19 @@ class AstroApp:
         # default ttk Windows theme has more generous padding around buttons
         # and the date picker), so the planning-date adjuster gets clipped at
         # 1210px.  Nudge the startup width up on Windows to give it room.
+        #
+        # The Plan tab's browsing grid (left, 2 columns of target cards) plus
+        # its fixed-380px Tonight's Plan rail (right) together need more than
+        # either of the widths above — measured at ~1360px of natural content
+        # width with realistic scope/camera names, vs. only 1210-1320px of
+        # actual window width, so the rail (packed second, after the
+        # expanding grid) was getting compressed below its own 380px and
+        # clipping its cards. Widened both by the same ~180px the Windows
+        # branch already added over the non-Windows one, plus headroom.
         if platform.system() == "Windows":
-            self.root.geometry("1320x855")
+            self.root.geometry("1500x855")
         else:
-            self.root.geometry("1210x855")
+            self.root.geometry("1400x855")
 
         # ── Window icon ──────────────────────────────────────────────────
         # Sets the taskbar / dock / title-bar / alt-tab icon.  Without this
@@ -1187,7 +1283,7 @@ class AstroApp:
         # to True so the user sees everything until they explicitly filter.
         for _cat in ("NGC", "IC", "Messier", "Caldwell", "Sharpless", "Other"):
             self.catalog_filter.setdefault(_cat, True)
-        self._catalog_filter_popup = None
+        self._unified_filters_popup = None   # Plan tab's consolidated Filters popup (Option C)
 
         # State shared between analyze_framing and the integration planner
         self._last_exp_s    = None   # most recent recommended sub-exposure (seconds)
@@ -1198,23 +1294,21 @@ class AstroApp:
 
         # Tonight's Plan — list of dicts, one per planned target
         self._plan_entries: list = []
-        self._queue_entries: list = []
-        self._editing_queue_idx = None   # index of queue entry being edited, or None
-        self._loading_queue_row = False  # True while _queue_load_target is populating fields
-        # Backup of the Planner's target search + equipment state, captured
-        # when the user switches to the Targets tab.  Restored on return to
-        # the Planner tab so the queue-card auto-load doesn't clobber the
-        # Planner's in-progress target.  Cleared by _queue_card_click when
-        # the user explicitly pivots to a queue entry.
-        self._planner_state_backup = None
 
         # Dirty-flag system for deferred analysis.  Instead of calling
         # analyze_framing immediately (which can be flushed by macOS Tk's
         # update_idletasks into a re-entrant cascade), callers set the dirty
         # flag via _mark_analysis_dirty().  The actual analysis is then
-        # scheduled via after() only when the Planner or Session tab is visible.
+        # scheduled via after() only when the Planner tab is visible.
         self._analysis_dirty = False
         self._analysis_after_id = None   # tracks a pending after() so we don't stack them
+        self._grid_rig_refresh_after_id = None   # ditto, for _schedule_grid_rig_refresh
+
+        # Equipment chips (scope/camera/reduction/filter) are restored from
+        # the last-used rig, and Bortle from last session state (it isn't
+        # part of a rig), exactly once, on the first refresh_dropdowns()
+        # call at startup -- see that method for why this must not repeat.
+        self._equipment_chips_restored = False
 
         # Plan Gantt drag state
         self._gantt_drag_idx      = None   # plan entry index being dragged
@@ -1227,7 +1321,15 @@ class AstroApp:
         self._gantt_lm            = 74     # left margin pixels
         self._gantt_pw            = 0      # plot width pixels
         self._sidebar_switching   = False  # True while sidebar is initiating a tab switch
-        
+
+        # Headless analysis state — show_integration_plan/_analyze_framing_impl
+        # (shared backbone functions also used by the Frame dialog) read/write
+        # these StringVars and this Label. They used to be created as a side
+        # effect of setup_session_tab building the (now-retired) Targets
+        # List tab's "Current Target Analysis" stat cards; created here
+        # instead so those functions keep working with nothing visible.
+        self._init_headless_analysis_vars()
+
         self.setup_header()
 
         # ── Outer layout: sidebar + content area ──────────────────────────
@@ -1243,16 +1345,23 @@ class AstroApp:
         self.tab_control = ttk.Notebook(self._main_frame)
         self.tab_equip = ttk.Frame(self.tab_control)
         self.tab_planner = ttk.Frame(self.tab_control)
-        self.tab_session = ttk.Frame(self.tab_control)
         self.tab_plan    = ttk.Frame(self.tab_control)
         self.tab_explore = ttk.Frame(self.tab_control)
         self.tab_settings = ttk.Frame(self.tab_control)
 
-        self.tab_control.add(self.tab_planner, text='Target Planner')
-        self.tab_control.add(self.tab_equip,   text='Manage Equipment')
-        self.tab_control.add(self.tab_session, text='Targets List')
-        self.tab_control.add(self.tab_plan,    text="Tonight's Plan")
+        # tab_planner is deliberately never added here — the Planner tab is
+        # retired from navigation (Explore + the Plan tab's cards/Frame
+        # dialog now cover everything it did), but setup_planner_tab() still
+        # runs and builds it below: self.scope_choice/camera_choice/
+        # bortle_choice/filter_mode/reduction_factor, self.target_search,
+        # self.results_txt, self.preview_canvas, self.alt_canvas, and the
+        # saved-rig machinery are all still live global state that the Frame
+        # dialog, the Plan tab's cards, and NINA export read/write — moving
+        # all of that off this tab's widgets is real future work, not a
+        # same-session refactor, so the tab is hidden rather than torn out.
         self.tab_control.add(self.tab_explore, text='Explore')
+        self.tab_control.add(self.tab_plan,    text="Tonight's Plan")
+        self.tab_control.add(self.tab_equip,   text='Manage Equipment')
         self.tab_control.add(self.tab_settings, text='Settings')
         self.tab_control.pack(expand=1, fill="both")
         self.tab_control.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -1261,7 +1370,6 @@ class AstroApp:
 
         self.setup_input_tab()
         self.setup_planner_tab()
-        self.setup_session_tab()
         self.setup_plan_tab()
         self.setup_explore_tab()
         self.setup_settings_tab()
@@ -1307,11 +1415,11 @@ class AstroApp:
     def _route_to_equip_if_empty(self):
         """Switch to the Equip tab if the user has no scopes or cameras.
 
-        Runs early in startup to sidestep the macOS Cocoa Tk paint stall
-        on the empty-state Planner tab, and to land the user on the tab
-        they need anyway: you can't plan a session without equipment.
-        Only reroutes if the inventory is genuinely empty — users with
-        saved gear start on the Planner as before.
+        Runs early in startup to sidestep a macOS Cocoa Tk paint stall on
+        an empty-state tab, and to land the user on the tab they need
+        anyway: you can't plan a session without equipment. Only reroutes
+        if the inventory is genuinely empty — users with saved gear start
+        on Explore (the sidebar's first entry) as usual.
         """
         scopes  = self.data.get("scopes", {})
         cameras = self.data.get("cameras", {})
@@ -1375,7 +1483,7 @@ class AstroApp:
             "Welcome to Lightbucket Astro Planner!\n\n"
             "Your inventory is currently empty. Add at least one camera and "
             "one telescope on this tab to get started, then switch to the "
-            "Planner tab to begin planning a session.\n\n"
+            "Explore or Tonight's Plan tab to begin planning a session.\n\n"
             "Your observer location is being estimated from your IP address "
             "in the background — you can verify or change it on the Settings "
             "tab.\n\n"
@@ -1389,8 +1497,8 @@ class AstroApp:
             current = self.tab_control.select()
             if current == str(self.tab_equip):
                 self.root.after(100, self._kick_equip_paint)
-            elif current == str(self.tab_planner):
-                self.root.after(100, self._kick_planner_paint)
+            elif current == str(self.tab_explore):
+                self.root.after(100, self._kick_explore_paint)
         except Exception:
             pass
 
@@ -1438,11 +1546,12 @@ class AstroApp:
         self._sidebar_active_idx = 0
 
         # Tab mapping: (label, tab_frame, icon_name)
+        # Explore is first — and therefore the tab selected at startup by
+        # the _sidebar_select(0) call below — now that the Planner tab is
+        # retired from navigation (see the tab_control.add(...) calls above).
         self._sidebar_tabs = [
-            ("Planner",  self.tab_planner, "crosshair"),
-            ("Targets",  self.tab_session, "star_list"),
-            ("Tonight's\nPlan",  self.tab_plan,    "moon"),
             ("Explore",  self.tab_explore, "compass"),
+            ("Tonight's\nPlan",  self.tab_plan,    "moon"),
             ("Equip",    self.tab_equip,   "telescope"),
         ]
         self._sidebar_settings_tab = ("Settings", self.tab_settings, "gear")
@@ -1792,7 +1901,7 @@ class AstroApp:
 
     # Current gear-file schema version.  Bump this and add a new migration
     # step in _migrate_data whenever the shape of astro_gear.json changes.
-    _DATA_SCHEMA = 6
+    _DATA_SCHEMA = 8
 
     def load_data(self):
         """Load the gear JSON file, applying schema migrations; return an empty default on any failure."""
@@ -1820,6 +1929,7 @@ class AstroApp:
             "active_location": "",
             "session":      {},
             "nina_filters": {},
+            "filter_sets":  {},
             "settings":     {"rigs": [], "active_rig": ""},
         }
 
@@ -1862,6 +1972,33 @@ class AstroApp:
               for named location profiles; fold the existing single
               ``location`` into a default "Home" profile.
             • Stamp ``schema: 6``
+        schema 6 → 7  (Filter Manager)
+            • Add top-level ``filters`` dict — {name: {"type": "narrowband"|
+              "lrgb", "bandwidth_nm": float}} — replacing the old model
+              where every narrowband filter shared one global
+              ``nina_filters["bandwidth_nm"]``. Seeded from whatever
+              ``nina_filters`` already had (same bandwidth applied to each
+              imported narrowband name — the best available starting point;
+              refine per-filter afterward in the new manager), or from
+              Ha/OIII/SII @ 7nm + L/R/G/B if nothing was ever imported, so
+              no existing install loses its narrowband/LRGB options.
+            • Stamp ``schema: 7``
+        schema 7 → 8  (Filter Sets)
+            • Replace the flat ``filters`` dict (one bandwidth per
+              individual narrowband filter) with top-level ``filter_sets``
+              dict — {name: {"bandwidth_nm": float|None, "members":
+              [{"name": str, "type": "narrowband"|"lrgb"}, ...]}}. A rig now
+              points at a whole Filter Set (its filter wheel's contents,
+              which may mix narrowband and LRGB channels) instead of one
+              filter at a time, so "Add to Tonight" adds every filter the
+              set contains in one click. Every filter that existed under
+              schema 7 is folded into one set, "My Filters", using the
+              bandwidth of its first narrowband entry as that set's shared
+              bandwidth (schema 7 rarely had per-filter bandwidths differ in
+              practice, so this loses little); any rig that pointed at a
+              specific filter or the old generic "LRGB" is repointed at
+              "My Filters" (Mono Lum / no-filter rigs are untouched).
+            • Stamp ``schema: 8``
         """
         v = data.get("schema", 0)
 
@@ -1937,11 +2074,59 @@ class AstroApp:
             data["schema"] = 6
             v = 6
 
+        if v < 7:
+            # ── 6 → 7: introduce a real Filter Manager (data["filters"]) ──
+            filters = {}
+            nf = data.get("nina_filters", {}) or {}
+            nf_bw = nf.get("bandwidth_nm")
+            for name in (nf.get("narrowband") or []):
+                filters[name] = {"type": "narrowband",
+                                  "bandwidth_nm": float(nf_bw) if nf_bw else 7.0}
+            for name in (nf.get("lrgb") or []):
+                filters[name] = {"type": "lrgb"}
+            if not filters:
+                filters = {
+                    "Ha":   {"type": "narrowband", "bandwidth_nm": 7.0},
+                    "OIII": {"type": "narrowband", "bandwidth_nm": 7.0},
+                    "SII":  {"type": "narrowband", "bandwidth_nm": 7.0},
+                    "L": {"type": "lrgb"}, "R": {"type": "lrgb"},
+                    "G": {"type": "lrgb"}, "B": {"type": "lrgb"},
+                }
+            data["filters"] = filters
+            data["schema"] = 7
+            v = 7
+
+        if v < 8:
+            # ── 7 → 8: replace the flat per-filter dict with Filter Sets ──
+            old_filters = data.get("filters", {}) or {}
+            filter_sets = {}
+            if old_filters:
+                members = []
+                nb_bw = None
+                for fname, finfo in old_filters.items():
+                    ftype = finfo.get("type", "lrgb")
+                    members.append({"name": fname, "type": ftype})
+                    if ftype == "narrowband" and nb_bw is None and finfo.get("bandwidth_nm"):
+                        nb_bw = float(finfo["bandwidth_nm"])
+                filter_sets["My Filters"] = {"bandwidth_nm": nb_bw, "members": members}
+            data["filter_sets"] = filter_sets
+            data.pop("filters", None)
+            # A rig used to point at one filter (or the old generic "LRGB")
+            # — repoint it at the new consolidated set. "Mono Lum"/no-filter
+            # rigs need no change.
+            default_set_name = "My Filters" if filter_sets else ""
+            for rig in data.get("settings", {}).get("rigs", []):
+                old_val = rig.get("filter", "")
+                if old_val and old_val != "Mono Lum":
+                    rig["filter"] = default_set_name
+            data["schema"] = 8
+            v = 8
+
         # Future migrations go here:
-        # if v < 7:
+        # if v < 9:
         #     ...
-        #     data["schema"] = 7
-        #     v = 7
+        #     data["schema"] = 9
+        #     v = 8
 
         return data
 
@@ -2046,6 +2231,29 @@ class AstroApp:
                                        font=("Helvetica", 9), bg=HDR_BG, fg="#a0b8cc",
                                        width=52, anchor="w")
         self.twi_date_label.pack(anchor="w")
+
+        # ── Sky darkness (Bortle) — sits right under dusk/dawn since it's
+        # sky-condition context, not equipment. Global: read by the Frame
+        # dialog, the Plan tab's cards/NINA export, Explore's rig reports,
+        # everywhere the old Planner-tab chip fed. There is exactly one of
+        # these in the whole app now — Explore's Rig Builder and the
+        # equipment drawer both used to show their own second copy of this
+        # control; both were removed in favor of this single source of
+        # truth (see _on_bortle_changed). ────
+        sky_row = tk.Frame(twi_frame, bg=HDR_BG)
+        sky_row.pack(anchor="w", pady=(4, 0))
+        tk.Label(sky_row, text="SKY:", font=("Helvetica", 9, "bold"),
+                 bg=HDR_BG, fg=ACC_FG).pack(side="left", padx=(0, 6))
+        self.bortle_choice = tk.StringVar(value=self.data.get("settings", {}).get(
+            "default_bortle", "4 (Rural/Suburban)"))
+        self.bortle_dropdown = ttk.Combobox(sky_row, textvariable=self.bortle_choice,
+                                             values=list(BORTLE_FACTORS.keys()),
+                                             state="readonly", width=20)
+        self.bortle_dropdown.pack(side="left")
+        ToolTip(self.bortle_dropdown,
+                "Sky darkness (Bortle scale) at your site —\n"
+                "feeds the exposure recommendation everywhere\n"
+                "it's used (Frame dialog, plan cards, NINA export).")
 
         # ── Moon Phase ────────────────────────────────────────────────────
         _sep(px=8)
@@ -2162,11 +2370,24 @@ class AstroApp:
         self._on_planning_date_changed()
 
     def _on_planning_date_changed(self):
-        """Refresh all date-sensitive displays after a planning date change."""
+        """Refresh all date-sensitive displays after a planning date change.
+
+        The browsing grid ("search results" on the Plan tab) is its own
+        case: each card's peak-altitude and imaging-window figures come
+        from a scan done the last time _refresh_visible_grid() ran, not
+        recomputed live on render — same category of gap as the Bortle
+        setting previously not reaching Tonight's Plan. The scan
+        functions themselves are already planning-date-aware (they key
+        off the shared _planning_local_noon()/_jd_local_noon() globals),
+        so nothing about the astronomy math needs to change here — the
+        grid just needs to be told to re-scan, exactly like it already
+        is after an equipment or filter change.
+        """
         self.refresh_twilight_header()
         self.refresh_moon_header()
         if self.auto_update_enabled:
             self._mark_analysis_dirty()
+        self._refresh_visible_grid()
 
     def refresh_twilight_header(self):
         """Recompute and display astronomical twilight times for tonight."""
@@ -2321,6 +2542,27 @@ class AstroApp:
         style.configure("TNotebook.Tab",     background=FIELD_BG, foreground=FG)
         style.map("TNotebook.Tab",           background=[("selected", SEL_BG)])
         style.configure("TScrollbar",        background=FIELD_BG, troughcolor=TAB_BG)
+
+        # Explore tab's rotate slider — dark trough + orange thumb to match
+        # the tab's own navy/orange palette (the tab draws its own colours
+        # directly rather than using TAB_BG, since it's always dark
+        # regardless of night mode). Only rendered on the "clam" theme (see
+        # the comment above about Windows/macOS-light forcing clam); macOS
+        # dark-mode users keep native aqua sliders, which already look fine
+        # on a dark background.
+        style.configure("Explore.Horizontal.TScale",
+                        background="#cc8833", troughcolor="#0e1a28")
+
+        # Explore tab's floating zoom +/- pill — flat, borderless, sized to
+        # sit flush inside the pill frame (same "named custom button style"
+        # pattern as Nav.TButton / HDR.TButton above).
+        style.configure("ExploreZoom.TButton",
+                        background="#131f2e", foreground="#e8edf2",
+                        relief="flat", borderwidth=0, padding=(0, 3),
+                        font=("Helvetica", 11, "bold"))
+        style.map("ExploreZoom.TButton",
+                  background=[("active", "#2a3f55")],
+                  foreground=[("active", "#ffffff")])
 
         style.configure("TCombobox",
                         fieldbackground=FIELD_BG, background=FIELD_BG,
@@ -2605,6 +2847,16 @@ class AstroApp:
                 self._explore_refresh_cards()
             except Exception:
                 pass
+            # Explore's report panel — same situation: rebuild so its chip
+            # row (hardcoded day colours) and header/section-tag text pick
+            # up the red night palette too. The report body's own tags
+            # ("optimal"/"sec_framing"/etc.) are already caught by the
+            # generic _recolor walker above (it re-tags every tk.Text it
+            # finds), so only the chip rebuild is needed here.
+            try:
+                self._explore_refresh_report()
+            except Exception:
+                pass
 
             # Update banner — created after the colour snapshot, so rebuild it
             # rather than relying on the recolor walker.
@@ -2674,6 +2926,20 @@ class AstroApp:
                 self.results_txt.tag_configure("sec_moon",     foreground="#ef5350", font=("Helvetica", 10, "bold"))
                 self.results_txt.tag_configure("dim",          foreground="#778899", font=("Helvetica", 11))
                 self.results_txt.tag_configure("amber",        foreground="#f59e0b", font=("Helvetica", 11, "bold"))
+                # Explore's report panel uses the identical tag set — restore
+                # it the same way (the night-mode walker re-tags it generically
+                # on the way in, but day-mode restore only special-cases
+                # results_txt by name, so this one needs its own copy).
+                self._explore_report_txt.tag_configure("optimal",   foreground="#4caf50", font=("Helvetica", 11, "bold"))
+                self._explore_report_txt.tag_configure("warning",   foreground="#ef5350", font=("Helvetica", 11, "bold"))
+                self._explore_report_txt.tag_configure("highlight", foreground="#38bdf8", font=("Helvetica", 11, "bold"))
+                self._explore_report_txt.tag_configure("header",    foreground="#ffffff", font=("Helvetica", 13, "bold"))
+                self._explore_report_txt.tag_configure("sec_framing",  foreground="#38bdf8", font=("Helvetica", 10, "bold"))
+                self._explore_report_txt.tag_configure("sec_exposure", foreground="#f59e0b", font=("Helvetica", 10, "bold"))
+                self._explore_report_txt.tag_configure("sec_window",   foreground="#4caf50", font=("Helvetica", 10, "bold"))
+                self._explore_report_txt.tag_configure("sec_moon",     foreground="#ef5350", font=("Helvetica", 10, "bold"))
+                self._explore_report_txt.tag_configure("dim",          foreground="#778899", font=("Helvetica", 11))
+                self._explore_report_txt.tag_configure("amber",        foreground="#f59e0b", font=("Helvetica", 11, "bold"))
             except Exception:
                 pass
             self.search_hint_label.configure(foreground="#ffffff")
@@ -2696,26 +2962,36 @@ class AstroApp:
             except Exception:
                 pass
 
-            # Rebuild dynamic card lists (queue cards on the Targets tab,
-            # plan cards on Tonight's Plan tab).  These widgets are created
-            # after startup so they aren't in _orig_colors and the day-mode
-            # restore loop above can't reach them — without this, they'd
-            # stay red after a Night → Day toggle.  The refresh methods
-            # recreate the tk.Frame / tk.Label widgets with fresh day-mode
-            # colors; guarded because _refresh_queue_tree short-circuits if
-            # the Targets tab hasn't been built yet.
-            try:
-                self._refresh_queue_tree()
-            except Exception:
-                pass
+            # Rebuild the dynamic plan-card list on Tonight's Plan tab.
+            # These widgets are created after startup so they aren't in
+            # _orig_colors and the day-mode restore loop above can't reach
+            # them — without this, they'd stay red after a Night → Day
+            # toggle. The refresh method recreates the tk.Frame / tk.Label
+            # widgets with fresh day-mode colors.
             try:
                 self._refresh_plan_tree()
+            except Exception:
+                pass
+            # Rebuild the Plan tab's live browsing/search grid too — same
+            # dynamic-widget situation as the plan-card list above:
+            # _build_target_card's tk.Frame/Label widgets are created after
+            # startup, so they're absent from _orig_colors and the restore
+            # loop above can't reach them. The night-mode _recolor walker
+            # painted them red on the way in (it walks every tk widget
+            # under self.root); without this rebuild they'd stay red after
+            # a Night -> Day toggle, which is exactly what Jerry reported.
+            try:
+                self._refresh_visible_grid()
             except Exception:
                 pass
             # Explore legend cards — same dynamic-widget situation as the
             # queue/plan cards above: rebuild so they return to day colours.
             try:
                 self._explore_refresh_cards()
+            except Exception:
+                pass
+            try:
+                self._explore_refresh_report()
             except Exception:
                 pass
             # Update banner — same dynamic-widget situation as the cards above.
@@ -2805,10 +3081,30 @@ class AstroApp:
 
     def setup_input_tab(self):
         """Build the Manage Equipment tab — camera/scope entry forms + inventory trees."""
-        container = ttk.Frame(self.tab_equip)
+        # Scrollable container so the whole tab (Camera/Telescope/Rig Library
+        # row, Equipment Inventory, Filter Library) fits shorter windows
+        # instead of clipping the bottom sections — same canvas+scrollbar
+        # pattern as the Settings tab (see _bind_equip_mousewheel below).
+        _eq_bg = ttk.Style().lookup("TFrame", "background") or "#1e2d3e"
+        self._equip_canvas = tk.Canvas(self.tab_equip, bg=_eq_bg, highlightthickness=0)
+        _equip_sb = ttk.Scrollbar(self.tab_equip, orient="vertical",
+                                  command=self._equip_canvas.yview)
+        self._equip_canvas.configure(yscrollcommand=_equip_sb.set)
+        _equip_sb.pack(side="right", fill="y")
+        self._equip_canvas.pack(side="left", fill="both", expand=True)
+
+        outer = ttk.Frame(self._equip_canvas)
+        outer.bind("<Configure>", lambda e: self._equip_canvas.configure(
+            scrollregion=self._equip_canvas.bbox("all")))
+        self._equip_canvas.create_window((0, 0), window=outer, anchor="nw", tags="inner")
+        self._equip_canvas.bind("<Configure>", lambda e:
+            self._equip_canvas.itemconfig("inner", width=e.width))
+
+        container = ttk.Frame(outer)
         container.pack(fill="x")
         container.columnconfigure(0, weight=1)
         container.columnconfigure(1, weight=1)
+        container.columnconfigure(2, weight=1)
         cam_frame = ttk.LabelFrame(container, text="Camera Settings")
         cam_frame.grid(row=0, column=0, padx=20, pady=10, sticky="nsew")
         self.cam_entries = {}
@@ -2836,8 +3132,72 @@ class AstroApp:
         save_scope_btn.grid(row=4, columnspan=2, pady=5)
         ToolTip(save_scope_btn, "Save this telescope to your equipment profile.\nDouble-click a scope in the inventory to edit it.")
 
-        inv_frame = ttk.LabelFrame(self.tab_equip, text="Equipment Inventory")
-        inv_frame.pack(fill="both", expand=True, padx=20, pady=10)
+        # ── Rig Library ─ reclaims the dead space beside Camera/Telescope
+        # Settings. Same underlying rig data/functions as the equipment
+        # drawer's "Manage Rigs" dialog (_find_rig, _apply_rig,
+        # _refresh_rig_dropdown, _build_rig_list_and_details, and the
+        # generic _rig_manager_delete helper) — this is just a second,
+        # always-visible view onto the same rigs. Renaming lives inside the
+        # Edit dialog's own Name field here (no separate Rename button) —
+        # the standalone "Manage Rigs" modal keeps its own Rename button.
+        # Mocked as "Option 1" (unified rig library) and approved.
+        rig_frame = ttk.LabelFrame(container, text="Rig Library")
+        rig_frame.grid(row=0, column=2, padx=20, pady=10, sticky="nsew")
+
+        (self._equip_rig_lb, equip_rig_details, self._equip_rig_names,
+         self._equip_rig_detail_labels, self._equip_rig_refresh) = \
+            self._build_rig_list_and_details(rig_frame, rig_frame, list_height=6, list_width=20)
+        self._equip_rig_lb.pack(fill="x", padx=2, pady=(0, 8))
+        equip_rig_details.pack(fill="x", padx=2, pady=(0, 8))
+
+        def _equip_rig_apply(event=None):
+            sel = self._equip_rig_lb.curselection()
+            if not sel or sel[0] >= len(self._equip_rig_names):
+                return
+            name = self._equip_rig_names[sel[0]]
+            rig = self._find_rig(name)
+            if rig is None:
+                return
+            self._apply_rig(rig)
+            self._equip_rig_refresh(preserve_name=name)
+            self._show_toast(f"Applied rig: {name}")
+        self._equip_rig_lb.bind("<Double-1>", _equip_rig_apply)
+        ToolTip(self._equip_rig_lb, "Click a rig to preview its details below.\nDouble-click to apply it to the current equipment chips.")
+
+        # Icon-only buttons (not "+ New" / "Edit" / "Rename" / "Delete" text)
+        # — this column is only 1/3-width now, and the tooltips below still
+        # spell out exactly what each one does.
+        rig_btn_row = ttk.Frame(rig_frame)
+        rig_btn_row.pack(fill="x", pady=(4, 0))
+        new_rig_btn = ttk.Button(
+            rig_btn_row, text="+", width=3,
+            command=lambda: self._open_edit_rig_dialog(None, self._equip_rig_refresh, self.root))
+        new_rig_btn.pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ToolTip(new_rig_btn, "New rig — opens a blank editor for\nscope, reducer, camera, and filter")
+        edit_rig_btn = ttk.Button(
+            rig_btn_row, text="✎", width=3,
+            command=lambda: self._rig_manager_edit(
+                self._equip_rig_names, self._equip_rig_lb, self._equip_rig_refresh, self.root))
+        edit_rig_btn.pack(side="left", expand=True, fill="x", padx=3)
+        ToolTip(edit_rig_btn, "Edit — scope, reducer, camera, filter, and\n"
+                              "name are all editable here (renaming no longer\n"
+                              "needs a separate button) — nothing is changed\n"
+                              "until you click Save.")
+        delete_rig_btn = ttk.Button(
+            rig_btn_row, text="✕", width=3,
+            command=lambda: self._rig_manager_delete(
+                self._equip_rig_names, self._equip_rig_lb, self._equip_rig_refresh, self.root))
+        delete_rig_btn.pack(side="left", expand=True, fill="x", padx=(3, 0))
+        ToolTip(delete_rig_btn, "Permanently delete the selected rig")
+
+        self._equip_rig_refresh()
+
+        # Equipment Inventory sits under Camera + Telescope Settings (2/3 of
+        # the row's width) so Filter Library can take the column under Rig
+        # Library instead of running full-width below everything — the two
+        # "library" panels (Rig, Filter) now stack in one column together.
+        inv_frame = ttk.LabelFrame(container, text="Equipment Inventory")
+        inv_frame.grid(row=1, column=0, columnspan=2, padx=20, pady=10, sticky="nsew")
 
         self.cam_tree = ttk.Treeview(inv_frame, columns=("Name", "Pixel", "Sensor", "Res", "Type"), show='headings', height=4)
         for col in ("Name", "Pixel", "Sensor", "Res", "Type"):
@@ -2857,6 +3217,62 @@ class AstroApp:
         del_scope_btn.pack(padx=10, anchor="w")
         ToolTip(del_scope_btn, "Permanently delete the selected telescope\nfrom your equipment profile")
 
+        # ── Filter Library ─ manages Filter Sets (self.data["filter_sets"]),
+        # not individual filters. Same "always-visible library" footing as
+        # Equipment Inventory above and the Rig Library above it — no
+        # modal, no extra click. A rig now points at a whole Filter Set
+        # (its filter wheel's contents — can mix LRGB and narrowband
+        # channels), built up by adding filters into the set one at a time,
+        # similar to how a rig is built from named components. Sits in Rig
+        # Library's column (row 1, under it) so the two "library" panels
+        # stack together — recoups the horizontal space Equipment Inventory
+        # no longer needs at full width.
+        filter_frame = ttk.LabelFrame(container, text="Filter Library")
+        filter_frame.grid(row=1, column=2, padx=20, pady=10, sticky="nsew")
+
+        # Stacked list-then-details (not side-by-side) — matches how the Rig
+        # Library above it is laid out in this same narrow column.
+        (self._equip_filter_lb, equip_filter_details, self._equip_filter_names,
+         self._equip_filter_detail_labels, self._equip_filter_refresh) = \
+            self._build_filter_set_list_and_details(filter_frame, filter_frame,
+                                                      list_height=7, list_width=20)
+        self._equip_filter_lb.pack(fill="x", padx=2, pady=(0, 8))
+        equip_filter_details.pack(fill="x", padx=2, pady=(0, 8))
+
+        def _equip_filter_dblclick(event=None):
+            self._filter_manager_edit(self._equip_filter_names, self._equip_filter_lb,
+                                       self._equip_filter_refresh, self.root)
+        self._equip_filter_lb.bind("<Double-1>", _equip_filter_dblclick)
+        ToolTip(self._equip_filter_lb, "Click a filter set to preview its details below.\nDouble-click to edit it.")
+
+        # Icon-only buttons — same reasoning as the Rig Library's button row
+        # above (narrow column, tooltips carry the explanation).
+        filter_btn_row = ttk.Frame(filter_frame)
+        filter_btn_row.pack(fill="x", padx=2, pady=(0, 8))
+        new_filter_btn = ttk.Button(
+            filter_btn_row, text="+", width=3,
+            command=lambda: self._open_edit_filter_dialog(None, self._equip_filter_refresh, self.root))
+        new_filter_btn.pack(side="left", expand=True, fill="x", padx=(0, 3))
+        ToolTip(new_filter_btn, "New filter set — build a filter wheel's\ncontents (narrowband and/or LRGB)")
+        edit_filter_btn = ttk.Button(
+            filter_btn_row, text="✎", width=3,
+            command=lambda: self._filter_manager_edit(
+                self._equip_filter_names, self._equip_filter_lb, self._equip_filter_refresh, self.root))
+        edit_filter_btn.pack(side="left", expand=True, fill="x", padx=3)
+        ToolTip(edit_filter_btn, "Edit the selected filter set's name\nor its member filters")
+        delete_filter_btn = ttk.Button(
+            filter_btn_row, text="✕", width=3,
+            command=lambda: self._filter_manager_delete(
+                self._equip_filter_names, self._equip_filter_lb, self._equip_filter_refresh, self.root))
+        delete_filter_btn.pack(side="left", expand=True, fill="x", padx=(3, 0))
+        ToolTip(delete_filter_btn, "Permanently delete the selected filter set")
+
+        self._equip_filter_refresh()
+
+        # Wheel-scroll the whole tab (canvas + every widget inside it).
+        self._bind_equip_mousewheel(self._equip_canvas)
+        self._bind_equip_mousewheel_recursive(outer)
+
     def setup_planner_tab(self):
         """Build the Target Planner tab — equipment chips, target search, FOV preview, results."""
         # ── Equipment chips bar ───────────────────────────────────────────
@@ -2864,13 +3280,21 @@ class AstroApp:
         ctrl_frame.pack(padx=0, pady=0, fill="x")
         
         self.scope_choice, self.camera_choice = tk.StringVar(), tk.StringVar()
-        self.bortle_choice = tk.StringVar(value=self.data.get("settings", {}).get(
-            "default_bortle", "4 (Rural/Suburban)"))
+        # self.bortle_choice/bortle_dropdown are created in setup_header (it
+        # now lives in the header, under the twilight readout, rather than
+        # as a chip here — see setup_header) so it reads as a global "sky
+        # conditions" setting rather than a per-tab equipment control.
         self.filter_mode = tk.StringVar(value="Mono Lum")
         self.reduction_factor = tk.StringVar(value="1.0×")
 
-        for var in [self.scope_choice, self.camera_choice, self.bortle_choice, self.filter_mode, self.reduction_factor]:
+        for var in [self.scope_choice, self.camera_choice, self.filter_mode, self.reduction_factor]:
             var.trace_add('write', self.on_parameter_change)
+        # Bortle (sky brightness) isn't equipment — it's an environmental
+        # fact, not part of a rig — so it gets its own handler instead of
+        # riding on_parameter_change's rig-comparison logic, and that
+        # handler always forces a fresh recompute rather than only when
+        # "auto update" is on (see _on_bortle_changed).
+        self.bortle_choice.trace_add('write', self._on_bortle_changed)
 
         chips_row = tk.Frame(ctrl_frame, bg="#131f2e")
         chips_row.pack(fill="x", padx=16, pady=8)
@@ -2945,18 +3369,12 @@ class AstroApp:
                                              state="readonly", width=18)
         self.camera_dropdown.pack(side="left", padx=(0, 6))
 
-        # Bortle chip
-        self.bortle_dropdown = ttk.Combobox(chips_row, textvariable=self.bortle_choice,
-                                             values=list(BORTLE_FACTORS.keys()),
-                                             state="readonly", width=16)
-        self.bortle_dropdown.pack(side="left", padx=(0, 6))
-
         # Filter chip (visibility toggled by camera type)
         self.filter_label = ttk.Label(chips_row, text="")  # hidden placeholder
+        # Values come from self.data["filter_sets"] (the Filter Library on
+        # the Equipment tab) via refresh_dropdowns() — not hardcoded here,
+        # same as the scope/camera dropdowns just above.
         self.filter_dropdown = ttk.Combobox(chips_row, textvariable=self.filter_mode,
-                                             values=["Mono Lum", "LRGB",
-                                                     "NB (3nm)", "NB (7nm)",
-                                                     "NB (12nm)"],
                                              state="readonly", width=12)
         self.camera_choice.trace_add('write', self.toggle_filter_visibility)
 
@@ -2964,6 +3382,12 @@ class AstroApp:
         self._equip_summary_label = tk.Label(chips_row, text="", bg="#131f2e",
                                               fg="#556677", font=("Helvetica", 9))
         self._equip_summary_label.pack(side="right", padx=(10, 0))
+
+        # Kept so the Phase-3 equipment drawer can borrow these same chip
+        # widgets (scope/reducer/camera/filter) and hand them back
+        # here when it closes, instead of creating a second, StringVar-
+        # duplicated set of controls.
+        self._equip_chips_row = chips_row
 
         # Bottom separator for equipment bar
         tk.Frame(ctrl_frame, bg="#1e2d3e", height=1).pack(fill="x")
@@ -3011,7 +3435,7 @@ class AstroApp:
             # Star + label inline, horizontally arranged
             self._queue_btn.create_text(16, h//2, text="☆",
                                         fill=fg, font=("Helvetica", 13, "bold"), anchor="center")
-            self._queue_btn.create_text(30, h//2, text="Add to Targets",
+            self._queue_btn.create_text(30, h//2, text="Add to Tonight",
                                         fill=fg, font=("Helvetica", 11, "bold"), anchor="w")
 
         self._queue_btn = tk.Canvas(search_row, width=_QB_W, height=_QB_H,
@@ -3027,7 +3451,7 @@ class AstroApp:
             else:
                 _draw_queue_btn(_QB_BG, _QB_BORDER, _QB_FG)
         def _qb_click(e):
-            self._add_to_queue()
+            self._add_target_from_planner_search()
         def _qb_release(e):
             _qb_leave(e)
 
@@ -3036,24 +3460,17 @@ class AstroApp:
         self._queue_btn.bind("<Button-1>",        _qb_click)
         self._queue_btn.bind("<ButtonRelease-1>", _qb_release)
         self._draw_queue_btn = _draw_queue_btn   # store for night-mode redraws
-        ToolTip(self._queue_btn, "Add this target to the Targets List\nfor side-by-side window comparison\nand suggested shoot order.")
+        ToolTip(self._queue_btn, "Add this target straight to Tonight's Plan,\nusing this tab's current equipment and\nany pan/rotation you've set in the FOV preview.")
 
         # ── Full-width search entry ──────────────────────────────────────
         self.target_search = ttk.Entry(search_row, width=50, font=("Helvetica", 12))
         self.target_search.pack(side="left", fill="x", expand=True, padx=(0, 4))
 
-        # ── Catalog filter button ────────────────────────────────────────
-        # Small icon-only button next to the search entry that opens a popup
-        # with checkboxes for NGC / IC / Messier / Caldwell / Sharpless / Other.
-        # Shows a dot indicator when any catalog is filtered out.
-        self._catalog_filter_btn = ttk.Button(
-            search_row, text="▽",
-            command=self._toggle_catalog_filter_popup,
-            width=3)
-        self._catalog_filter_btn.pack(side="left", padx=(0, 8))
-        ToolTip(self._catalog_filter_btn,
-                "Limit the search and suggestion popup to\nspecific catalogs (NGC, IC, Messier,\nCaldwell, Sharpless).")
-        self._update_catalog_filter_btn_label()
+        # Catalog filter button lives on the Plan tab now, next to
+        # self.plan_search (see setup_plan_tab) — it's shared, global filter
+        # state (self.catalog_filter) that _update_floating_suggestions
+        # already applies no matter which search box is calling it, so only
+        # the button itself needed to move.
 
         # ── Floating suggestion popup (replaces fixed Listbox) ───────────
         self._suggestion_popup = None
@@ -3072,9 +3489,8 @@ class AstroApp:
         visible_btn = ttk.Button(btn_frame, text="🌙 Visible Tonight", command=self.show_visible_tonight)
         visible_btn.pack(side="left", padx=(0, 4))
         ToolTip(visible_btn, "Search the full catalog for objects\nvisible tonight from your location,\nfiltered by type, altitude, and season")
-        skymap_btn = ttk.Button(btn_frame, text="Show Sky Map", command=self.open_sky_map)
-        skymap_btn.pack(side="left", padx=(0, 4))
-        ToolTip(skymap_btn, "Open the interactive sky map\ncentred on the current target")
+        # "Show Sky Map" has moved to the Explore tab (above its FOV image) —
+        # see _explore_open_sky_map / setup_explore_tab.
 
         results_frame = ttk.Frame(left_box)
         results_frame.pack(anchor="w", fill="both", expand=True, pady=(6, 0))
@@ -3152,6 +3568,9 @@ class AstroApp:
         self._fov_offset_y = 0.0
         self._fov_angle    = 0.0
         self._zoom_level   = 1.0
+        self._pending_frame_restore = None  # staged by _analyze_framing_impl,
+                                             # applied by _apply_pending_frame_restore
+                                             # once a fresh DSS fetch lands
         self._drag_mode    = None   # 'pan' | 'rotate'
         self._drag_start   = None   # (x, y) for pan
         self._rotate_start_angle = None  # angle at drag start (degrees)
@@ -3159,6 +3578,28 @@ class AstroApp:
         self._cached_dss_img = None
         self._cached_dss_target = None
         self._cached_dss_survey_deg = None
+
+        # Wide-field wait state (see fetch_thumbnail / _draw_fov_wait_frame):
+        # shown instead of a picture while a DSS request big enough to need
+        # the "slow lane" is still in flight, with a live elapsed timer and
+        # a "Show 5° field instead" cancel pill drawn on the FOV canvas.
+        self._fov_wait_token = 0          # bumped on every fetch_thumbnail() call so a
+                                           # stale wait-state loop/callback can tell it's
+                                           # been superseded and stop touching the canvas
+        self._fov_wait_after_id = None    # scheduled .after() id for the spinner/timer tick
+        self._fov_wait_fast_ready = None  # (img, fetched_deg) once the fast lane lands —
+                                           # cached so Cancel can show it instantly
+        self._fov_wait_cancelled = False
+        self._fov_wait_target = None
+        self._fov_wait_survey_deg = None
+        self._fov_wait_start_ts = None
+        self._fov_wait_angle = 0
+        self._fov_result_token = None     # token that produced the currently cached/
+                                           # displayed DSS image — see _show_dss_result's
+                                           # size tie-break, which must only compare
+                                           # results racing within the SAME fetch_thumbnail()
+                                           # call, never against a stale image left over
+                                           # from an earlier call for a different rig/FOV
 
         # ── Bottom: altitude chart (compact inline strip) ─────────────────
         self.alt_canvas = tk.Canvas(self.tab_planner, height=168, bg="#050810",
@@ -3173,205 +3614,1332 @@ class AstroApp:
         self.alt_canvas.bind("<Motion>",  self._alt_canvas_motion)
         self.alt_canvas.bind("<Leave>",   self._alt_canvas_leave)
 
-    def setup_session_tab(self):
-        """Build the Targets List tab — Integration Plan preview + Tonight's Plan list."""
-        # Scrollable container so the whole tab (analysis + queue + schedule
-        # graph) scrolls as one page on shorter windows.  The inner queue-card
-        # list keeps its own wheel scroll — it's excluded from the page binding
-        # at the end of this method.
-        _ss_bg = ttk.Style().lookup("TFrame", "background") or "#1e2d3e"
-        self._session_canvas = tk.Canvas(self.tab_session, bg=_ss_bg,
-                                         highlightthickness=0)
-        _session_sb = ttk.Scrollbar(self.tab_session, orient="vertical",
-                                    command=self._session_canvas.yview)
-        self._session_canvas.configure(yscrollcommand=_session_sb.set)
-        _session_sb.pack(side="right", fill="y")
-        self._session_canvas.pack(side="left", fill="both", expand=True)
+    def _init_headless_analysis_vars(self):
+        """Headless state for show_integration_plan/_analyze_framing_impl.
 
-        outer = ttk.Frame(self._session_canvas, padding=(20, 10))
-        outer.bind("<Configure>", lambda e: self._session_canvas.configure(
-            scrollregion=self._session_canvas.bbox("all")))
-        self._session_canvas.create_window((0, 0), window=outer,
-                                           anchor="nw", tags="inner")
-        def _session_canvas_config(e):
-            self._session_canvas.itemconfig("inner", width=e.width)
-            self._session_canvas.configure(
-                scrollregion=self._session_canvas.bbox("all"))
-        self._session_canvas.bind("<Configure>", _session_canvas_config)
-
-        # ── Integration Plan (preview of current analysis) ────────────────
-        plan_card = tk.Frame(outer, bg="#131f2e", highlightthickness=0)
-        plan_card.pack(fill="x", pady=(0, 10))
-        tk.Frame(plan_card, bg="#38bdf8", width=3).pack(side="left", fill="y")
-        plan_outer = ttk.Frame(plan_card)
-        plan_outer.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        ttk.Label(plan_outer, text="CURRENT TARGET ANALYSIS",
-                  font=("Helvetica", 9, "bold"), foreground="#38bdf8").pack(
-            anchor="w", padx=10, pady=(8, 0))
-
-        # Current target — large, updates automatically on every analysis
-        self._plan_target_var = tk.StringVar(value="No target analysed yet — run Analyze Target first")
-        ttk.Label(plan_outer, textvariable=self._plan_target_var,
-                  font=("Helvetica", 13, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
-
-        # ── All inputs on one horizontal row ─────────────────────────────
-        input_row = ttk.Frame(plan_outer)
-        input_row.pack(anchor="w", padx=10, pady=(2, 6))
-
-        # Allocated hours
-        ttk.Label(input_row, text="Allocated hours:").pack(side="left")
-        self.session_hours_var = tk.StringVar(value="4.0")
-        self.session_hours_var.trace_add("write", lambda *_: (
-            self.show_integration_plan(silent=True),
-            self._commit_queue_edit(silent=True)))
-        session_entry = ttk.Entry(input_row, textvariable=self.session_hours_var, width=6,
-                                  state="disabled")
-        session_entry.pack(side="left", padx=(4, 2))
-        self._session_entry = session_entry
-        ttk.Label(input_row, text="h").pack(side="left", padx=(0, 10))
-        ToolTip(session_entry, "Hours allocated to this target.\nAuto-fills from tonight's dark window\nwhen you run Analyze Target.")
-
-        ttk.Separator(input_row, orient="vertical").pack(side="left", fill="y", pady=2, padx=(0, 10))
-
-        # Sub-exposure
-        ttk.Label(input_row, text="Sub-exp:").pack(side="left")
-        self.manual_exp_var = tk.StringVar(value="")
-        self.manual_exp_var.trace_add("write", lambda *_: (
-            self.show_integration_plan(silent=True),
-            self._commit_queue_edit(silent=True)))
-        manual_exp_entry = ttk.Entry(input_row, textvariable=self.manual_exp_var, width=7,
-                                     state="disabled")
-        manual_exp_entry.pack(side="left", padx=(4, 2))
-        self._manual_exp_entry = manual_exp_entry
-        ttk.Label(input_row, text="s").pack(side="left", padx=(0, 4))
-        self._recommended_exp_label = ttk.Label(input_row, text="", font=("Helvetica", 9),
-                                                foreground="#aaaaaa")
-        self._recommended_exp_label.pack(side="left", padx=(0, 10))
-        ToolTip(manual_exp_entry, "Enter a custom sub-exposure time in seconds.\nLeave blank to use the calculated recommendation.")
-
-        ttk.Separator(input_row, orient="vertical").pack(side="left", fill="y", pady=2, padx=(0, 10))
-
-        # Overhead per sub
-        ttk.Label(input_row, text="Overhead:").pack(side="left")
+        These StringVars (and one Label) used to live on the Targets List
+        tab's "Current Target Analysis" card. That tab is retired now —
+        per Jerry, the Gantt timeline and reorder tools moved to the Plan
+        tab, but the stat cards themselves were fine to drop — yet the
+        Frame dialog still runs analyze_framing, which still calls these
+        shared functions and expects them to exist. So they're created
+        here with no visible widget: values get computed and stored, just
+        never displayed.
+        """
+        self.session_hours_var    = tk.StringVar(value="4.0")
+        self.manual_exp_var       = tk.StringVar(value="")
         self.overhead_per_sub_var = tk.StringVar(value="5")
-        self.overhead_per_sub_var.trace_add("write", lambda *_: (
-            self.show_integration_plan(silent=True),
-            self._commit_queue_edit(silent=True)))
-        overhead_entry = ttk.Entry(input_row, textvariable=self.overhead_per_sub_var, width=5)
-        overhead_entry.pack(side="left", padx=(4, 2))
-        ttk.Label(input_row, text="s/sub").pack(side="left", padx=(0, 10))
-        ToolTip(overhead_entry,
-                "Extra time lost per sub-frame, in seconds.\n"
-                "Accounts for:\n"
-                "  • Camera sensor readout time\n"
-                "  • Dithering between frames\n"
-                "  • Filter wheel rotation\n"
-                "  • Autofocuser runs (amortised)\n"
-                "  • Plate-solve / re-centre pauses\n"
-                "  • Guider settling time\n\n"
-                "Default: 5s — a reasonable estimate for most\n"
-                "modern CMOS setups with dithering enabled.")
+        self._plan_target_var     = tk.StringVar(value="")
+        self._plan_subs_var       = tk.StringVar(value="—")
+        self._plan_total_var      = tk.StringVar(value="—")
+        self._plan_snr_var        = tk.StringVar(value="—")
+        self._plan_overhead_var   = tk.StringVar(value="—")
+        self._plan_noise_var      = tk.StringVar(value="")
+        self.session_hours_var.trace_add("write", lambda *_: self.show_integration_plan(silent=True))
+        self.manual_exp_var.trace_add("write", lambda *_: self.show_integration_plan(silent=True))
+        self.overhead_per_sub_var.trace_add("write", lambda *_: self.show_integration_plan(silent=True))
+        # A real Label — some code paths call .config(text=...) on it —
+        # parented to root but never packed, so it never becomes visible.
+        self._recommended_exp_label = ttk.Label(self.root, text="")
 
-        # Stat cards — 4 across, modern metric card style
-        cards_frame = ttk.Frame(plan_outer)
-        cards_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self._plan_subs_var     = tk.StringVar(value="—")
-        self._plan_total_var    = tk.StringVar(value="—")
-        self._plan_snr_var      = tk.StringVar(value="—")
-        self._plan_overhead_var = tk.StringVar(value="—")
-        for col, (var, lbl) in enumerate([
-            (self._plan_subs_var,     "Subframes"),
-            (self._plan_total_var,    "Integration Time"),
-            (self._plan_snr_var,      "SNR Improvement"),
-            (self._plan_overhead_var, "Overhead Time"),
-        ]):
-            card = tk.Frame(cards_frame, bg="#1a2b3c", highlightthickness=0)
-            card.grid(row=0, column=col, padx=(0, 8), pady=2, sticky="nsew")
-            cards_frame.columnconfigure(col, weight=1)
-            tk.Label(card, text=lbl.upper(), bg="#1a2b3c", fg="#556677",
-                     font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(8, 2))
-            tk.Label(card, textvariable=var, bg="#1a2b3c", fg="#ffffff",
-                     font=("Helvetica", 16, "bold")).pack(anchor="w", padx=10, pady=(0, 8))
+    # ═══════════════════════════════════════════════════════════════════
+    # TARGET CARD — new browsing-grid card (pill / sparkline / moon line /
+    # status tag / actions), and the live grid that renders a row of them.
+    # ═══════════════════════════════════════════════════════════════════
 
-        self._plan_noise_var = tk.StringVar(value="")
-        ttk.Label(plan_outer, textvariable=self._plan_noise_var,
-                  font=("Helvetica", 11), wraplength=700).pack(anchor="w", padx=10, pady=(0, 6))
+    _CARD_PANEL  = "#131f2e"
+    _CARD_LINE   = "#1e2d3e"
+    _CARD_TEXT   = "#ffffff"
+    _CARD_MUTED  = "#aaaaaa"
+    _CARD_FAINT  = "#556677"
+    _CARD_BLUE   = "#38bdf8"
+    _CARD_GREEN  = "#4caf50"
+    _CARD_AMBER  = "#f59e0b"
+    _CARD_RED    = "#ef5350"
 
-        # ── Target Queue ────────────────────────────────────────────────────
-        queue_card = tk.Frame(outer, bg="#131f2e", highlightthickness=0)
-        queue_card.pack(fill="x", pady=(0, 8))
-        tk.Frame(queue_card, bg="#f59e0b", width=3).pack(side="left", fill="y")
-        queue_outer = ttk.Frame(queue_card)
-        queue_outer.pack(side="left", fill="both", expand=True, padx=(8, 0))
-        ttk.Label(queue_outer, text="TARGET QUEUE",
-                  font=("Helvetica", 9, "bold"), foreground="#f59e0b").pack(
-            anchor="w", padx=8, pady=(8, 0))
+    # Object-type chip (approved "Option C" condensed row design) — its own
+    # muted color channel, deliberately not reusing green/amber/red (those
+    # already mean imaging condition elsewhere on the row) or blue (the
+    # primary-action color). Covers every category _identify_catalogs /
+    # NGC_TYPE_CATEGORIES can produce, not just the 5 in OBJECT_TYPE_FILTERS
+    # — Asterism/Star/unknown still need a chip, just not a Type-dropdown
+    # entry of their own.
+    _TYPE_CHIP = {
+        "Galaxy":           ("GAL",  "#a78bfa"),
+        "Nebula":           ("NEB",  "#2dd4bf"),
+        "Planetary Nebula": ("PN",   "#f472b6"),
+        "Open Cluster":     ("OC",   "#a3e635"),
+        "Globular Cluster": ("GC",   "#818cf8"),
+        "Asterism":         ("AST",  "#94a3b8"),
+        "Star":             ("STAR", "#94a3b8"),
+    }
+    _TYPE_CHIP_DEFAULT = ("OTH", "#667788")
 
-        q_btn_row = ttk.Frame(queue_outer)
-        q_btn_row.pack(fill="x", padx=8, pady=(6, 4))
-        ttk.Button(q_btn_row, text="↑ Move Up",
-                   command=self._queue_move_up).pack(side="left", padx=(0, 4))
-        ttk.Button(q_btn_row, text="↓ Move Down",
-                   command=self._queue_move_down).pack(side="left", padx=(0, 4))
-        ttk.Button(q_btn_row, text="✕ Remove",
-                   command=self._queue_remove).pack(side="left", padx=(0, 16))
-        ttk.Button(q_btn_row, text="★ Order by Transit",
-                   command=self._queue_suggest_order).pack(side="left", padx=(0, 8))
-        add_selected_btn = ttk.Button(q_btn_row, text="▶ Add to Tonight's Plan",
-                   command=self._queue_move_selected_to_plan)
-        add_selected_btn.pack(side="left", padx=(0, 8))
-        ToolTip(add_selected_btn, "Move the selected queue target\nto Tonight's Plan.")
-        ttk.Button(q_btn_row, text="▶▶ Add All to Tonight's Plan",
-                   command=self._queue_move_all_to_plan).pack(side="left", padx=(0, 8))
-        ttk.Button(q_btn_row, text="✕ Clear All",
-                   command=self._queue_clear).pack(side="left")
+    def _build_target_card(self, parent, t, max_alt, rise_label):
+        """Build one browsing-grid row for target ``t`` — a dense,
+        single-line "list row" (approved "Option C" design, replacing the
+        earlier two-column card).
 
-        q_tree_frame = ttk.Frame(queue_outer)
-        q_tree_frame.pack(fill="x", padx=8, pady=(0, 4))
+        ``max_alt``/``rise_label`` come straight from a
+        ``_scan_visible_targets`` result tuple — ``rise_label`` is "up"
+        (already above min-altitude), an "HH:MM" rise time, or ``None``.
 
-        # Scrollable card container (replaces ttk.Treeview)
-        self._queue_cards_canvas = tk.Canvas(q_tree_frame, height=200, bg="#0e1a28",
-                                              highlightthickness=0)
-        self._queue_cards_scrollbar = ttk.Scrollbar(q_tree_frame, orient="vertical",
-                                                      command=self._queue_cards_canvas.yview)
-        self._queue_cards_inner = tk.Frame(self._queue_cards_canvas, bg="#0e1a28")
-        self._queue_cards_inner.bind("<Configure>",
-            lambda e: self._queue_cards_canvas.configure(
-                scrollregion=self._queue_cards_canvas.bbox("all")))
-        self._queue_cards_canvas.create_window((0, 0), window=self._queue_cards_inner,
-                                                anchor="nw", tags="inner")
-        self._queue_cards_canvas.bind("<Configure>",
-            lambda e: self._queue_cards_canvas.itemconfig("inner", width=e.width))
-        self._queue_cards_canvas.configure(yscrollcommand=self._queue_cards_scrollbar.set)
-        self._queue_cards_canvas.pack(side="left", fill="both", expand=True)
-        self._queue_cards_scrollbar.pack(side="right", fill="y")
+        Left to right: accent bar, id + common name, a color-coded
+        object-type chip, a flexible middle cluster (altitude sparkline +
+        moon-condition icon + a length-capped "peak ##° · HH:MM–HH:MM"
+        readout), a visibility pill, and icon-only Frame / Add-to-Tonight
+        actions.
 
-        # Mousewheel scrolling — bind on the canvas AND the embedded inner
-        # frame.  Card widgets created later in _refresh_queue_tree get the
-        # same bindings recursively, because Tk routes MouseWheel events to
-        # the widget under the cursor; once cards fill the visible area the
-        # canvas itself never sees the wheel.
-        self._bind_queue_mousewheel(self._queue_cards_canvas)
-        self._bind_queue_mousewheel(self._queue_cards_inner)
+        Why this replaces the old stacked card: that layout's sparkline+
+        readout row alone needed ~280px, which at a 2-column grid forced
+        the whole grid wider than its pane once the toolbar above it grew
+        too (the search-box widening that triggered the cropping bug
+        report). A single row per target needs roughly half that, and —
+        just as importantly — there's only one column left to compete for
+        width, so it can't repeat that failure mode. The middle cluster's
+        peak/window text is capped to a fixed max length rather than truly
+        reflowing with the window (Tk labels have no CSS-style
+        text-overflow: ellipsis), which is a deliberately simple,
+        deterministic way to guarantee the sparkline/moon-icon/action
+        buttons are never the thing that gives up space.
 
-        # Selection state for cards
-        self._queue_card_selected = None  # index of selected card
-        self._queue_card_widgets = []     # list of card frame references
+        Every side="right" widget below is packed BEFORE the flexible
+        middle cluster (in rightmost-to-leftmost order) precisely so it
+        can't happen again: packing an expand=True sibling before a
+        fixed-size one lets it greedily claim the fixed one's space too
+        (see _open_equip_drawer's docstring for the original lesson this
+        mirrors).
+        """
+        P, LN, TX, MU, FA = (self._CARD_PANEL, self._CARD_LINE, self._CARD_TEXT,
+                              self._CARD_MUTED, self._CARD_FAINT)
+        BL, GR = self._CARD_BLUE, self._CARD_GREEN
 
-        # Keep queue_tree as a dummy attribute so hasattr checks don't break
-        self.queue_tree = None
+        # "In plan" has to mean "already has an entry under the CURRENTLY
+        # selected rig + filter mode" -- the exact same key
+        # _add_target_to_plan_direct's duplicate check uses -- not just
+        # "this target is on the plan under *some* rig". Otherwise
+        # switching rigs leaves every previously-added target showing a
+        # stale ✓, even though clicking ✚ for the new rig would actually
+        # succeed (it's a different scope/camera, not a duplicate). This
+        # also means the icon self-corrects when you switch back to a rig
+        # a target really is planned under -- no separate state to track.
+        in_plan = any(e["target_id"] == t["id"]
+                      and e.get("scope") == self.scope_choice.get()
+                      and e.get("camera") == self.camera_choice.get()
+                      and e.get("filter_mode") == self.filter_mode.get()
+                      for e in self._plan_entries)
+        accent  = GR if in_plan else "#3a4a5c"
 
-        self.queue_gantt = tk.Canvas(queue_outer, height=200, bg="#050810",
-                                     highlightthickness=1, highlightbackground="#334455")
-        self.queue_gantt.pack(fill="x", padx=8, pady=(0, 2))
-        self.queue_gantt.create_text(430, 100,
-            text="Add targets to the queue and move them to Tonight's Plan to see the schedule timeline",
-            fill="#445566", font=("Helvetica", 9))
-        ttk.Label(queue_outer, text="Target Scheduling  —  drag a bar to set its start time",
-                  font=("Helvetica", 11, "italic")).pack(anchor="w", padx=8, pady=(0, 2))
-        self._gantt_note_lbl = ttk.Label(queue_outer, text="",
+        row = tk.Frame(parent, bg=P, highlightthickness=1,
+                        highlightbackground=LN, highlightcolor=LN)
+        tk.Frame(row, bg=accent, width=3).pack(side="left", fill="y")
+        body = tk.Frame(row, bg=P)
+        body.pack(side="left", fill="both", expand=True, padx=10, pady=7)
+
+        # ── Right cluster (packed first — see docstring) ────────────────
+        if in_plan:
+            add_text, add_bg, add_fg = "✓", "#142a1a", GR
+        else:
+            add_text, add_bg, add_fg = "＋", "#0d1826", MU
+        add_btn = tk.Label(body, text=add_text, bg=add_bg, fg=add_fg,
+                            font=("Helvetica", 11, "bold"), width=2, cursor="hand2")
+        add_btn.pack(side="right")
+        add_btn.bind("<Button-1>", lambda e, tid=t["id"]: self._add_target_to_tonight(tid))
+        ToolTip(add_btn, "Already in tonight's plan" if in_plan else "Add to Tonight's Plan")
+
+        frame_btn = tk.Label(body, text="🖼", bg=BL, fg="#0a1a26",
+                              font=("Helvetica", 11), width=2, cursor="hand2")
+        frame_btn.pack(side="right", padx=(4, 6))
+        frame_btn.bind("<Button-1>", lambda e, tid=t["id"]: self._frame_from_card(tid))
+        ToolTip(frame_btn, "Open the Frame dialog for this target.")
+
+        if rise_label == "up":
+            pill_text, pill_fg, pill_bg = "up now", GR, "#142a1a"
+        elif rise_label:
+            pill_text, pill_fg, pill_bg = f"rises {rise_label}", BL, "#0f2233"
+        else:
+            pill_text, pill_fg, pill_bg = "—", FA, P
+        tk.Label(body, text=pill_text, bg=pill_bg, fg=pill_fg,
+                 font=("Helvetica", 9), padx=7, pady=2).pack(side="right", padx=(6, 6))
+
+        # ── Left cluster: name + common name + type chip ────────────────
+        name_wrap = tk.Frame(body, bg=P)
+        name_wrap.pack(side="left")
+        tk.Label(name_wrap, text=t["id"], bg=P, fg=TX,
+                 font=("Helvetica", 12, "bold")).pack(side="left")
+        common = t.get("common", "").split(";")[0].strip()
+        if common:
+            if len(common) > 20:
+                common = common[:19] + "…"
+            tk.Label(name_wrap, text="  " + common, bg=P, fg=BL,
+                     font=("Helvetica", 9)).pack(side="left")
+
+        abbrev, chip_col = self._TYPE_CHIP.get(t.get("obj_type", ""), self._TYPE_CHIP_DEFAULT)
+        chip_wrap = tk.Frame(body, bg="#18232f")
+        chip_wrap.pack(side="left", padx=(8, 0))
+        tk.Frame(chip_wrap, bg=chip_col, width=3).pack(side="left", fill="y")
+        tk.Label(chip_wrap, text=abbrev, bg="#18232f", fg="#cbd5e1",
+                 font=("Helvetica", 8, "bold"), padx=5, pady=2).pack(side="left")
+        ToolTip(chip_wrap, t.get("obj_type") or "Other")
+
+        # ── Flexible middle cluster: sparkline + moon icon + peak/window ─
+        # Packed LAST — the one thing in this row allowed to give up space.
+        mid = tk.Frame(body, bg=P)
+        mid.pack(side="left", fill="both", expand=True, padx=(10, 6))
+
+        lat, lon = self._get_saved_location()
+        spark = tk.Canvas(mid, width=46, height=18, bg=P, highlightthickness=0)
+        spark.pack(side="left")
+        if lat is not None and lon is not None:
+            series = self._sample_altitude_series(t, lat, lon)
+            alts = series["alts"]
+            if alts:
+                lo, hi = min(alts), max(alts)
+                rng = (hi - lo) or 1.0
+                n = len(alts)
+                pts = []
+                for i, a in enumerate(alts):
+                    x = 1 + (i / (n - 1)) * 44
+                    y = 16 - ((a - lo) / rng) * 13
+                    pts.extend([x, y])
+                line_col = GR if rise_label == "up" else (BL if rise_label else FA)
+                if len(pts) >= 4:
+                    spark.create_line(*pts, fill=line_col, width=1.6, smooth=True)
+
+        stat_bits = [f"peak {max_alt:.0f}°"]
+        if lat is not None and lon is not None:
+            _tag, icon, note, _impact, _illum, _sep = self._moon_condition(t["ra_deg"], t["dec_deg"])
+            moon_lbl = tk.Label(mid, text=icon, bg=P, font=("Helvetica", 10))
+            moon_lbl.pack(side="left", padx=(6, 6))
+            ToolTip(moon_lbl, note)
+            try:
+                _min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
+                win_start, win_end, win_hrs, _peak_t, _peak_a, _diag = \
+                    _calc_best_imaging_window(t["ra_deg"], t["dec_deg"], lat, lon,
+                                               min_alt=_min_alt)
+            except Exception:
+                win_start = win_end = None
+                win_hrs = 0.0
+            if win_hrs and win_start and win_end:
+                stat_bits.append(f"{win_start}–{win_end}")
+
+        stat_text = " · ".join(stat_bits)
+        if len(stat_text) > 24:
+            stat_text = stat_text[:23] + "…"
+        tk.Label(mid, text=stat_text, bg=P, fg=MU, font=("Helvetica", 9)).pack(side="left")
+
+        return row
+
+    def _frame_from_card(self, target_id):
+        """Open the modal Frame dialog for a card's target (chart above the
+        FOV framing box, per the approved layout).
+
+        This does not reimplement any astronomy/geometry math — it reuses
+        ``analyze_framing``/``_analyze_framing_impl``, ``_draw_altitude_chart``,
+        ``_draw_fov_overlay``, and the ``_fov_mouse_*``/``_apply_zoom``/
+        ``_reset_fov_framing`` handlers completely unchanged. Those methods
+        all read/write shared instance attributes (``self.preview_canvas``,
+        ``self.alt_canvas``, ``self._rot_label``, ``self._zoom_label``)
+        rather than taking widgets as parameters, so this dialog just points
+        those attributes at its own widgets for as long as it's open and
+        restores the Planner tab's originals when it closes — the Planner
+        tab's own FOV/chart widgets are untouched and keep working as a
+        fallback until Phase 5 retires that tab.
+        """
+        key = target_id.replace(" ", "").upper()
+        t = self.targets.get(key) or self.common_names_map.get(key)
+        if not t:
+            messagebox.showwarning("Target Not Found",
+                f"Could not find '{target_id}' in the catalog.")
+            return
+        # Pin it to the top of the Plan tab's browsing grid — see
+        # _mark_grid_touched — so re-finding it later never requires a
+        # fresh search.
+        self._mark_grid_touched(t["id"])
+        if not self.scope_choice.get() or not self.camera_choice.get():
+            messagebox.showwarning("Equipment Needed",
+                "Choose a scope and camera (via the rig chip) before framing a target.")
+            return
+
+        self.target_search.delete(0, tk.END)
+        self.target_search.insert(0, target_id)
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Frame — {t['id']}")
+        dlg.configure(bg="#0d1620")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        header = tk.Frame(dlg, bg="#0d1620")
+        header.pack(fill="x", padx=16, pady=(14, 4))
+        common = t.get("common", "").split(";")[0].strip()
+        title_txt = t["id"] + (f"   ·   {common}" if common else "")
+        tk.Label(header, text=title_txt, bg="#0d1620", fg="#e8eef4",
+                 font=("Helvetica", 14, "bold")).pack(side="left")
+
+        # ── Altitude / moon chart — reuses _draw_altitude_chart verbatim ──
+        chart_canvas = tk.Canvas(dlg, width=400, height=190, bg="#050810",
+                                  highlightthickness=1, highlightbackground="#2e4a63")
+        chart_canvas.pack(padx=16, pady=(8, 14))
+
+        # ── FOV framing box — reuses _draw_fov_overlay / pan-rotate-zoom verbatim ──
+        fov_canvas = tk.Canvas(dlg, width=340, height=340, bg="black",
+                                highlightthickness=1, highlightbackground="#2e4a63")
+        fov_canvas.pack()
+        fov_canvas.create_text(170, 170, text="Loading…", fill="gray", font=("Helvetica", 9))
+        tk.Label(dlg, text="drag to pan · corners to rotate", bg="#0d1620",
+                 fg="#556677", font=("Helvetica", 8)).pack(pady=(2, 0))
+
+        ctrl_row = tk.Frame(dlg, bg="#0d1620")
+        ctrl_row.pack(pady=(6, 4))
+        tk.Label(ctrl_row, text="Rot:", bg="#0d1620", fg="#778899",
+                 font=("Helvetica", 9)).pack(side="left", padx=(0, 2))
+        rot_label = tk.Label(ctrl_row, text=f"{self._screen_to_sky_pa(0.0):.1f}°",
+                              bg="#0d1620", fg="#ffffff", font=("Helvetica", 9), width=5)
+        rot_label.pack(side="left")
+        tk.Label(ctrl_row, text="|", bg="#0d1620", fg="#2e4a63").pack(side="left", padx=6)
+        reset_btn = ttk.Button(ctrl_row, text="⌖ Reset", width=7, command=lambda: self._reset_fov_framing())
+        reset_btn.pack(side="left", padx=2)
+        tk.Label(ctrl_row, text="|", bg="#0d1620", fg="#2e4a63").pack(side="left", padx=6)
+        tk.Label(ctrl_row, text="Zoom:", bg="#0d1620", fg="#778899",
+                 font=("Helvetica", 9)).pack(side="left", padx=(0, 2))
+        ttk.Button(ctrl_row, text="−", width=2,
+                   command=lambda: self._apply_zoom(1 / 1.25)).pack(side="left", padx=1)
+        zoom_label = tk.Label(ctrl_row, text="1.0×", bg="#0d1620", fg="#ffffff",
+                               font=("Helvetica", 9), width=4)
+        zoom_label.pack(side="left")
+        ttk.Button(ctrl_row, text="+", width=2,
+                   command=lambda: self._apply_zoom(1.25)).pack(side="left", padx=1)
+
+        fov_canvas.bind("<ButtonPress-1>",   self._fov_mouse_down)
+        fov_canvas.bind("<B1-Motion>",       self._fov_mouse_drag)
+        fov_canvas.bind("<ButtonRelease-1>", self._fov_mouse_up)
+        fov_canvas.bind("<Motion>",          self._fov_mouse_hover)
+        fov_canvas.bind("<MouseWheel>",      self._fov_mousewheel)
+        fov_canvas.bind("<Button-4>",        self._fov_mousewheel)
+        fov_canvas.bind("<Button-5>",        self._fov_mousewheel)
+
+        # ── Point the shared FOV/chart attributes at this dialog's widgets ──
+        _orig_preview_canvas = self.preview_canvas
+        _orig_alt_canvas     = self.alt_canvas
+        _orig_rot_label      = self._rot_label
+        _orig_zoom_label     = self._zoom_label
+        self.preview_canvas  = fov_canvas
+        self.alt_canvas      = chart_canvas
+        self._rot_label      = rot_label
+        self._zoom_label     = zoom_label
+
+        def _restore_originals():
+            self.preview_canvas = _orig_preview_canvas
+            self.alt_canvas     = _orig_alt_canvas
+            self._rot_label     = _orig_rot_label
+            self._zoom_label    = _orig_zoom_label
+
+        def _on_cancel():
+            _restore_originals()
+            dlg.destroy()
+
+        def _on_confirm():
+            # Capture framing (pan + rotation) while self.preview_canvas/
+            # self._fov_angle still point at THIS dialog's widgets/state —
+            # _framed_center converts the accumulated pixel pan using the
+            # canvas's current width, so it must run before the originals
+            # (a different-sized canvas) are restored.
+            framed_ra, framed_dec = self._framed_center(t["ra_deg"], t["dec_deg"])
+            rotation_angle = self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0) or 0.0)
+            _restore_originals()
+            dlg.destroy()
+            try:
+                reduction = float(self.reduction_factor.get().rstrip("×x"))
+            except ValueError:
+                reduction = 1.0
+            self._add_target_to_plan_direct(
+                t, self.scope_choice.get(), self.camera_choice.get(),
+                self.bortle_choice.get(), self.filter_mode.get(), reduction,
+                rotation_angle=rotation_angle,
+                framed_ra_deg=framed_ra, framed_dec_deg=framed_dec,
+                report_text="", allow_update_framing=True)
+            # _add_target_to_plan_direct's own async completion callback now
+            # triggers the grid rescan itself, once the plan entry has
+            # actually landed -- calling it again here, immediately, used
+            # to race that background computation and could repopulate the
+            # grid from _plan_entries before the new entry was in it,
+            # leaving the card's "＋" stuck instead of flipping to "✓".
+            # allow_update_framing=True: this dialog exists to dial in a
+            # real framing, so if the target's already on tonight's plan
+            # (e.g. quick-added earlier with no framing), Confirm should
+            # update that plan row's pointing/rotation rather than refuse
+            # with "Already Planned" -- that refusal was the reported bug.
+
+        # Already on tonight's plan under this exact rig/filter mode? Then
+        # Confirm is going to update that row's framing rather than add a
+        # new one (see allow_update_framing above) -- label it accordingly
+        # so that's not a surprise.
+        _already_planned = any(
+            pe["target_id"] == t["id"] and pe.get("scope") == self.scope_choice.get()
+            and pe.get("camera") == self.camera_choice.get()
+            and pe.get("filter_mode") == self.filter_mode.get()
+            for pe in self._plan_entries)
+
+        btn_row = tk.Frame(dlg, bg="#0d1620")
+        btn_row.pack(fill="x", padx=16, pady=(6, 16))
+        ttk.Button(btn_row, text="Update Framing" if _already_planned else "Confirm Framing",
+                   command=_on_confirm).pack(side="right")
+        ttk.Button(btn_row, text="Cancel", command=_on_cancel).pack(side="right", padx=(0, 6))
+
+        dlg.protocol("WM_DELETE_WINDOW", _on_cancel)
+
+        # Give the dialog a moment to map before running analysis (matches
+        # the defer pattern used elsewhere before this dialog existed).
+        self.root.after(50, self.analyze_framing)
+
+    def _add_target_to_tonight(self, target_id):
+        """Add a card's target straight to Tonight's Plan — no framing
+        dialog, no tab jump.
+
+        This is the plain "Add to Tonight" action (as opposed to the
+        card's "Frame" button, which opens the modal Frame dialog first).
+        Since no interactive framing has happened, it commits the
+        catalog's raw RA/Dec with a neutral 0° rotation rather than
+        calling ``_framed_center``/reading ``self._fov_angle`` — those
+        hold scratch state from whatever was last framed elsewhere in
+        the app, and would silently carry over a stale pan/rotation onto
+        an unrelated target. Framing first (via the Frame dialog) and
+        then confirming is the path that sets a real pan/rotation.
+        """
+        key = target_id.replace(" ", "").upper()
+        t = self.targets.get(key) or self.common_names_map.get(key)
+        if not t:
+            messagebox.showwarning("Target Not Found",
+                f"Could not find '{target_id}' in the catalog.")
+            return
+        self._mark_grid_touched(t["id"])
+        scope_name = self.scope_choice.get()
+        cam_name   = self.camera_choice.get()
+        if not scope_name or not cam_name:
+            messagebox.showwarning("Equipment Needed",
+                "Choose a scope and camera (via the rig chip) before adding "
+                "a target to tonight's plan.")
+            return
+        try:
+            reduction = float(self.reduction_factor.get().rstrip("×x"))
+        except ValueError:
+            reduction = 1.0
+        self._add_target_to_plan_direct(
+            t, scope_name, cam_name, self.bortle_choice.get(),
+            self.filter_mode.get(), reduction,
+            rotation_angle=self._screen_to_sky_pa(0.0),
+            framed_ra_deg=None, framed_dec_deg=None,
+            report_text="")
+
+    def _refresh_visible_grid(self):
+        """(Re)scan the catalog for tonight's visible targets and rebuild
+        the browsing grid. Runs the scan in a background thread — same
+        pattern as show_visible_tonight — so the UI doesn't freeze."""
+        if getattr(self, "_grid_scan_running", False):
+            return
+        if not hasattr(self, "_grid_inner"):
+            return   # tab not built yet
+        self._grid_scan_running = True
+        self._grid_hint_var.set("Scanning catalog…")
+
+        lat, lon = self._get_saved_location()
+        if lat is None or lon is None:
+            self._grid_scan_running = False
+            self._grid_hint_var.set("Set an observer location in Settings first.")
+            self._populate_visible_grid([])
+            return
+
+        obj_type = self._grid_type_var.get() if hasattr(self, "_grid_type_var") else "All Types"
+
+        # Extra filters (Min Altitude / Max Magnitude / Seasonal), set via
+        # the toolbar's "Filters" popover — fall back to the old hardcoded
+        # behavior if the tab hasn't been rebuilt with them yet.
+        try:
+            min_alt = float(self._grid_min_alt_var.get()) if hasattr(self, "_grid_min_alt_var") \
+                else float(self.data.get("settings", {}).get("min_alt", 20))
+        except (TypeError, ValueError):
+            min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
+        mag_txt = self._grid_mag_limit_var.get().strip() if hasattr(self, "_grid_mag_limit_var") else ""
+        try:
+            mag_limit = float(mag_txt) if mag_txt else None
+        except ValueError:
+            mag_limit = None
+        use_surf_br   = self._grid_use_surf_br_var.get() if hasattr(self, "_grid_use_surf_br_var") else False
+        seasonal_only = self._grid_seasonal_var.get() if hasattr(self, "_grid_seasonal_var") else True
+
+        # "🌙 Tonight" / "🔭 All" mode — All drops the altitude gate so the
+        # grid becomes a free browse of the whole catalog (see _set_grid_mode).
+        mode = self._grid_mode_var.get() if hasattr(self, "_grid_mode_var") else "tonight"
+        require_min_alt = (mode != "all")
+
+        def _compute():
+            results, fallback_note = self._scan_visible_targets(
+                lat, lon, min_alt=min_alt, obj_type=obj_type,
+                mag_limit=mag_limit, use_surf_br=use_surf_br, seasonal_only=seasonal_only,
+                require_min_alt=require_min_alt)
+
+            def _show():
+                self._grid_scan_running = False
+                shown, pinned_n, total = self._populate_visible_grid(results)
+                capped = total > shown
+                pin_note = f"{pinned_n} pinned + " if pinned_n else ""
+                if mode == "all":
+                    if capped:
+                        hint = (f"{fallback_note}Showing {pin_note}best-placed {shown} of {total} "
+                                f"catalog objects — narrow with Type/Magnitude or search directly "
+                                f"for a specific target")
+                    else:
+                        hint = (f"{fallback_note}{total} catalog objects "
+                                f"(not altitude-limited) · sorted by tonight's peak altitude")
+                else:
+                    if capped:
+                        hint = (f"{fallback_note}Showing {pin_note}best-placed {shown} of {total} "
+                                f"visible tonight — narrow with Type/Magnitude to see the rest")
+                    else:
+                        hint = f"{fallback_note}{total} visible tonight · sorted by altitude"
+                self._grid_hint_var.set(hint)
+            self.root.after(0, _show)
+
+        threading.Thread(target=_compute, daemon=True).start()
+
+    def _mark_grid_touched(self, target_id):
+        """Record a target as touched (framed, or added to Tonight straight
+        from a card) so _populate_visible_grid pins it at the top of the
+        Plan tab's browsing grid — no re-searching for something you're
+        actively working on. Re-touching moves it back to the front; a
+        plain dict preserves insertion order, so "most recent" is just
+        "last in" (read back via reversed() below)."""
+        if not hasattr(self, "_grid_touched"):
+            self._grid_touched = {}
+        self._grid_touched.pop(target_id, None)
+        self._grid_touched[target_id] = True
+
+    def _unmark_grid_touched_if_unplanned(self, target_id):
+        """Drop ``target_id``'s pin (see _mark_grid_touched) once it's no
+        longer in tonight's plan.
+
+        Being "touched" is what keeps a target pinned at the top of the
+        browsing grid regardless of the active filters — useful while
+        you're actively working with it, but once you remove it from the
+        plan there's no reason for it to keep ignoring, say, a Type
+        restriction that would otherwise exclude it. A target can have
+        several plan entries (one per filter channel, e.g. split LRGB), so
+        this only clears the pin once none of them reference it any more.
+        """
+        if not hasattr(self, "_grid_touched") or target_id not in self._grid_touched:
+            return
+        if any(e["target_id"] == target_id for e in self._plan_entries):
+            return
+        del self._grid_touched[target_id]
+
+    def _populate_visible_grid(self, results):
+        """Rebuild the grid's card widgets from a _scan_visible_targets
+        result list.
+
+        Anything touched this session (see _mark_grid_touched) is pinned at
+        the top, most-recently-touched first, even if it doesn't match the
+        current scan/filters — computing its altitude/rise data fresh in
+        that case. The remaining scan results follow in their original
+        (altitude-sorted) order. GRID_CARD_CAP (see its comment) still
+        bounds the total shown, but only trims the non-pinned tail — a
+        touched target is never bumped off by the cap.
+
+        Returns (shown, pinned_count, total) so the caller can build an
+        accurate "Showing X of Y" hint.
+        """
+        for w in self._grid_inner.winfo_children():
+            w.destroy()
+        # Single column (Option C) — the earlier 2-column grid required
+        # each card to fit in half the pane's width, and once the toolbar
+        # above it grew (the search-box widening fix), two cards competing
+        # for width was what actually got cropped. A single dense row per
+        # target has no sibling column to compete with.
+        cols = 1
+        for c in range(cols):
+            self._grid_inner.grid_columnconfigure(c, weight=1, uniform="gridcol")
+
+        touched_ids = list(reversed(self._grid_touched)) if hasattr(self, "_grid_touched") else []
+        by_id = {tup[0]["id"]: tup for tup in results}
+        pinned, seen = [], set()
+        if touched_ids:
+            lat, lon = self._get_saved_location()
+            min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
+            dark_range = _dark_jd_range(lat, lon) if lat is not None and lon is not None else None
+            for tid in touched_ids:
+                if tid in seen:
+                    continue
+                seen.add(tid)
+                if tid in by_id:
+                    pinned.append(by_id[tid])
+                elif dark_range is not None:
+                    t = self.targets.get(tid) or self.common_names_map.get(tid)
+                    if not t:
+                        continue
+                    max_alt, rise_label = _alt_rise_tonight(
+                        t["ra_deg"], t["dec_deg"], lat, lon, min_alt, dark_range)
+                    pinned.append((t, max_alt, rise_label))
+                # No saved location yet: skip computing a touched-but-unscanned
+                # target rather than showing it with meaningless altitude data.
+
+        others = [tup for tup in results if tup[0]["id"] not in seen]
+        budget = max(0, GRID_CARD_CAP - len(pinned))
+        ordered = pinned + others[:budget]
+
+        row_offset = 0
+        if pinned:
+            tk.Label(self._grid_inner, text="RECENTLY TOUCHED", bg="#0e1a28", fg="#556677",
+                     font=("Helvetica", 8, "bold")).grid(
+                row=0, column=0, columnspan=cols, sticky="w", padx=2, pady=(0, 4))
+            row_offset = 1
+
+        for idx, (t, max_alt, rise_label) in enumerate(ordered):
+            card = self._build_target_card(self._grid_inner, t, max_alt, rise_label)
+            r, c = divmod(idx, cols)
+            card.grid(row=r + row_offset, column=c, sticky="nsew", padx=6, pady=4)
+
+        return len(ordered), len(pinned), len(pinned) + len(others)
+
+    def _build_plan_left_pane(self, parent):
+        """Build the new live "Visible Tonight" browsing grid — the left
+        half of the merged Plan tab. The right half (below) is the
+        existing Tonight's Plan rail, unchanged.
+
+        Toolbar (left to right): the Tonight/All mode segment, the rig
+        chip, a catalog search box that jumps straight to Frame for any
+        target, one consolidated "⚙ Filters" popover (Object Type,
+        Catalogs, Min Altitude / Max Magnitude / Seasonal — see
+        _show_unified_filters_popup), and an icon-only Rescan. That single
+        popover replaces what used to be three separate controls (a ▽
+        catalog-filter button, a Type dropdown, and a "Filters ▾" button)
+        — approved "Option C" consolidation, done specifically to free up
+        toolbar width after the search box was widened for readability
+        and started forcing the grid wider than its pane."""
+        toolbar = ttk.Frame(parent)
+        toolbar.pack(fill="x", pady=(0, 8))
+
+        # ── 🌙 Tonight / 🔭 All mode segment ─────────────────────────────
+        # Replaces the old static "Visible Tonight" title. "All" drops the
+        # altitude gate entirely (see _scan_visible_targets' require_min_alt)
+        # so the grid becomes a free browse of the whole catalog — lets a
+        # search for something not currently favorable stay on the list
+        # instead of only opening Frame and disappearing, and supports
+        # planning future sessions. Forces "Seasonal only" off while active,
+        # since that's itself a curated tonight-relevant subset.
+        self._grid_mode_var = tk.StringVar(value="tonight")
+        self._grid_prior_seasonal = True
+        seg_wrap = tk.Frame(toolbar, bg="#1a2b3c", highlightthickness=1, highlightbackground="#1e2d3e")
+        seg_wrap.pack(side="left")
+        self._grid_seg_tonight = tk.Label(seg_wrap, text="🌙 Tonight", font=("Helvetica", 9, "bold"),
+                                           padx=10, pady=5, cursor="hand2")
+        self._grid_seg_tonight.pack(side="left")
+        self._grid_seg_all = tk.Label(seg_wrap, text="🔭 All", font=("Helvetica", 9, "bold"),
+                                       padx=10, pady=5, cursor="hand2")
+        self._grid_seg_all.pack(side="left")
+        self._grid_seg_tonight.bind("<Button-1>", lambda e: self._set_grid_mode("tonight"))
+        self._grid_seg_all.bind("<Button-1>", lambda e: self._set_grid_mode("all"))
+        ToolTip(self._grid_seg_tonight, "Only objects above your minimum\naltitude tonight.")
+        ToolTip(self._grid_seg_all, "Every catalog object, regardless of\n"
+                                     "tonight's altitude — for planning ahead.\n"
+                                     "Search results also stay on this list.")
+        self._update_grid_mode_seg()
+
+        # ── Rig chip — opens/closes the equipment drawer ────────────────
+        # "ACTIVE RIG" caption + a glowing pill (blue-tinted fill/border plus
+        # a green live-status dot), per the approved design round.
+        chip_wrap = tk.Frame(toolbar, bg="#1e2d3e")
+        chip_wrap.pack(side="left", padx=(14, 0))
+
+        tk.Label(chip_wrap, text="ACTIVE RIG", bg="#1e2d3e", fg="#7eb8d4",
+                 font=("Helvetica", 8, "bold")).pack(side="left", padx=(0, 8))
+
+        self._rig_chip_pill = tk.Frame(chip_wrap, bg="#0f2233", cursor="hand2",
+                                        highlightthickness=2, highlightbackground="#1f4a63")
+        self._rig_chip_pill.pack(side="left")
+
+        self._rig_chip_dot = tk.Canvas(self._rig_chip_pill, width=8, height=8,
+                                        bg="#0f2233", highlightthickness=0, cursor="hand2")
+        self._rig_chip_dot.pack(side="left", padx=(10, 6), pady=7)
+        self._rig_chip_dot.create_oval(1, 1, 7, 7, fill="#34d399", outline="")
+
+        self._rig_chip_btn = tk.Label(self._rig_chip_pill, bg="#0f2233", fg="#38bdf8",
+                                       font=("Helvetica", 9, "bold"),
+                                       padx=0, pady=7, cursor="hand2")
+        self._rig_chip_btn.pack(side="left", padx=(0, 12))
+
+        for _w in (self._rig_chip_pill, self._rig_chip_dot, self._rig_chip_btn):
+            _w.bind("<Button-1>", lambda e: self._toggle_equip_drawer())
+            ToolTip(_w, "Active equipment — click to switch\nrigs or tweak scope/camera/filter.")
+        self._update_rig_chip_label()
+        self.rig_choice.trace_add('write', lambda *a: self._update_rig_chip_label())
+
+        # ── Catalog search — jump straight to any target, whether or not
+        # it's in tonight's visible list below. Reuses the exact floating
+        # suggestion popup the Planner/Explore search boxes use (see the
+        # "Search plumbing" section near _explore_on_search_key) rather
+        # than a fresh implementation.
+        # Font matches whatever ttk.Button actually renders with (its style
+        # is never explicitly given a font, so this is the live theme
+        # default) rather than a guessed size — that's the "match the
+        # button" ask. A dedicated "PlanSearch.TEntry" style adds vertical
+        # padding for a taller box without touching every other Entry in
+        # the app; the placeholder style shares that same padding so the
+        # box doesn't resize when the placeholder appears/disappears.
+        _btn_font = ttk.Style().lookup("TButton", "font") or "TkDefaultFont"
+        self.plan_search = ttk.Entry(toolbar, width=26, font=_btn_font,
+                                     style="PlanSearch.TEntry")
+        self.plan_search.pack(side="left", padx=(14, 0))
+        ToolTip(self.plan_search, "Search by catalog ID (M42, NGC 224) or\n"
+                                   "common name — opens straight into Frame,\n"
+                                   "even if it's not in tonight's list below.")
+        self.plan_search.bind("<KeyRelease>", self._plan_on_search_key)
+        self.plan_search.bind("<Return>", lambda e: (self._hide_suggestions(), self._plan_search_submit()))
+        self.plan_search.bind("<Escape>", lambda e: self._hide_suggestions())
+        self.plan_search.bind("<FocusIn>", lambda e: self._plan_search_clear_placeholder())
+        self.plan_search.bind("<FocusOut>", self._plan_search_on_focus_out)
+
+        # A plain "it's a text box" placeholder — a dedicated style so the
+        # grey only ever applies while the placeholder itself is showing;
+        # swapping back to the "PlanSearch.TEntry" style (rather than
+        # setting an instance-level foreground override) means the real
+        # typed text keeps tracking the normal day/night TEntry color
+        # automatically, instead of getting stuck at whichever color was
+        # current when the placeholder was last cleared.
+        style = ttk.Style()
+        style.configure("PlanSearch.TEntry", padding=(8, 6))
+        style.configure("PlanSearchPlaceholder.TEntry", foreground="#667788", padding=(8, 6))
+        # TEntry's own style.map forces foreground back to the normal text
+        # colour in the "!disabled"/"focus"/"" states (see _setup_day_styles),
+        # and a derived style inherits that map unless it defines its own —
+        # without this override the placeholder text rendered in the normal
+        # white/red day/night colour instead of grey, no matter what
+        # style.configure() above set as the plain default.
+        style.map("PlanSearchPlaceholder.TEntry",
+                  foreground=[("!disabled", "#667788"), ("focus", "#667788"), ("", "#667788")])
+        self._plan_search_placeholder_active = False
+        self._plan_search_show_placeholder()
+
+        # ── Extra filters (Min Altitude / Max Magnitude / Seasonal) ─────
+        # Pulled over from the old "Visible Tonight" popup — same override
+        # semantics: seeded from the saved settings default but not written
+        # back to it, kept in-memory for this session only (matching how
+        # show_visible_tonight's own min-altitude field already behaves).
+        self._grid_touched         = {}   # target_id -> True, insertion-order = touch order (see _mark_grid_touched)
+        self._grid_type_var        = tk.StringVar(value="All Types")
+        self._grid_min_alt_var     = tk.StringVar(
+            value=str(int(self.data.get("settings", {}).get("min_alt", 20))))
+        self._grid_mag_limit_var   = tk.StringVar(value="")
+        self._grid_use_surf_br_var = tk.BooleanVar(value=False)
+        self._grid_seasonal_var    = tk.BooleanVar(value=True)
+
+        # Packed right-to-left: the first side="right" widget claims the
+        # rightmost slot, so Rescan (icon-only, to save width) is packed
+        # first to end up rightmost, then the single unified Filters
+        # button just left of it.
+        rescan_btn = ttk.Button(toolbar, text="🔄", width=3,
+                                 command=self._refresh_visible_grid)
+        rescan_btn.pack(side="right")
+        ToolTip(rescan_btn, "Re-run the scan (e.g. after changing\nyour observer location).")
+
+        self._unified_filters_btn = ttk.Button(toolbar, text="⚙ Filters ▾",
+                                                command=self._toggle_unified_filters_popup)
+        self._unified_filters_btn.pack(side="right", padx=(6, 0))
+        ToolTip(self._unified_filters_btn,
+                "Object type, catalogs (NGC/IC/Messier/\nCaldwell/Sharpless), min altitude, max\n"
+                "magnitude, and seasonal-only — all in one place.")
+        self._update_unified_filters_btn_label()
+
+        self._grid_hint_var = tk.StringVar(value="")
+        ttk.Label(parent, textvariable=self._grid_hint_var,
+                  font=("Helvetica", 9), foreground="#778899").pack(fill="x", pady=(0, 6))
+
+        grid_frame = ttk.Frame(parent)
+        grid_frame.pack(fill="both", expand=True)
+        self._grid_canvas = tk.Canvas(grid_frame, bg="#0e1a28", highlightthickness=0)
+        grid_scroll = ttk.Scrollbar(grid_frame, orient="vertical",
+                                     command=self._grid_canvas.yview)
+        self._grid_inner = tk.Frame(self._grid_canvas, bg="#0e1a28")
+        self._grid_inner.bind("<Configure>",
+            lambda e: self._grid_canvas.configure(scrollregion=self._grid_canvas.bbox("all")))
+        self._grid_canvas.create_window((0, 0), window=self._grid_inner, anchor="nw", tags="inner")
+        self._grid_canvas.bind("<Configure>",
+            lambda e: self._grid_canvas.itemconfig("inner", width=e.width))
+        self._grid_canvas.configure(yscrollcommand=grid_scroll.set)
+        self._grid_canvas.pack(side="left", fill="both", expand=True)
+        grid_scroll.pack(side="right", fill="y")
+        self._bind_plan_mousewheel(self._grid_canvas)
+        self._bind_plan_mousewheel(self._grid_inner)
+
+        # First fill happens once the tab is actually visible (see
+        # _on_tab_changed), same lazy-load pattern as the rest of the app.
+
+    # ── Plan tab search (shares the Planner's floating suggestion popup,
+    # same pattern as _explore_on_search_key / _explore_select_suggestion) ──
+
+    _PLAN_SEARCH_PLACEHOLDER = "Search catalog…"
+
+    def _plan_search_show_placeholder(self):
+        """Show the grey "Search catalog…" hint text — only when the box
+        is actually empty, so this never clobbers real (possibly emptied-
+        then-refocused) user input."""
+        if self.plan_search.get():
+            return
+        self._plan_search_placeholder_active = True
+        self.plan_search.insert(0, self._PLAN_SEARCH_PLACEHOLDER)
+        self.plan_search.configure(style="PlanSearchPlaceholder.TEntry")
+
+    def _plan_search_clear_placeholder(self):
+        """Clear the placeholder (called on focus-in) and restore the
+        normal (padded) entry style so typed text tracks the current
+        day/night color instead of staying grey."""
+        if self._plan_search_placeholder_active:
+            self._plan_search_placeholder_active = False
+            self.plan_search.delete(0, tk.END)
+            self.plan_search.configure(style="PlanSearch.TEntry")
+
+    def _plan_search_on_focus_out(self, event):
+        """Focus left the search box — keep the existing suggestion-popup
+        dismissal, and re-show the placeholder if the box was left empty."""
+        self.root.after(150, self._hide_suggestions)
+        if not self.plan_search.get():
+            self._plan_search_show_placeholder()
+
+    def _plan_on_search_key(self, event):
+        """Key release in the Plan tab's catalog search — drive the shared
+        floating suggestion popup."""
+        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
+            return
+        self._update_floating_suggestions(entry=self.plan_search,
+                                           on_select=self._plan_select_suggestion)
+
+    def _plan_select_suggestion(self, target_id):
+        """Suggestion clicked — open that target straight into the Frame
+        dialog, whether or not it's in tonight's visible-grid list."""
+        self._hide_suggestions()
+        self.plan_search.delete(0, tk.END)
+        self._frame_from_card(target_id)
+
+    def _plan_search_submit(self):
+        """Enter pressed in the Plan tab's search box — same catalog-key
+        normalization the Planner tab's search uses, then opens straight
+        into Frame (_frame_from_card does its own not-found warning)."""
+        raw = self.plan_search.get().strip().upper().replace(" ", "")
+        if not raw:
+            return
+        raw = self._normalize_catalog_key(raw)
+        self.plan_search.delete(0, tk.END)
+        self._frame_from_card(raw)
+
+    # ── Plan tab's consolidated "⚙ Filters" popover ─────────────────────
+    # Object Type, Catalogs (NGC/IC/Messier/Caldwell/Sharpless/Other), and
+    # Min Altitude / Max Magnitude / Seasonal — one popup instead of the
+    # three separate controls (▽ catalog button, Type dropdown, "Filters
+    # ▾" button) this replaces, per the approved "Option C" consolidation.
+    # Embedded Frame + .place(), not a Toplevel — two overrideredirect
+    # Toplevels (this popup and a tooltip) fight over z-order on macOS.
+
+    def _toggle_unified_filters_popup(self):
+        """Show or hide the consolidated Filters popup."""
+        if self._unified_filters_popup and self._unified_filters_popup.winfo_exists():
+            self._close_unified_filters_popup()
+            return
+        self._show_unified_filters_popup()
+
+    def _show_unified_filters_popup(self):
+        """Build the consolidated Filters popup beneath the Filters button.
+
+        Catalog checkboxes and the Type combobox are rebuilt fresh each
+        time the popup opens (cheap, and avoids any dangling-widget
+        bookkeeping between opens) — the same pattern the old standalone
+        catalog-filter popup already used.
+        """
+        if self._unified_filters_popup and self._unified_filters_popup.winfo_exists():
+            self._close_unified_filters_popup()
+
+        nm = getattr(self, "night_mode", False)
+        bg_panel   = "#2a0000" if nm else "#1e2d3e"
+        bg_active  = "#330000" if nm else "#263545"
+        bg_field   = "#1a0000" if nm else "#132233"
+        border_col = "#882222" if nm else "#2e4a63"
+        fg_primary = "#cc0000" if nm else "#cbd9e5"
+        fg_dim     = "#882222" if nm else "#6a8aa8"
+        fg_muted   = "#552222" if nm else "#445566"
+
+        popup = tk.Frame(self.root, bg=bg_panel,
+                          highlightthickness=1, highlightbackground=border_col)
+        self._unified_filters_popup = popup
+
+        self.root.update_idletasks()
+        self._unified_filters_btn.update_idletasks()
+        btn_x = self._unified_filters_btn.winfo_rootx() - self.root.winfo_rootx()
+        btn_y = self._unified_filters_btn.winfo_rooty() - self.root.winfo_rooty()
+        btn_h = self._unified_filters_btn.winfo_height()
+        btn_w = self._unified_filters_btn.winfo_width()
+        popup_w = 230
+        # Right-align under the button — it sits at the toolbar's right
+        # edge, so left-aligning could run the popup off-window.
+        popup.place(x=btn_x + btn_w - popup_w, y=btn_y + btn_h + 2, width=popup_w, height=440)
+        popup.lift()
+
+        # ── Object Type ──────────────────────────────────────────────
+        tk.Label(popup, text="OBJECT TYPE", bg=bg_panel, fg=fg_dim,
+                 font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
+        type_combo = ttk.Combobox(popup, textvariable=self._grid_type_var,
+                                   values=OBJECT_TYPE_FILTERS, state="readonly")
+        type_combo.pack(fill="x", padx=10, pady=(0, 8))
+        type_combo.bind("<<ComboboxSelected>>", lambda e: self._on_unified_filters_change())
+
+        tk.Frame(popup, bg=border_col, height=1).pack(fill="x", padx=10, pady=(0, 8))
+
+        # ── Catalogs ──────────────────────────────────────────────────
+        cat_header = tk.Frame(popup, bg=bg_panel)
+        cat_header.pack(fill="x", padx=10, pady=(0, 4))
+        tk.Label(cat_header, text="CATALOGS", bg=bg_panel, fg=fg_dim,
+                 font=("Helvetica", 8, "bold")).pack(side="left")
+        none_lbl = tk.Label(cat_header, text="None", bg=bg_panel, fg=fg_dim,
+                             font=("Helvetica", 8, "underline"), cursor="hand2")
+        none_lbl.pack(side="right")
+        none_lbl.bind("<Button-1>", lambda e: self._set_all_catalog_filters(False))
+        self._bind_link_hover(none_lbl, normal=fg_dim, hover=fg_primary)
+        tk.Label(cat_header, text="·", bg=bg_panel, fg=fg_muted,
+                 font=("Helvetica", 8)).pack(side="right", padx=5)
+        all_lbl = tk.Label(cat_header, text="All", bg=bg_panel, fg=fg_dim,
+                            font=("Helvetica", 8, "underline"), cursor="hand2")
+        all_lbl.pack(side="right")
+        all_lbl.bind("<Button-1>", lambda e: self._set_all_catalog_filters(True))
+        self._bind_link_hover(all_lbl, normal=fg_dim, hover=fg_primary)
+
+        counts = self._count_targets_by_catalog()
+        cat_order = ["NGC", "IC", "Messier", "Caldwell", "Sharpless", "Other"]
+        self._catalog_filter_vars = {}
+        for cat in cat_order:
+            row = tk.Frame(popup, bg=bg_panel, cursor="hand2")
+            row.pack(fill="x", padx=4, pady=1)
+            var = tk.BooleanVar(value=self.catalog_filter.get(cat, True))
+            self._catalog_filter_vars[cat] = var
+            cb = tk.Checkbutton(row, text=cat, variable=var,
+                                 bg=bg_panel, fg=fg_primary, selectcolor=bg_panel,
+                                 activebackground=bg_active, activeforeground=fg_primary,
+                                 font=("Helvetica", 10), anchor="w", padx=4,
+                                 command=lambda c=cat: self._on_catalog_filter_change(c))
+            cb.pack(side="left", padx=(4, 0))
+            count = counts.get(cat, 0)
+            tk.Label(row, text=f"{count:,}", bg=bg_panel, fg=fg_dim,
+                      font=("Helvetica", 9)).pack(side="right", padx=(0, 10))
+
+        tk.Frame(popup, bg=border_col, height=1).pack(fill="x", padx=10, pady=(6, 8))
+
+        # ── Min Altitude / Max Magnitude / Seasonal ──────────────────
+        tk.Label(popup, text="OTHER", bg=bg_panel, fg=fg_dim,
+                 font=("Helvetica", 8, "bold")).pack(anchor="w", padx=10, pady=(0, 4))
+
+        row1 = tk.Frame(popup, bg=bg_panel)
+        row1.pack(fill="x", padx=10, pady=(0, 6))
+        tk.Label(row1, text="Min. Altitude", bg=bg_panel, fg=fg_primary,
+                 font=("Helvetica", 10)).pack(side="left")
+        tk.Label(row1, text="°", bg=bg_panel, fg=fg_dim,
+                 font=("Helvetica", 10)).pack(side="right")
+        alt_entry = tk.Entry(row1, textvariable=self._grid_min_alt_var, width=4,
+                              bg=bg_field, fg=fg_primary, insertbackground=fg_primary,
+                              relief="flat", highlightthickness=1, highlightbackground=border_col)
+        alt_entry.pack(side="right", padx=(0, 4))
+        alt_entry.bind("<Return>", lambda e: self._on_unified_filters_change())
+        alt_entry.bind("<FocusOut>", lambda e: self._on_unified_filters_change())
+
+        row2 = tk.Frame(popup, bg=bg_panel)
+        row2.pack(fill="x", padx=10, pady=(0, 2))
+        tk.Label(row2, text="Max Magnitude", bg=bg_panel, fg=fg_primary,
+                 font=("Helvetica", 10)).pack(side="left")
+        mag_entry = tk.Entry(row2, textvariable=self._grid_mag_limit_var, width=4,
+                              bg=bg_field, fg=fg_primary, insertbackground=fg_primary,
+                              relief="flat", highlightthickness=1, highlightbackground=border_col)
+        mag_entry.pack(side="right")
+        mag_entry.bind("<Return>", lambda e: self._on_unified_filters_change())
+        mag_entry.bind("<FocusOut>", lambda e: self._on_unified_filters_change())
+        ToolTip(mag_entry, "Leave blank to show all magnitudes.")
+
+        surf_cb = tk.Checkbutton(popup, text="Use surface brightness",
+                                  variable=self._grid_use_surf_br_var,
+                                  bg=bg_panel, fg=fg_primary, selectcolor=bg_panel,
+                                  activebackground=bg_panel, activeforeground=fg_primary,
+                                  font=("Helvetica", 9), anchor="w",
+                                  command=self._on_unified_filters_change)
+        surf_cb.pack(fill="x", padx=6, pady=(0, 4))
+
+        tk.Frame(popup, bg=border_col, height=1).pack(fill="x", padx=10, pady=(2, 6))
+
+        season_cb = tk.Checkbutton(popup, text="Seasonal targets only",
+                                    variable=self._grid_seasonal_var,
+                                    bg=bg_panel, fg=fg_primary, selectcolor=bg_panel,
+                                    activebackground=bg_panel, activeforeground=fg_primary,
+                                    font=("Helvetica", 9), anchor="w",
+                                    command=self._on_unified_filters_change)
+        # Disabled while the "🔭 All" mode is active — seasonal is itself a
+        # curated tonight-relevant subset, which fights "show me everything".
+        if self._grid_mode_var.get() == "all":
+            season_cb.config(state="disabled")
+        season_cb.pack(fill="x", padx=6, pady=(0, 8))
+        self._grid_seasonal_cb = season_cb
+
+        # Same Cocoa Tk paint bug _kick_paint already works around elsewhere
+        # (see its docstring) — freshly-created Entry widgets on macOS can
+        # stay blank until the pointer physically enters them. Kick the two
+        # text fields right away instead of waiting for the user's mouse.
+        self._kick_paint([alt_entry, mag_entry])
+
+        self._unified_filters_click_binding = self.root.bind(
+            "<Button-1>", self._maybe_close_unified_filters_popup, add="+")
+        self._unified_filters_escape_binding = self.root.bind(
+            "<Escape>", lambda e: self._close_unified_filters_popup(), add="+")
+
+    def _maybe_close_unified_filters_popup(self, event):
+        """Close the unified filters popup if the click landed outside it
+        (and outside the Filters button, which toggles it itself)."""
+        popup = self._unified_filters_popup
+        if not popup or not popup.winfo_exists():
+            return
+        px, py = popup.winfo_rootx(), popup.winfo_rooty()
+        pw, ph = popup.winfo_width(), popup.winfo_height()
+        if px <= event.x_root <= px + pw and py <= event.y_root <= py + ph:
+            return
+        if hasattr(self, "_unified_filters_btn"):
+            btn = self._unified_filters_btn
+            bx, by = btn.winfo_rootx(), btn.winfo_rooty()
+            bw, bh = btn.winfo_width(), btn.winfo_height()
+            if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
+                return
+        self._close_unified_filters_popup()
+
+    def _close_unified_filters_popup(self):
+        """Tear down the unified filters popup and its root-level bindings."""
+        if getattr(self, "_unified_filters_click_binding", None):
+            try:
+                self.root.unbind("<Button-1>", self._unified_filters_click_binding)
+            except (tk.TclError, AttributeError):
+                pass
+            self._unified_filters_click_binding = None
+        if getattr(self, "_unified_filters_escape_binding", None):
+            try:
+                self.root.unbind("<Escape>", self._unified_filters_escape_binding)
+            except (tk.TclError, AttributeError):
+                pass
+            self._unified_filters_escape_binding = None
+        if self._unified_filters_popup and self._unified_filters_popup.winfo_exists():
+            self._unified_filters_popup.destroy()
+        self._unified_filters_popup = None
+
+    def _on_unified_filters_change(self):
+        """Any control in the unified Filters popup changed — validate,
+        refresh the Filters button's active-indicator dot, and re-scan."""
+        try:
+            float(self._grid_min_alt_var.get())
+        except (TypeError, ValueError):
+            self._grid_min_alt_var.set(str(int(self.data.get("settings", {}).get("min_alt", 20))))
+        mag_txt = self._grid_mag_limit_var.get().strip()
+        if mag_txt:
+            try:
+                float(mag_txt)
+            except ValueError:
+                self._grid_mag_limit_var.set("")
+        self._update_unified_filters_btn_label()
+        self._refresh_visible_grid()
+
+    def _update_unified_filters_btn_label(self):
+        """Light up the Filters button's "•" indicator when any filter is
+        off its default: object type, catalogs, min-altitude setting, mag
+        limit, surface-brightness toggle, or seasonal-only.
+
+        Seasonal-only is excluded from this check while "🔭 All" mode is
+        active — it's forced off by the mode itself, not a user choice, so
+        it shouldn't make the Filters button look "active" on its own.
+        """
+        if not hasattr(self, "_unified_filters_btn"):
+            return
+        default_alt = str(int(self.data.get("settings", {}).get("min_alt", 20)))
+        in_all_mode = getattr(self, "_grid_mode_var", None) is not None \
+            and self._grid_mode_var.get() == "all"
+        catalogs_restricted = self.catalog_filter is not None and \
+            not all(self.catalog_filter.values())
+        type_restricted = getattr(self, "_grid_type_var", None) is not None \
+            and self._grid_type_var.get() != "All Types"
+        active = (type_restricted
+                  or catalogs_restricted
+                  or self._grid_min_alt_var.get().strip() != default_alt
+                  or bool(self._grid_mag_limit_var.get().strip())
+                  or self._grid_use_surf_br_var.get()
+                  or (not self._grid_seasonal_var.get() and not in_all_mode))
+        self._unified_filters_btn.config(text="⚙ Filters • ▾" if active else "⚙ Filters ▾")
+
+    def _set_grid_mode(self, mode):
+        """Switch the Plan tab grid between "tonight" (altitude/seasonal
+        gated) and "all" (free browse — every catalog object regardless of
+        tonight's altitude, so a search result or a target you're planning
+        ahead for stays on the list instead of disappearing)."""
+        if mode == self._grid_mode_var.get():
+            return
+        self._grid_mode_var.set(mode)
+        if mode == "all":
+            self._grid_prior_seasonal = self._grid_seasonal_var.get()
+            self._grid_seasonal_var.set(False)
+        else:
+            self._grid_seasonal_var.set(getattr(self, "_grid_prior_seasonal", True))
+        seasonal_cb = getattr(self, "_grid_seasonal_cb", None)
+        if seasonal_cb is not None and seasonal_cb.winfo_exists():
+            seasonal_cb.config(state="disabled" if mode == "all" else "normal")
+        self._update_unified_filters_btn_label()
+        self._update_grid_mode_seg()
+        self._refresh_visible_grid()
+
+    def _update_grid_mode_seg(self):
+        """Restyle the Tonight/All segment labels to match the active mode."""
+        if not hasattr(self, "_grid_seg_tonight"):
+            return
+        mode = self._grid_mode_var.get()
+        for lbl, key in ((self._grid_seg_tonight, "tonight"), (self._grid_seg_all, "all")):
+            if mode == key:
+                lbl.config(bg="#38bdf8", fg="#0e1a28")
+            else:
+                lbl.config(bg="#1a2b3c", fg="#556677")
+
+    def _update_rig_chip_label(self):
+        """Refresh the Plan tab's rig-chip text to match the active rig."""
+        if not hasattr(self, "_rig_chip_btn"):
+            return
+        name = self.rig_choice.get() or "Custom…"
+        self._rig_chip_btn.config(text=f"⚙ {name}")
+
+    def _select_rig_chip(self, name):
+        """Apply a saved rig chosen from the equipment drawer's chip row.
+
+        Setting the StringVar alone doesn't fire <<ComboboxSelected>> (that
+        only fires on user interaction with the combobox widget itself), so
+        this calls the same handler the dropdown uses to actually apply the
+        rig's equipment snapshot."""
+        self.rig_choice.set(name)
+        self._on_rig_selected()
+        self._close_equip_drawer()
+        self._open_equip_drawer()   # rebuild so the chip row highlights the new active rig
+
+    def _toggle_equip_drawer(self):
+        if getattr(self, "_equip_drawer", None) is not None:
+            self._close_equip_drawer()
+        else:
+            self._open_equip_drawer()
+
+    def _open_equip_drawer(self):
+        """Open the equipment slide-in drawer (Option 2, approved) over the
+        right edge of the Plan tab.
+
+        Earlier version of this method tried to re-parent the Planner tab's
+        actual scope/reducer/camera/filter widgets into the drawer via
+        pack(in_=...). That fails at the Tk level: pack's "-in" target must be
+        the widget's real parent or a descendant of it, and the drawer lives
+        under a completely different tab frame — Tk raises
+        "can't pack X inside Y" the moment it's tried (confirmed by
+        reproducing it directly against this method). So instead, the drawer
+        gets its own Combobox widgets bound to the *same* StringVars
+        (self.scope_choice, self.reduction_factor, self.camera_choice,
+        self.filter_mode) that the Planner tab's chips
+        use — Tkinter keeps every widget sharing a StringVar in sync
+        automatically, so there's still exactly one source of truth for the
+        selected value, just two on-screen views of it. Dropdown *options*
+        (values=) are copied from the Planner tab's widgets at open time and
+        kept in sync by refresh_dropdowns() while the drawer is open (same
+        pattern already used for the Explore tab's own scope/camera
+        dropdowns).
+
+        Bortle (sky darkness) is deliberately NOT shown here — it isn't
+        equipment, it's a single global "sky conditions" setting that lives
+        in the header, and this drawer is scoped to "ACTIVE EQUIPMENT" /
+        rig settings. Showing a second view of it under a rig's name would
+        wrongly imply it's part of that rig.
+
+        Known simplification: this appears/disappears instantly rather than
+        sliding, and there's no dimmed "scrim" over the rest of the tab like
+        the mockup — both are cosmetic and cheap to add later if wanted.
+        """
+        if getattr(self, "_equip_drawer", None) is not None or not hasattr(self, "_plan_split"):
+            return
+
+        DRAWER_W = 330
+        drawer = tk.Frame(self._plan_split, bg="#131f2e",
+                           highlightthickness=1, highlightbackground="#2e4a63")
+        drawer.place(relx=1.0, rely=0.0, anchor="ne", relheight=1.0, width=DRAWER_W)
+        drawer.lift()
+        self._equip_drawer = drawer
+        # Resolve the place() geometry now, synchronously — otherwise a
+        # drawer rebuilt immediately after a prior one closes (e.g. from
+        # _select_rig_chip) can get children packed before Tk has computed
+        # this frame's actual height from relheight, and pack silently
+        # declines to map anything that doesn't yet fit.
+        self.root.update_idletasks()
+
+        head = tk.Frame(drawer, bg="#131f2e")
+        head.pack(fill="x", padx=16, pady=(14, 10))
+        tk.Label(head, text="ACTIVE EQUIPMENT", bg="#131f2e", fg="#7eb8d4",
+                 font=("Helvetica", 10, "bold")).pack(side="left")
+        tk.Button(head, text="✕", relief="flat", bd=0, bg="#131f2e", fg="#778899",
+                  activebackground="#131f2e", activeforeground="#ffffff",
+                  cursor="hand2", command=self._close_equip_drawer).pack(side="right")
+
+        body = tk.Frame(drawer, bg="#131f2e")
+        body.pack(fill="both", expand=True, padx=16)
+
+        tk.Label(body, text="SAVED RIGS", bg="#131f2e", fg="#556677",
+                 font=("Helvetica", 8, "bold")).pack(anchor="w", pady=(0, 8))
+        chips_wrap = tk.Frame(body, bg="#131f2e")
+        chips_wrap.pack(fill="x", pady=(0, 16))
+
+        # Chips wrap onto additional rows instead of overflowing the fixed
+        # drawer width — plenty of vertical room, no reason to let a rig
+        # with several saved chips get clipped. Tk's pack/grid don't wrap
+        # on their own, so this measures each chip's rendered width up
+        # front (via tkfont, before the widget is ever created — a Label's
+        # master can't be changed after construction, so we have to know
+        # which row a chip belongs to before building it) and starts a new
+        # row Frame whenever the next chip would overflow.
+        CHIP_FONT = ("Helvetica", 9)
+        CHIP_GAP  = 6
+        chip_font_obj = tkfont.Font(family=CHIP_FONT[0], size=CHIP_FONT[1])
+        # DRAWER_W matches the width= passed to drawer.place() above; body's
+        # own padx=16 (both sides) is the only other thing eating into it.
+        available_w = DRAWER_W - 2 * 16 - 6   # small safety margin
+
+        def _chip_width(text, bordered=False):
+            # padx=10 both sides (Label's padx param) + ~2px for chips that
+            # also carry a 1px highlightthickness border (the "+ New rig" chip).
+            return chip_font_obj.measure(text) + 20 + (2 if bordered else 0)
+
+        rows = [tk.Frame(chips_wrap, bg="#131f2e")]
+        rows[0].pack(fill="x", anchor="w")
+        row_w = [0]
+
+        def _place_chip(name, bordered=False, **label_kwargs):
+            w = _chip_width(name, bordered) + CHIP_GAP
+            if row_w[0] > 0 and row_w[0] + w > available_w:
+                rows.append(tk.Frame(chips_wrap, bg="#131f2e"))
+                rows[-1].pack(fill="x", anchor="w")
+                row_w[0] = 0
+            # A single rig name long enough to exceed the whole drawer width
+            # has nowhere to wrap TO — starting a new row wouldn't help a
+            # chip that's wider than the drawer itself. Wrap its own text
+            # internally instead of letting it overflow sideways.
+            wrap_kwargs = {}
+            if w - CHIP_GAP > available_w:
+                wrap_kwargs["wraplength"] = available_w - 20
+                wrap_kwargs["justify"] = "left"
+            chip = tk.Label(rows[-1], text=name, font=CHIP_FONT,
+                             padx=10, pady=4, cursor="hand2", **wrap_kwargs, **label_kwargs)
+            chip.pack(side="left", padx=(0, CHIP_GAP), pady=(0, 6))
+            row_w[0] += w
+            return chip
+
+        active_rig = self.rig_choice.get()
+        for name in self.rig_dropdown.cget("values"):
+            is_active = (name == active_rig)
+            chip = _place_chip(name,
+                                bg=("#0f2233" if is_active else "#1a2836"),
+                                fg=("#7eb8d4" if is_active else "#aabbcc"))
+            chip.bind("<Button-1>", lambda e, n=name: self._select_rig_chip(n))
+        add_chip = _place_chip("+ New rig", bordered=True,
+                                bg="#131f2e", fg="#556677",
+                                highlightthickness=1, highlightbackground="#2e4a63")
+        add_chip.bind("<Button-1>", lambda e: self._open_save_rig_dialog())
+
+        tk.Label(body, text=f"{active_rig or 'CUSTOM'} SETTINGS".upper(),
+                 bg="#131f2e", fg="#556677", font=("Helvetica", 8, "bold")
+                 ).pack(anchor="w", pady=(0, 8))
+        field_stack = tk.Frame(body, bg="#131f2e")
+        field_stack.pack(fill="x")
+
+        def _row(label, values, var):
+            r = tk.Frame(field_stack, bg="#1a2836")
+            r.pack(fill="x", pady=(0, 6))
+            tk.Label(r, text=label, bg="#1a2836", fg="#7a8a9a",
+                     font=("Helvetica", 8), width=8, anchor="w").pack(
+                     side="left", padx=(8, 4), pady=6)
+            dd = ttk.Combobox(r, textvariable=var, values=values, state="readonly")
+            dd.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
+            return dd
+
+        self._drawer_scope_dd  = _row("Scope",   self.scope_dropdown.cget("values"),  self.scope_choice)
+        self._drawer_reduc_dd  = _row("Reducer", self.reduction_entry.cget("values"), self.reduction_factor)
+        self._drawer_camera_dd = _row("Camera",  self.camera_dropdown.cget("values"), self.camera_choice)
+
+        # Filter row/combobox — built here but shown only for mono cameras;
+        # toggle_filter_visibility (already trace-bound to camera_choice)
+        # packs/forgets it, same rule as the Planner tab's own filter chip.
+        self._drawer_filter_row = tk.Frame(field_stack, bg="#1a2836")
+        tk.Label(self._drawer_filter_row, text="Filter", bg="#1a2836", fg="#7a8a9a",
+                 font=("Helvetica", 8), width=8, anchor="w").pack(
+                 side="left", padx=(8, 4), pady=6)
+        self._drawer_filter_dd = ttk.Combobox(
+            self._drawer_filter_row, textvariable=self.filter_mode,
+            values=self.filter_dropdown.cget("values"), state="readonly")
+        self._drawer_filter_dd.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
+        self.toggle_filter_visibility()
+
+        foot = tk.Frame(drawer, bg="#131f2e")
+        foot.pack(fill="x", padx=16, pady=14)
+        ttk.Button(foot, text="Manage Rigs",
+                   command=self._open_manage_rigs_dialog).pack(side="left")
+        ttk.Button(foot, text="Done", command=self._close_equip_drawer).pack(side="right")
+
+    def _close_equip_drawer(self):
+        """Destroy the drawer and its widgets. Nothing needs to be handed
+        back anywhere — the Planner tab's own chip widgets were never
+        touched (see _open_equip_drawer's note on why)."""
+        drawer = getattr(self, "_equip_drawer", None)
+        if drawer is None:
+            return
+        self._drawer_filter_row = None
+        drawer.destroy()
+        self._equip_drawer = None
+
+    def setup_plan_tab(self):
+        """Build the merged Plan tab: a live "Visible Tonight" browsing
+        grid (left) beside the Tonight's Plan rail (right), with a
+        full-width collapsible schedule-timeline strip below both —
+        the Gantt/drag-to-schedule timeline and the reorder tools that
+        used to live on the (now retired) Targets List tab, reattached
+        to tonight's committed plan (_plan_entries) instead of the old
+        pre-commit queue. "Add to Tonight" commits straight to
+        _plan_entries — no queue, no tab jump (see
+        _add_target_to_plan_direct)."""
+        tab_outer = ttk.Frame(self.tab_plan)
+        tab_outer.pack(fill="both", expand=True)
+
+        # ── Full-width collapsible schedule-timeline strip ─────────────────
+        # Packed BEFORE `split` below, and to the bottom, so it reserves its
+        # own height first — the same pack-order lesson as the plan card
+        # list's scrollbar (see the comment further down): the sibling
+        # packed first with expand=True would otherwise claim the entire
+        # cavity and leave nothing for this strip.
+        self._gantt_strip = tk.Frame(tab_outer, bg="#050810", highlightthickness=1,
+                                      highlightbackground="#2e4a63")
+
+        gantt_header = tk.Frame(self._gantt_strip, bg="#050810")
+        gantt_header.pack(fill="x", padx=12, pady=(6, 2))
+        tk.Label(gantt_header, text="SCHEDULE TIMELINE", bg="#050810", fg="#7eb8d4",
+                 font=("Helvetica", 9, "bold")).pack(side="left")
+        tk.Label(gantt_header, text="·  drag a bar to set its start time",
+                 bg="#050810", fg="#556677", font=("Helvetica", 9)).pack(side="left", padx=(6, 0))
+        self._gantt_collapse_btn = tk.Label(gantt_header, text="⌄ collapse", bg="#050810",
+                 fg="#38bdf8", font=("Helvetica", 9, "underline"), cursor="hand2")
+        self._gantt_collapse_btn.pack(side="right")
+        self._gantt_collapse_btn.bind("<Button-1>", lambda e: self._toggle_gantt_strip())
+
+        self._gantt_body = tk.Frame(self._gantt_strip, bg="#050810")
+        self._gantt_body.pack(fill="x")
+        self._gantt_collapsed = False
+
+        self.queue_gantt = tk.Canvas(self._gantt_body, height=190, bg="#050810",
+                                     highlightthickness=0)
+        self.queue_gantt.pack(fill="x", padx=12, pady=(0, 2))
+        self._gantt_note_lbl = ttk.Label(self._gantt_body, text="",
                                          font=("Helvetica", 9, "italic"), foreground="#cc8800")
-        self._gantt_note_lbl.pack(anchor="w", padx=8, pady=(0, 4))
+        self._gantt_note_lbl.pack(anchor="w", padx=12, pady=(0, 8))
 
         self.queue_gantt.bind("<ButtonPress-1>",   self._gantt_press)
         self.queue_gantt.bind("<B1-Motion>",       self._gantt_drag)
@@ -3380,32 +4948,39 @@ class AstroApp:
         self.queue_gantt.bind("<Configure>",       lambda e: self._draw_queue_gantt())
         self.queue_gantt.bind("<Map>",             lambda e: self.root.after(20, self._draw_queue_gantt))
 
-        # Wheel-scroll the whole tab as one page, but leave the inner queue-card
-        # list to its own wheel scroll (drag the gantt bars still works — that's
-        # Button-1, not the wheel).
-        self._bind_session_mousewheel(self._session_canvas)
-        self._bind_session_mousewheel_recursive(
-            outer, exclude=(self._queue_cards_canvas,))
-        self._session_canvas.after_idle(lambda: self._session_canvas.configure(
-            scrollregion=self._session_canvas.bbox("all")))
+        self._gantt_strip.pack(side="bottom", fill="x")
 
-    def setup_plan_tab(self):
-        """Build the Tonight's Plan tab — the final output of the planning workflow."""
-        outer = ttk.Frame(self.tab_plan)
-        outer.pack(fill="both", expand=True, padx=20, pady=10)
+        split = ttk.Frame(tab_outer)
+        split.pack(side="top", fill="both", expand=True)
+        self._plan_split = split   # equipment drawer (Phase 3) overlays this
+
+        leftpane = ttk.Frame(split)
+        leftpane.pack(side="left", fill="both", expand=True, padx=(20, 10), pady=10)
+        self._build_plan_left_pane(leftpane)
+
+        rightpane = ttk.Frame(split, width=380)
+        rightpane.pack(side="left", fill="y", padx=(0, 20), pady=10)
+        rightpane.pack_propagate(False)
+
+        outer = rightpane   # rightpane is already packed above; everything
+                             # below just parents its widgets to it, same as
+                             # the original single-column layout did to
+                             # the old top-level `outer` frame.
 
         # Empty-state message (shown when no entries)
         self._plan_empty_label = ttk.Label(outer,
             text="No targets in tonight's plan yet.\n\n"
-                 "Add targets from the Targets List using\n"
-                 "\"▶ Add to Tonight's Plan\" or \"▶▶ Add All\".",
+                 "Add targets from the grid on the left using\n"
+                 "\"+ Add to Tonight\", or frame one first.",
             font=("Helvetica", 12), foreground="#556677", justify="center")
         self._plan_empty_label.pack(pady=(60, 0))
 
-        # Scrollable card container (replaces ttk.Treeview)
+        # Scrollable card container (replaces ttk.Treeview). NOT packed here
+        # — see the bottom-anchored action cluster comment further down,
+        # where this is packed last, deliberately, alongside totals_frame/
+        # reorder_frame/icon_row.
         tree_frame = ttk.Frame(outer)
         self._plan_tree_frame = tree_frame
-        tree_frame.pack(fill="both", expand=True)
 
         self._plan_cards_canvas = tk.Canvas(tree_frame, height=300, bg="#0e1a28",
                                              highlightthickness=0)
@@ -3420,8 +4995,16 @@ class AstroApp:
         self._plan_cards_canvas.bind("<Configure>",
             lambda e: self._plan_cards_canvas.itemconfig("inner", width=e.width))
         self._plan_cards_canvas.configure(yscrollcommand=self._plan_cards_scrollbar.set)
-        self._plan_cards_canvas.pack(side="left", fill="both", expand=True)
+        # Pack the scrollbar BEFORE the canvas.  With side="left"/expand=True
+        # packed first, Tk's packer greedily hands the expanding canvas the
+        # *entire* cavity and only then tries to fit the scrollbar into
+        # whatever's left — squeezing it down to ~1px instead of its real
+        # ~15px, and (worse) leaving the canvas a few px wider than it should
+        # be, which is what let card content spill past the rail's edge.
+        # Packing the non-expanding scrollbar first reserves its natural
+        # width up front, so the canvas correctly gets the remainder.
         self._plan_cards_scrollbar.pack(side="right", fill="y")
+        self._plan_cards_canvas.pack(side="left", fill="both", expand=True)
 
         # Mousewheel scrolling — bind on the canvas AND the embedded inner
         # frame.  Card widgets created later in _refresh_plan_view get the
@@ -3434,13 +5017,14 @@ class AstroApp:
         # Card selection state
         self._plan_card_selected = None
         self._plan_card_widgets = []
+        self._plan_drag = None
 
         # Keep plan_tree as dummy for hasattr checks
         self.plan_tree = None
 
-        # Totals row
+        # Totals row (not packed yet — see the bottom-anchored action
+        # cluster comment below)
         totals_frame = ttk.Frame(outer)
-        totals_frame.pack(fill="x", pady=(4, 4))
         self._plan_total_alloc_var = tk.StringVar(value="")
         self._plan_total_int_var   = tk.StringVar(value="")
         self._plan_total_subs_var  = tk.StringVar(value="")
@@ -3449,34 +5033,102 @@ class AstroApp:
         ttk.Label(totals_frame, textvariable=self._plan_total_int_var,   font=("Helvetica", 11)).pack(side="left", padx=(0, 14))
         ttk.Label(totals_frame, textvariable=self._plan_total_subs_var,  font=("Helvetica", 11)).pack(side="left")
 
-        # Action buttons
-        btn_frame = ttk.Frame(outer)
-        btn_frame.pack(fill="x", pady=(4, 0))
-        remove_btn = ttk.Button(btn_frame, text="🗑 Remove Selected",
-                                command=self._remove_from_plan)
-        remove_btn.pack(side="left", padx=(0, 6))
-        ToolTip(remove_btn, "Remove the selected entry from\ntonight's plan.")
-        clear_btn = ttk.Button(btn_frame, text="✕ Clear All",
-                               command=self._clear_plan)
-        clear_btn.pack(side="left", padx=(0, 20))
-        ToolTip(clear_btn, "Remove all entries from\ntonight's plan.")
-        save_btn = ttk.Button(btn_frame, text="💾 Save Session",
-                              command=self._save_session_as)
-        save_btn.pack(side="left", padx=(0, 6))
-        ToolTip(save_btn, "Save tonight's plan to a named\n.json file for future reference.")
-        load_btn = ttk.Button(btn_frame, text="📂 Load Session",
-                              command=self._load_session)
-        load_btn.pack(side="left", padx=(0, 20))
-        ToolTip(load_btn, "Load a previously saved session\ninto tonight's plan.")
-        export_btn = ttk.Button(btn_frame, text="📄 Export Session",
-                                command=self._export_session)
-        export_btn.pack(side="left", padx=(0, 6))
-        ToolTip(export_btn, "Save tonight's plan as a text or HTML report.\nThe HTML report embeds a per-target altitude chart;\nchoose the format in the Save dialog's file-type list.\nPrint the HTML to PDF from your browser if needed.")
-        nina_btn = ttk.Button(btn_frame, text="🔭 Export as NINA",
-                              command=self._export_nina)
-        nina_btn.pack(side="left")
-        ToolTip(nina_btn, "Export tonight's plan as a NINA target set\n(.ninaTargetSet) for import into N.I.N.A.\nEach target becomes a CaptureSequenceList\nwith its sub-exposure and sub-count filled in.")
+        # Reorder controls — act on the selected card above, mirroring the
+        # retired queue's Move Up/Down + Order by Transit.
+        reorder_frame = ttk.Frame(outer)  # not packed yet — see below
+        up_btn = ttk.Button(reorder_frame, text="↑", width=3, command=self._plan_move_up)
+        up_btn.pack(side="left", padx=(0, 4))
+        ToolTip(up_btn, "Move the selected plan entry\nearlier in the list.")
+        down_btn = ttk.Button(reorder_frame, text="↓", width=3, command=self._plan_move_down)
+        down_btn.pack(side="left", padx=(0, 10))
+        ToolTip(down_btn, "Move the selected plan entry\nlater in the list.")
+        order_btn = ttk.Button(reorder_frame, text="★ Order by Transit",
+                               command=self._plan_suggest_order)
+        order_btn.pack(side="left")
+        ToolTip(order_btn, "Sort tonight's plan by each\ntarget's meridian transit time.")
 
+        # No standalone Remove control here anymore — each card now carries
+        # its own 🗑 icon (see _refresh_plan_tree), which covers removal
+        # without needing a card selected first, so a second copy of the
+        # same action on this row was redundant.
+
+        # Action buttons — an icon-only toolbar instead of six labeled
+        # buttons. This pane is a fixed 380px rail (it used to be Tonight's
+        # Plan's whole tab, with the full window width to work with); six
+        # full-width buttons either got clipped or, once split across rows
+        # to avoid that, looked crowded. Icons + hover tooltips cover the
+        # same six actions (Remove is now above, on the reorder row) in a
+        # single tidy row.
+        icon_row = ttk.Frame(outer)  # not packed yet — see below
+        self._make_icon_button(icon_row, "✕", self._clear_plan,
+            "Remove all entries from\ntonight's plan.")
+        ttk.Separator(icon_row, orient="vertical").pack(side="left", fill="y", padx=4)
+        self._make_icon_button(icon_row, "💾", self._save_session_as,
+            "Save tonight's plan to a named\n.json file for future reference.")
+        self._make_icon_button(icon_row, "📂", self._load_session,
+            "Load a previously saved session\ninto tonight's plan.")
+        ttk.Separator(icon_row, orient="vertical").pack(side="left", fill="y", padx=4)
+        self._make_icon_button(icon_row, "📄", self._export_session,
+            "Save tonight's plan as a text or HTML report.\nThe HTML report embeds a per-target altitude chart;\nchoose the format in the Save dialog's file-type list.\nPrint the HTML to PDF from your browser if needed.")
+        self._make_icon_button(icon_row, "🔭", self._export_nina,
+            "Export tonight's plan as a NINA target set\n(.ninaTargetSet) for import into N.I.N.A.\nEach target becomes a CaptureSequenceList\nwith its sub-exposure and sub-count filled in.")
+
+        # ── Bottom-anchored action cluster + expanding card list ───────────
+        # Packed here, as one block, now that every widget above exists —
+        # and in this specific side/order combination, so the always-needed
+        # action rows (totals, reorder, icon toolbar) reserve their natural
+        # height FIRST, no matter how little vertical room `outer` actually
+        # has. Tk's packer carves cavity strictly in packing-call order, so
+        # a side="top" tree_frame packed EARLY (as this used to do) claims
+        # its own natural size but leaves whatever's left over for whoever
+        # comes next; when the plan is empty, the empty-state label's extra
+        # ~110px was enough to starve totals_frame/reorder_frame/icon_row
+        # down to a sliver (icon_row measured a literal 1x1 px parcel —
+        # Jerry: "the buttons shrink to about 1/4 of their height and you
+        # can't see the text or icons on them"). Packing these three with
+        # side="bottom", in REVERSE visual order (icon_row first so it lands
+        # flush at the very bottom, then reorder_frame just above it, then
+        # totals_frame above that), reserves their combined height up front;
+        # tree_frame (side="top", fill="both", expand=True), packed LAST,
+        # then simply takes whatever vertical space remains above them —
+        # shrinking gracefully (it already scrolls) instead of the reverse.
+        icon_row.pack(side="bottom", fill="x", pady=(4, 4))
+        reorder_frame.pack(side="bottom", fill="x", pady=(0, 4))
+        totals_frame.pack(side="bottom", fill="x", pady=(4, 4))
+        tree_frame.pack(fill="both", expand=True)
+
+    def _make_icon_button(self, parent, icon, command, tooltip_text,
+                          base_fg="#7eb8d4", hover_fg="#ffffff"):
+        """Build one icon-only "button" (a plain Label with a click binding
+        and a hover brighten) for the Plan tab's action toolbar and similar
+        icon rows. Returns the Label so callers can restyle it further if
+        needed."""
+        bg = ttk.Style().lookup("TFrame", "background") or "#1e2d3e"
+        lbl = tk.Label(parent, text=icon, bg=bg, fg=base_fg,
+                      font=("Helvetica", 13), cursor="hand2", padx=7, pady=3)
+        lbl.pack(side="left", padx=(0, 2))
+        lbl.bind("<Button-1>", lambda e: command())
+        lbl.bind("<Enter>", lambda e: lbl.config(fg=hover_fg))
+        lbl.bind("<Leave>", lambda e: lbl.config(fg=base_fg))
+        ToolTip(lbl, tooltip_text)
+        return lbl
+
+    def _toggle_gantt_strip(self):
+        """Collapse/expand the full-width schedule-timeline strip.
+
+        Collapsing hides _gantt_body (canvas + note label) but leaves the
+        header (with the collapse/expand toggle) visible. _draw_queue_gantt
+        already bails out early via winfo_ismapped() when collapsed, so no
+        further guard is needed here.
+        """
+        self._gantt_collapsed = not self._gantt_collapsed
+        if self._gantt_collapsed:
+            self._gantt_body.pack_forget()
+            self._gantt_collapse_btn.config(text="⌃ expand")
+        else:
+            self._gantt_body.pack(fill="x")
+            self._gantt_collapse_btn.config(text="⌄ collapse")
+            self.root.after(20, self._draw_queue_gantt)
 
     def _bind_plan_mousewheel(self, widget):
         """Bind mousewheel / Linux scroll-button events on a widget so the
@@ -3516,11 +5168,10 @@ class AstroApp:
         for child in widget.winfo_children():
             self._bind_plan_mousewheel_recursive(child)
 
-    def _bind_queue_mousewheel(self, widget):
-        """Bind mousewheel / Linux scroll-button events on a widget so the
-        wheel scrolls the queue card list on the Targets List tab.  Mirrors
-        _bind_plan_mousewheel — see that method for the macOS delta quirk
-        explanation."""
+    def _bind_equip_mousewheel(self, widget):
+        """Bind mousewheel / Linux scroll events so the wheel scrolls the
+        Manage Equipment tab.  Mirrors _bind_settings_mousewheel (see it for
+        the macOS delta quirk)."""
         def _on_wheel(e):
             if abs(e.delta) >= 120:
                 steps = int(-1 * (e.delta / 120))
@@ -3529,23 +5180,22 @@ class AstroApp:
             else:
                 steps = 0
             if steps:
-                self._queue_cards_canvas.yview_scroll(steps, "units")
+                self._equip_canvas.yview_scroll(steps, "units")
         widget.bind("<MouseWheel>", _on_wheel)
         widget.bind("<Button-4>",
-            lambda e: self._queue_cards_canvas.yview_scroll(-1, "units"))
+            lambda e: self._equip_canvas.yview_scroll(-1, "units"))
         widget.bind("<Button-5>",
-            lambda e: self._queue_cards_canvas.yview_scroll(1, "units"))
+            lambda e: self._equip_canvas.yview_scroll(1, "units"))
 
-    def _bind_queue_mousewheel_recursive(self, widget):
-        """Recursively apply _bind_queue_mousewheel to a widget and all of
-        its descendants."""
-        self._bind_queue_mousewheel(widget)
+    def _bind_equip_mousewheel_recursive(self, widget):
+        """Recursively bind equip wheel-scroll on a widget and descendants."""
+        self._bind_equip_mousewheel(widget)
         for child in widget.winfo_children():
-            self._bind_queue_mousewheel_recursive(child)
+            self._bind_equip_mousewheel_recursive(child)
 
     def _bind_settings_mousewheel(self, widget):
         """Bind mousewheel / Linux scroll events so the wheel scrolls the
-        Settings panel.  Mirrors _bind_queue_mousewheel (see it for the
+        Settings panel.  Mirrors _bind_plan_mousewheel (see it for the
         macOS delta quirk)."""
         def _on_wheel(e):
             if abs(e.delta) >= 120:
@@ -3567,34 +5217,6 @@ class AstroApp:
         self._bind_settings_mousewheel(widget)
         for child in widget.winfo_children():
             self._bind_settings_mousewheel_recursive(child)
-
-    def _bind_session_mousewheel(self, widget):
-        """Bind mousewheel / Linux scroll so the wheel scrolls the Targets List
-        tab.  Mirrors _bind_queue_mousewheel."""
-        def _on_wheel(e):
-            if abs(e.delta) >= 120:
-                steps = int(-1 * (e.delta / 120))
-            elif e.delta:
-                steps = -1 if e.delta > 0 else 1
-            else:
-                steps = 0
-            if steps:
-                self._session_canvas.yview_scroll(steps, "units")
-        widget.bind("<MouseWheel>", _on_wheel)
-        widget.bind("<Button-4>",
-            lambda e: self._session_canvas.yview_scroll(-1, "units"))
-        widget.bind("<Button-5>",
-            lambda e: self._session_canvas.yview_scroll(1, "units"))
-
-    def _bind_session_mousewheel_recursive(self, widget, exclude=()):
-        """Recursively bind session wheel-scroll, skipping any widget (and its
-        subtree) in `exclude` so the inner queue list keeps its own scroll."""
-        if widget in exclude:
-            return
-        self._bind_session_mousewheel(widget)
-        for child in widget.winfo_children():
-            self._bind_session_mousewheel_recursive(child, exclude)
-
 
     def setup_settings_tab(self):
         """Build the Settings panel — observer location, analysis preferences, data management."""
@@ -4400,6 +6022,23 @@ class AstroApp:
     # TONIGHT'S PLAN — card rendering, selection, totals
     # ═══════════════════════════════════════════════════════════════════
 
+    def _get_rig_accent_color(self, scope, camera):
+        """Return a stable accent color for a scope+camera pairing.
+
+        Colors are handed out from RIG_ACCENT_COLORS in first-seen order and
+        cached on self._rig_color_map for the rest of the session, so a
+        rig's card color never shifts just because the plan list was
+        reordered, refreshed, or had entries added/removed.
+        """
+        if not hasattr(self, "_rig_color_map"):
+            self._rig_color_map = {}
+        key = (scope or "", camera or "")
+        color = self._rig_color_map.get(key)
+        if color is None:
+            color = RIG_ACCENT_COLORS[len(self._rig_color_map) % len(RIG_ACCENT_COLORS)]
+            self._rig_color_map[key] = color
+        return color
+
     def _refresh_plan_tree(self):
         """Repopulate the plan cards and update totals.
 
@@ -4430,7 +6069,11 @@ class AstroApp:
 
         for e in self._plan_entries:
             base_str = e.get("start_time") or e.get("win_start") or ""
-            group_key = (e["target_id"], e.get("scope", ""))
+            # Camera is part of the group key too — the same target/scope
+            # can carry two independent rigs (e.g. one camera on LRGB,
+            # another on SHO through the same telescope), and each rig's
+            # filters should get their own running offset, not share one.
+            group_key = (e["target_id"], e.get("scope", ""), e.get("camera", ""))
 
             if group_key != prev_group_key:
                 running_offset_h = 0.0
@@ -4506,14 +6149,42 @@ class AstroApp:
             # Default gray
             return ("#222830", "#aabbcc")
 
+        # Equipment-line text wraps instead of overflowing the card: a long
+        # scope + camera name pair (e.g. "Radian Telescopes Raptor 61 f/5.6
+        # · ZWO ASI2600MM Pro") is easily wider than the whole plan rail on
+        # its own, and unlike the metrics grid this is a single Label, so a
+        # wraplength is all it takes.  380 = rightpane's fixed width; the
+        # rest backs out the scrollbar (15) and the card/content chrome
+        # (2px card padx *2, 3px accent bar, 8+10px content padx).
+        equip_wraplen = 380 - 15 - 4 - 3 - 18
+
         for i, (e, start_str) in enumerate(zip(self._plan_entries, display_starts)):
             is_selected = (i == old_sel)
             border_col = "#38bdf8" if is_selected else "#1e2d3e"
-            accent_col = "#38bdf8" if is_selected else "#2e4a63"
+            # Accent bar identifies the target's rig (scope+camera) instead
+            # of selection now — selection is shown by the card border above
+            # (already a distinct blue highlight), so the two signals don't
+            # compete for the same bar.
+            accent_col = self._get_rig_accent_color(e.get("scope", ""), e.get("camera", ""))
 
             card = tk.Frame(self._plan_cards_inner, bg="#131f2e",
                             highlightthickness=1, highlightbackground=border_col)
             card.pack(fill="x", padx=2, pady=2)
+
+            # Drag handle — its own child widget, same principle as the 🗑
+            # icon below: Tk delivers a click to whichever widget is
+            # directly under the cursor, so grabbing here never fires the
+            # card's click-to-select / double-click-to-open bindings, and
+            # dragging from anywhere else on the card still does nothing.
+            grip = tk.Label(card, text="⠿", bg="#131f2e", fg="#3a4a5c",
+                            font=("Helvetica", 11), cursor="fleur", width=2)
+            grip.pack(side="left", fill="y")
+            grip.bind("<Enter>", lambda e, w=grip: w.config(fg="#38bdf8", bg="#182636"))
+            grip.bind("<Leave>", lambda e, w=grip: w.config(fg="#3a4a5c", bg="#131f2e"))
+            grip.bind("<ButtonPress-1>", lambda e, ii=i: self._plan_drag_start(ii, e))
+            grip.bind("<B1-Motion>", self._plan_drag_motion)
+            grip.bind("<ButtonRelease-1>", self._plan_drag_end)
+            ToolTip(grip, "Drag to reorder.")
 
             # Left accent
             tk.Frame(card, bg=accent_col, width=3).pack(side="left", fill="y")
@@ -4521,8 +6192,18 @@ class AstroApp:
             content = tk.Frame(card, bg="#131f2e")
             content.pack(side="left", fill="both", expand=True, padx=(8, 10), pady=5)
 
+            # Two lines instead of one — the name/filter/equipment (left)
+            # and the metrics grid (right) used to share a single row and
+            # would get squeezed or clipped once both sides' natural width
+            # exceeded the rightpane's fixed ~380px. Metrics now get their
+            # own full-width row below the name instead, indented to align
+            # under it (26px circle + 8px gap) rather than pinned to the
+            # right edge, so there's room to spread across the card's full
+            # width without competing against the name/common/filter text.
             row = tk.Frame(content, bg="#131f2e")
             row.pack(fill="x")
+            metrics_row = tk.Frame(content, bg="#131f2e")
+            metrics_row.pack(fill="x", pady=(4, 0))
 
             # Number circle
             circle_bg = "#38bdf8" if is_selected else "#2e4a63"
@@ -4532,6 +6213,23 @@ class AstroApp:
             num_cv.create_oval(1, 1, 25, 25, fill=circle_bg, outline="")
             num_cv.create_text(13, 13, text=str(i + 1), fill=circle_fg,
                                font=("Helvetica", 10, "bold"))
+
+            # Per-card remove icon — top-right corner of the card's name
+            # row. Deliberately NOT passed to _bind_all()/_bind_plan_
+            # mousewheel below with the select/open handlers: it's a
+            # distinct child widget, so a click on it goes to this Label
+            # alone and never reaches the card's own click bindings (Tk
+            # dispatches a click to whichever widget is directly under the
+            # cursor — it does not also fire a parent's binding). That's
+            # what lets "click the card opens details, click the icon
+            # removes it" coexist with no extra plumbing.
+            remove_icon = tk.Label(row, text="🗑", bg="#131f2e", fg="#3a4a5c",
+                                   font=("Helvetica", 10), cursor="hand2", padx=4)
+            remove_icon.pack(side="right", anchor="n", padx=(4, 0))
+            remove_icon.bind("<Button-1>", lambda e, ii=i: self._plan_card_remove_click(ii))
+            remove_icon.bind("<Enter>", lambda e, w=remove_icon: w.config(fg="#ff6b66"))
+            remove_icon.bind("<Leave>", lambda e, w=remove_icon: w.config(fg="#3a4a5c"))
+            ToolTip(remove_icon, "Remove this target from\ntonight's plan.")
 
             # Target + filter + equipment
             info = tk.Frame(row, bg="#131f2e")
@@ -4556,44 +6254,52 @@ class AstroApp:
             equip_parts = [p for p in [e.get("scope", ""), e.get("camera", "")] if p]
             if equip_parts:
                 tk.Label(info, text="  ·  ".join(equip_parts), bg="#131f2e",
-                         fg="#445566", font=("Helvetica", 9)).pack(anchor="w")
+                         fg="#445566", font=("Helvetica", 9), justify="left",
+                         wraplength=equip_wraplen).pack(anchor="w", fill="x")
 
-            # Right-side metrics
-            metrics = tk.Frame(row, bg="#131f2e")
-            metrics.pack(side="right")
+            # Metrics — own row below the name, indented slightly rather
+            # than pinned right.  Kept close to the left edge (not aligned
+            # under the full circle+gap) and with tighter inter-column
+            # gaps than the old single-row layout so the widest realistic
+            # card (long common name + narrowband filter badge + long
+            # scope/camera names on line 1; six-column metrics on line 2)
+            # still fits inside the plan rail's ~380px fixed width even
+            # after the vertical scrollbar takes its share.
+            metrics = tk.Frame(metrics_row, bg="#131f2e")
+            metrics.pack(side="left", padx=(18, 0))
 
             # Window
             win_str = f"{e['win_start']}–{e['win_end']}" if e.get("win_start") else "—"
             _alloc = e.get("allocated_hrs", 0)
             win_col = "#4caf50" if _alloc >= 2 else ("#f59e0b" if _alloc >= 0.5 else "#556677")
             tk.Label(metrics, text=win_str, bg="#131f2e", fg=win_col,
-                     font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=(0, 12))
+                     font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=(0, 9))
             tk.Label(metrics, text="window", bg="#131f2e", fg="#445566",
-                     font=("Helvetica", 8)).grid(row=1, column=0, padx=(0, 12))
+                     font=("Helvetica", 8)).grid(row=1, column=0, padx=(0, 9))
 
             # Start
             tk.Label(metrics, text=start_str, bg="#131f2e", fg="#ffffff",
-                     font=("Helvetica", 10)).grid(row=0, column=1, padx=(0, 10))
+                     font=("Helvetica", 10)).grid(row=0, column=1, padx=(0, 8))
             tk.Label(metrics, text="start", bg="#131f2e", fg="#445566",
-                     font=("Helvetica", 8)).grid(row=1, column=1, padx=(0, 10))
+                     font=("Helvetica", 8)).grid(row=1, column=1, padx=(0, 8))
 
             # Sub-exp
             tk.Label(metrics, text=f"{e['exp_s']}s", bg="#131f2e", fg="#f59e0b",
-                     font=("Helvetica", 10)).grid(row=0, column=2, padx=(0, 10))
+                     font=("Helvetica", 10)).grid(row=0, column=2, padx=(0, 8))
             tk.Label(metrics, text="sub", bg="#131f2e", fg="#445566",
-                     font=("Helvetica", 8)).grid(row=1, column=2, padx=(0, 10))
+                     font=("Helvetica", 8)).grid(row=1, column=2, padx=(0, 8))
 
             # Alloc
             tk.Label(metrics, text=f"{e['allocated_hrs']}h", bg="#131f2e", fg="#ffffff",
-                     font=("Helvetica", 10), width=4).grid(row=0, column=3, padx=(0, 8))
+                     font=("Helvetica", 10), width=4).grid(row=0, column=3, padx=(0, 6))
             tk.Label(metrics, text="alloc", bg="#131f2e", fg="#445566",
-                     font=("Helvetica", 8)).grid(row=1, column=3, padx=(0, 8))
+                     font=("Helvetica", 8)).grid(row=1, column=3, padx=(0, 6))
 
             # Subs
             tk.Label(metrics, text=str(e["n_subs"]), bg="#131f2e", fg="#ffffff",
-                     font=("Helvetica", 10), width=3).grid(row=0, column=4, padx=(0, 8))
+                     font=("Helvetica", 10), width=3).grid(row=0, column=4, padx=(0, 6))
             tk.Label(metrics, text="subs", bg="#131f2e", fg="#445566",
-                     font=("Helvetica", 8)).grid(row=1, column=4, padx=(0, 8))
+                     font=("Helvetica", 8)).grid(row=1, column=4, padx=(0, 6))
 
             # Integration time
             tk.Label(metrics, text=f"{e['total_int_hrs']:.2f}h", bg="#131f2e", fg="#38bdf8",
@@ -4610,6 +6316,7 @@ class AstroApp:
             _bind_all(card)
             _bind_all(content)
             _bind_all(row)
+            _bind_all(metrics_row)
             _bind_all(info)
             _bind_all(name_row)
             _bind_all(metrics)
@@ -4647,6 +6354,29 @@ class AstroApp:
         self._plan_card_update_highlight(old)
         self._plan_card_update_highlight(idx)
 
+    def _plan_card_remove_click(self, idx):
+        """Remove one specific card via its own corner icon, regardless of
+        whether that card happens to be the currently selected one — this
+        is now the only removal path (the old Remove Selected button and
+        its reorder-row icon were retired once every card got its own)."""
+        if idx is None or idx < 0 or idx >= len(self._plan_entries):
+            return
+        sel = self._plan_card_selected
+        removed_id = self._plan_entries[idx]["target_id"]
+        del self._plan_entries[idx]
+        if sel is not None:
+            if sel == idx:
+                self._plan_card_selected = (min(idx, len(self._plan_entries) - 1)
+                                            if self._plan_entries else None)
+            elif sel > idx:
+                self._plan_card_selected = sel - 1
+        self._refresh_plan_tree()
+        # Drop the browsing-grid pin too (if this was its last plan entry),
+        # and re-scan so a now-unpinned target that no longer matches the
+        # active filters disappears immediately instead of lingering.
+        self._unmark_grid_touched_if_unplanned(removed_id)
+        self._refresh_visible_grid()
+
     def _plan_card_dblclick(self, idx):
         """Double-click on a plan card — select and open edit dialog."""
         self._plan_card_click(idx)
@@ -4659,15 +6389,21 @@ class AstroApp:
         card = self._plan_card_widgets[idx]
         is_selected = (idx == self._plan_card_selected)
         border_col = "#38bdf8" if is_selected else "#1e2d3e"
-        accent_col = "#38bdf8" if is_selected else "#2e4a63"
         circle_bg = "#38bdf8" if is_selected else "#2e4a63"
         circle_fg = "#0e1a28" if is_selected else "#aaddff"
         try:
             card.configure(highlightbackground=border_col)
+            # Note: the accent bar (children[0]) is intentionally left
+            # untouched here — it always shows the card's rig color now,
+            # not selection state, so selection is signaled by the border
+            # (above) and the number circle (below) only.
             children = card.winfo_children()
-            if children:
-                children[0].configure(bg=accent_col)
-            content = children[1] if len(children) > 1 else None
+            # Content is always the LAST child, regardless of how many
+            # fixed-width strips (grip, accent bar) precede it — it's the
+            # only child packed with expand=True, so it settles wherever
+            # the others leave it, but it's created last and Tk's
+            # winfo_children() preserves creation order.
+            content = children[-1] if children else None
             if content:
                 top_row = content.winfo_children()[0] if content.winfo_children() else None
                 if top_row:
@@ -4697,28 +6433,158 @@ class AstroApp:
         self._plan_total_int_var.set(  f"Integration: {total_int:.2f}h")
         self._plan_total_subs_var.set( f"Total subs: {total_subs}")
 
-    def _remove_from_plan(self):
-        """Remove the selected card from tonight's plan."""
-        idx = self._plan_card_selected
-        if idx is None or idx < 0 or idx >= len(self._plan_entries):
-            return
-        del self._plan_entries[idx]
-        # Adjust selection
-        if self._plan_entries:
-            self._plan_card_selected = min(idx, len(self._plan_entries) - 1)
-        else:
-            self._plan_card_selected = None
-        self._refresh_plan_tree()
-
     def _clear_plan(self):
         """Clear all entries from tonight's plan after confirmation."""
         if not self._plan_entries:
             return
         if messagebox.askyesno("Clear Plan",
                 "Remove all entries from tonight's plan?"):
+            removed_ids = {e["target_id"] for e in self._plan_entries}
             self._plan_entries.clear()
             self._plan_card_selected = None
             self._refresh_plan_tree()
+            # Same browsing-grid pin cleanup as removing a single card (see
+            # _plan_card_remove_click) — every entry is gone now, so this
+            # drops the pin unconditionally rather than re-checking
+            # membership for each one.
+            for tid in removed_ids:
+                if hasattr(self, "_grid_touched"):
+                    self._grid_touched.pop(tid, None)
+            self._refresh_visible_grid()
+
+    def _plan_drag_start(self, idx, event):
+        """Begin a drag-to-reorder gesture, started from a card's grip
+        handle (see _refresh_plan_tree). Deliberately does NOT touch
+        self._plan_entries or trigger a redraw until the button is
+        released — _refresh_plan_tree() destroys and rebuilds every card
+        from scratch, and doing that mid-drag would destroy the very
+        widget that currently holds the mouse grab, aborting the drag."""
+        if idx is None or idx >= len(self._plan_card_widgets):
+            return
+        card = self._plan_card_widgets[idx]
+        self._plan_drag = {"idx": idx, "target_idx": idx}
+        try:
+            card.configure(highlightbackground="#38bdf8", highlightthickness=2)
+            card.lift()
+        except Exception:
+            pass
+        # Drop-line indicator — a thin bar showing where the card would
+        # land if released now. It lives in the same frame as the cards,
+        # so the next _refresh_plan_tree() sweeps it away for free.
+        self._plan_drag_line = tk.Frame(self._plan_cards_inner, bg="#38bdf8", height=3)
+        self._plan_drag_place_line(idx)
+
+    def _plan_drag_place_line(self, target):
+        """Pack the drop-line indicator at the gap `target` refers to,
+        where `target` is an index into the plan list with the dragged
+        entry already removed (0 = before everything else, len(others) =
+        after everything else)."""
+        drag = self._plan_drag
+        if not drag or not hasattr(self, "_plan_drag_line"):
+            return
+        others = [w for j, w in enumerate(self._plan_card_widgets) if j != drag["idx"]]
+        line = self._plan_drag_line
+        line.pack_forget()
+        if target >= len(others):
+            line.pack(fill="x", padx=6, pady=1)
+        else:
+            line.pack(fill="x", padx=6, pady=1, before=others[target])
+
+    def _plan_drag_motion(self, event):
+        """Track the pointer during a drag and move the drop-line to
+        whichever gap between cards it's currently hovering over. Only
+        the indicator moves — the cards themselves stay put (and
+        un-rebuilt) until the button is released."""
+        drag = self._plan_drag
+        if not drag:
+            return
+        y = event.y_root
+        target = 0
+        for j, w in enumerate(self._plan_card_widgets):
+            if j == drag["idx"]:
+                continue
+            try:
+                mid = w.winfo_rooty() + w.winfo_height() / 2
+            except Exception:
+                continue
+            if y > mid:
+                target += 1
+        if target != drag["target_idx"]:
+            drag["target_idx"] = target
+            self._plan_drag_place_line(target)
+
+    def _plan_drag_end(self, event):
+        """Finish a drag gesture: commit the reorder (if the drop
+        position differs from where the drag started) and redraw."""
+        drag = self._plan_drag
+        self._plan_drag = None
+        if not drag:
+            return
+        if hasattr(self, "_plan_drag_line"):
+            try:
+                self._plan_drag_line.destroy()
+            except Exception:
+                pass
+            del self._plan_drag_line
+        idx, target = drag["idx"], drag["target_idx"]
+        if target != idx and 0 <= idx < len(self._plan_entries):
+            entry = self._plan_entries.pop(idx)
+            self._plan_entries.insert(target, entry)
+            self._plan_card_selected = target
+        self._refresh_plan_tree()
+
+    def _plan_move_up(self):
+        """Move the selected plan entry one position earlier in the list."""
+        idx = self._plan_card_selected
+        if idx is None or idx <= 0 or idx >= len(self._plan_entries):
+            return
+        self._plan_entries[idx - 1], self._plan_entries[idx] = (
+            self._plan_entries[idx], self._plan_entries[idx - 1])
+        self._plan_card_selected = idx - 1
+        self._refresh_plan_tree()
+
+    def _plan_move_down(self):
+        """Move the selected plan entry one position later in the list."""
+        idx = self._plan_card_selected
+        if idx is None or idx < 0 or idx >= len(self._plan_entries) - 1:
+            return
+        self._plan_entries[idx + 1], self._plan_entries[idx] = (
+            self._plan_entries[idx], self._plan_entries[idx + 1])
+        self._plan_card_selected = idx + 1
+        self._refresh_plan_tree()
+
+    def _plan_suggest_order(self):
+        """Sort tonight's plan by each target's meridian transit time.
+
+        Plan entries don't store transit_time (only the retired queue
+        entries did), so it's computed here on the fly via
+        _calc_transit_time — same helper the Gantt strip's transit tick
+        uses.
+        """
+        if len(self._plan_entries) < 2:
+            return
+        lat, lon = self._get_saved_location()
+        if lon is None:
+            messagebox.showwarning("No Location",
+                "Save a location before sorting by transit time.")
+            return
+
+        def _transit_h(e):
+            try:
+                return self._parse_h(_calc_transit_time(e["ra_deg"], lon)) or 99.0
+            except Exception:
+                return 99.0
+
+        sel_id = None
+        if self._plan_card_selected is not None and 0 <= self._plan_card_selected < len(self._plan_entries):
+            sel_id = id(self._plan_entries[self._plan_card_selected])
+        self._plan_entries.sort(key=_transit_h)
+        if sel_id is not None:
+            for i, e in enumerate(self._plan_entries):
+                if id(e) == sel_id:
+                    self._plan_card_selected = i
+                    break
+        self._refresh_plan_tree()
 
     # ═══════════════════════════════════════════════════════════════════
     # SESSION I/O & NINA EXPORT
@@ -4848,24 +6714,28 @@ class AstroApp:
             lines.append("=" * 80)
             lines.append("")
 
-            # Group entries by (target_id, scope) so that the same object imaged
-            # with two different telescopes gets its own section in the report.
-            # Entries sharing the same target_id AND scope are treated as one setup
-            # (e.g. multiple filters on the same rig) and appear under one header.
-            seen_groups = []   # list of (target_id, scope) tuples in encounter order
+            # Group entries by (target_id, scope, camera) so that the same
+            # object imaged with two different rigs — including two
+            # cameras sharing one telescope (e.g. LRGB on one camera, SHO
+            # on another) — gets its own section in the report. Entries
+            # sharing target_id, scope AND camera are treated as one setup
+            # (e.g. multiple filters on the same rig) and appear under one
+            # header.
+            seen_groups = []   # list of (target_id, scope, camera) tuples in encounter order
             for e in self._plan_entries:
-                key = (e["target_id"], e.get("scope", ""))
+                key = (e["target_id"], e.get("scope", ""), e.get("camera", ""))
                 if key not in seen_groups:
                     seen_groups.append(key)
 
             total_targets = len(seen_groups)
             target_num = 0
 
-            for (tid, scope_key) in seen_groups:
+            for (tid, scope_key, camera_key) in seen_groups:
                 target_num += 1
-                # Grab all entries for this target+scope combo
+                # Grab all entries for this target+scope+camera combo
                 target_entries = [e for e in self._plan_entries
-                                  if e["target_id"] == tid and e.get("scope", "") == scope_key]
+                                  if e["target_id"] == tid and e.get("scope", "") == scope_key
+                                  and e.get("camera", "") == camera_key]
                 first = target_entries[0]
 
                 lines.append("━" * 80)
@@ -4934,11 +6804,12 @@ class AstroApp:
             return (str(x if x is not None else "")
                     .replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
-        # Group entries by (target_id, scope), in encounter order — same rule as
-        # the text report: same object on two rigs gets two sections.
+        # Group entries by (target_id, scope, camera), in encounter order —
+        # same rule as the text report: same object on two rigs (including
+        # two cameras sharing one scope) gets two sections.
         seen_groups = []
         for e in self._plan_entries:
-            key = (e["target_id"], e.get("scope", ""))
+            key = (e["target_id"], e.get("scope", ""), e.get("camera", ""))
             if key not in seen_groups:
                 seen_groups.append(key)
         total_targets = len(seen_groups)
@@ -5001,10 +6872,11 @@ class AstroApp:
                    "</div>")
 
         num = 0
-        for (tid, scope_key) in seen_groups:
+        for (tid, scope_key, camera_key) in seen_groups:
             num += 1
             group = [e for e in self._plan_entries
-                     if e["target_id"] == tid and e.get("scope", "") == scope_key]
+                     if e["target_id"] == tid and e.get("scope", "") == scope_key
+                     and e.get("camera", "") == camera_key]
             first = group[0]
             common = (first.get("common") or "").split(",")[0].strip()
             title = esc(tid) + (f" &mdash; {esc(common)}" if common else "")
@@ -5259,9 +7131,13 @@ class AstroApp:
             s = (dec_abs - d - m / 60.0) * 3600.0
             return d, m, s, negative
 
+        # Group by (target_id, scope, camera) — a CaptureSequenceList is
+        # loaded into NINA for one connected camera at a time, so two rigs
+        # sharing a scope (e.g. one camera on LRGB, another on SHO) must
+        # never be merged into the same list.
         seen_groups = []
         for e in entries:
-            key = (e["target_id"], e.get("scope", ""))
+            key = (e["target_id"], e.get("scope", ""), e.get("camera", ""))
             if key not in seen_groups:
                 seen_groups.append(key)
 
@@ -5270,9 +7146,10 @@ class AstroApp:
                      'xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" '
                      'xmlns:xsd="http://www.w3.org/2001/XMLSchema">')
 
-        for (tid, scope_key) in seen_groups:
+        for (tid, scope_key, camera_key) in seen_groups:
             target_entries = [e for e in entries
-                              if e["target_id"] == tid and e.get("scope", "") == scope_key]
+                              if e["target_id"] == tid and e.get("scope", "") == scope_key
+                              and e.get("camera", "") == camera_key]
             first = target_entries[0]
 
             # Prefer the FOV-framed centre (catalog centre adjusted for any pan
@@ -5347,26 +7224,31 @@ class AstroApp:
     def _export_nina(self):
         """Export tonight's plan as N.I.N.A. CaptureSequenceList (.ninaTargetSet).
 
-        If entries use more than one scope, a separate file is written per scope
-        (the user picks a directory and filenames are auto-generated).  When all
-        entries share a single scope the original single-file dialog is used.
+        If entries use more than one rig \u2014 a scope+camera combo, which
+        includes two cameras sharing one scope (e.g. an LRGB camera and a
+        narrowband camera riding the same telescope) \u2014 a separate file is
+        written per rig (the user picks a directory and filenames are
+        auto-generated). When every entry shares a single rig the original
+        single-file dialog is used. A CaptureSequenceList file is loaded
+        into NINA for whichever camera is currently connected, so two rigs
+        must never end up combined into one file even if they share a scope.
         """
         if not self._plan_entries:
             messagebox.showwarning("Empty Plan",
                 "Tonight's plan is empty \u2014 add some targets first.")
             return
 
-        # Determine distinct scopes in the plan
-        distinct_scopes = []
+        # Determine distinct rigs (scope, camera) in the plan.
+        distinct_rigs = []
         for e in self._plan_entries:
-            s = e.get("scope", "") or ""
-            if s not in distinct_scopes:
-                distinct_scopes.append(s)
+            rig = (e.get("scope", "") or "", e.get("camera", "") or "")
+            if rig not in distinct_rigs:
+                distinct_rigs.append(rig)
 
         date_tag = datetime.now().strftime("Session_%Y-%m-%d")
 
-        if len(distinct_scopes) <= 1:
-            # ---------- single-scope: original behaviour ----------
+        if len(distinct_rigs) <= 1:
+            # ---------- single-rig: original behaviour ----------
             path = filedialog.asksaveasfilename(
                 title="Export as NINA Target Set",
                 initialdir=str(self._get_sessions_dir()),
@@ -5386,31 +7268,34 @@ class AstroApp:
                 messagebox.showerror("Export Failed",
                     f"Could not write file.\n\nDetail: {exc}")
         else:
-            # ---------- multi-scope: one file per scope ----------
+            # ---------- multi-rig: one file per scope+camera ----------
             out_dir = filedialog.askdirectory(
-                title="Choose folder for per-scope NINA exports",
+                title="Choose folder for per-rig NINA exports",
                 initialdir=str(self._get_sessions_dir()),
             )
             if not out_dir:
                 return
 
             saved_paths = []
-            for scope_name in distinct_scopes:
-                scope_entries = [e for e in self._plan_entries
-                                 if (e.get("scope", "") or "") == scope_name]
-                # Build a filesystem-safe version of the scope name
-                safe = re.sub(r'[<>:"/\\|?*]', '_', scope_name) if scope_name else "NoScope"
-                fname = f"{date_tag}_{safe}.ninaTargetSet"
+            for scope_name, camera_name in distinct_rigs:
+                rig_entries = [e for e in self._plan_entries
+                               if (e.get("scope", "") or "") == scope_name
+                               and (e.get("camera", "") or "") == camera_name]
+                # Filesystem-safe scope AND camera \u2014 both are needed so two
+                # cameras sharing one scope don't collide on one filename.
+                safe_scope  = re.sub(r'[<>:"/\\|?*]', '_', scope_name)  if scope_name  else "NoScope"
+                safe_camera = re.sub(r'[<>:"/\\|?*]', '_', camera_name) if camera_name else "NoCamera"
+                fname = f"{date_tag}_{safe_scope}_{safe_camera}.ninaTargetSet"
                 fpath = os.path.join(out_dir, fname)
 
-                xml, _ = self._build_nina_xml(scope_entries)
+                xml, _ = self._build_nina_xml(rig_entries)
                 try:
                     with open(fpath, "w", encoding="utf-8") as f:
                         f.write(xml)
                     saved_paths.append(fpath)
                 except OSError as exc:
                     messagebox.showerror("Export Failed",
-                        f"Could not write file for scope '{scope_name}'.\n\nDetail: {exc}")
+                        f"Could not write file for '{scope_name} / {camera_name}'.\n\nDetail: {exc}")
                     return
 
             summary = "\n".join(os.path.basename(p) for p in saved_paths)
@@ -5441,7 +7326,24 @@ class AstroApp:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self._plan_entries = self._migrate_session(data)
+            # Pin every loaded target to the top of the browsing grid too —
+            # same as a manually-added target (see _mark_grid_touched) —
+            # so re-finding one of them right after loading never requires
+            # a fresh search. Mark in REVERSE plan order: _mark_grid_touched
+            # moves each id to the end of an insertion-ordered dict, and
+            # _populate_visible_grid reads that dict newest-marked-first, so
+            # marking the plan's LAST target first and its FIRST target last
+            # makes the grid's pinned order match the plan's own top-to-
+            # bottom order rather than reversing it. Dedup by target_id — a
+            # multi-filter target has one plan row per filter.
+            seen_ids = set()
+            for e in reversed(self._plan_entries):
+                tid = e.get("target_id")
+                if tid and tid not in seen_ids:
+                    seen_ids.add(tid)
+                    self._mark_grid_touched(tid)
             self._refresh_plan_tree()
+            self._refresh_visible_grid()
             name = data.get("name", Path(path).stem)
             messagebox.showinfo("Loaded", f"Session '{name}' loaded with "
                                 f"{len(self._plan_entries)} target(s).")
@@ -5623,6 +7525,125 @@ class AstroApp:
     # ═══════════════════════════════════════════════════════════════════
     # VISIBLE TONIGHT DIALOG
     # ═══════════════════════════════════════════════════════════════════
+
+    def _scan_visible_targets(self, lat, lon, min_alt=20.0, obj_type="All Types",
+                               mag_limit=None, use_surf_br=False, seasonal_only=True,
+                               require_min_alt=True, progress_cb=None):
+        """Scan the catalog, optionally gated on visibility above ``min_alt``.
+
+        Shared by the "Visible Tonight" popup (``show_visible_tonight``) and
+        the target-card browsing grid, so both compute visibility identically
+        instead of duplicating the catalog scan.
+
+        Also respects ``self.catalog_filter`` (the NGC/IC/Messier/Caldwell/
+        Sharpless/Other toggle set edited via the ▽ button next to the Plan
+        tab's search box) — same rule as the search suggestion popup: a
+        candidate is kept only if its ``catalogs`` tag set overlaps the
+        user's enabled catalogs, with no "rides along" exception. This is
+        applied here, in the one scan both the grid and the popup share, so
+        the catalog restriction is never missed by an individual caller.
+
+        Args mirror the popup's filter controls: ``obj_type`` is a value from
+        ``OBJECT_TYPE_FILTERS`` or "All Types"; ``mag_limit`` is a v-mag or
+        surface-brightness ceiling (``use_surf_br`` picks which), or ``None``
+        for no magnitude filter; ``seasonal_only`` restricts to the current
+        season's target list (with an automatic full-catalog fallback if a
+        type filter empties the seasonal list). ``require_min_alt`` (default
+        True) is the Plan tab grid's "🌙 Tonight" / "🔭 All" mode switch —
+        when False, every candidate that survives the type/magnitude/seasonal
+        filters is included regardless of tonight's altitude, for browsing or
+        planning ahead; ``min_alt`` is still passed to ``_alt_rise_tonight``
+        either way, so ``rise_label`` stays meaningful ("rises above 20° at
+        22:15") even when it isn't being used to exclude anything.
+        ``progress_cb(i, total)``, if given, is called every 20 candidates
+        during the (potentially slow, ~13,000-object) altitude scan — callers
+        on the UI thread should run this whole method in a background
+        thread, same as the popup does.
+
+        Returns ``(results, fallback_note)`` where ``results`` is a list of
+        ``(target_dict, max_alt, rise_label)`` tuples sorted by altitude
+        descending, and ``fallback_note`` is a user-facing string (possibly
+        empty) describing the seasonal-fallback case above.
+        """
+        month = _planning_local_noon().month
+        if month in [12, 1, 2]:
+            season = "Winter"
+        elif month in [3, 4, 5]:
+            season = "Spring"
+        elif month in [6, 7, 8]:
+            season = "Summer"
+        else:
+            season = "Autumn"
+
+        if seasonal_only:
+            seasonal_ids = set()
+            for sid in SEASONAL_TARGETS[season]:
+                key = sid.replace(" ", "").upper()
+                t = self.targets.get(key) or self.common_names_map.get(key)
+                if t:
+                    seasonal_ids.add(t["id"])
+            candidates = [t for t in self.targets.values() if t["id"] in seasonal_ids]
+            # deduplicate by id
+            seen = set(); unique = []
+            for t in candidates:
+                if t["id"] not in seen:
+                    seen.add(t["id"]); unique.append(t)
+            candidates = unique
+        else:
+            # Use all targets with known RA/Dec and reasonable size
+            seen = set(); candidates = []
+            for t in self.targets.values():
+                if t["id"] not in seen and t.get("ra_deg", 0) != 0 and t.get("size_maj", 0) > 0:
+                    seen.add(t["id"]); candidates.append(t)
+
+        # Apply type filter
+        fallback_note = ""
+        if obj_type != "All Types":
+            filtered = [t for t in candidates if t.get("obj_type") == obj_type]
+            # If seasonal mode + type filter yields nothing (e.g. Spring has no nebulae),
+            # fall back to the full catalog for that type so results are never silently empty.
+            if not filtered and seasonal_only:
+                seen = set()
+                filtered = []
+                for t in self.targets.values():
+                    if t["id"] not in seen and t.get("obj_type") == obj_type:
+                        seen.add(t["id"])
+                        filtered.append(t)
+                fallback_note = f"ℹ️ No {obj_type} in seasonal list — searched full catalog.  "
+            else:
+                fallback_note = ""
+            candidates = filtered
+
+        # Apply catalog filter — same rule as the search suggestion popup
+        # (_update_floating_suggestions): keep only targets whose catalog
+        # tags overlap the user's enabled set. Untagged/unknown entries
+        # carry an implicit "Other" tag, matching the popup's fallback.
+        enabled_catalogs = {c for c, on in self.catalog_filter.items() if on}
+        candidates = [t for t in candidates if (t.get("catalogs") or {"Other"}) & enabled_catalogs]
+
+        if not candidates:
+            return [], fallback_note
+
+        dark_range = _dark_jd_range(lat, lon)
+        results = []
+        for i, t in enumerate(candidates):
+            if progress_cb and i % 20 == 0:
+                progress_cb(i, len(candidates))
+
+            # Magnitude filter (applied before the expensive altitude calc)
+            if mag_limit is not None:
+                mag_val = t.get("surf_br") if use_surf_br else t.get("v_mag")
+                if mag_val is None or mag_val > mag_limit:
+                    continue
+
+            max_alt, rise_label = _alt_rise_tonight(
+                t["ra_deg"], t["dec_deg"], lat, lon, min_alt, dark_range)
+            if not require_min_alt or max_alt >= min_alt:
+                results.append((t, max_alt, rise_label))
+
+        # Sort by altitude descending
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results, fallback_note
 
     def show_visible_tonight(self):
         """Open the 'Visible Tonight' popup — scans the catalog for objects above min altitude."""
@@ -5995,28 +8016,20 @@ class AstroApp:
             prog_label.config(text=f"Checking {len(candidates)} objects…", foreground="orange")
 
             def _compute():
-                results = []
-                # Pre-compute the darkness window once — avoids re-scanning
-                # the sun's position for each of the ~13 000 candidate objects.
-                dark_range = _dark_jd_range(lat, lon)
-                for i, t in enumerate(candidates):
-                    if i % 20 == 0:
-                        popup.after(0, lambda v=i: prog_label.config(
-                            text=f"Checking {v}/{len(candidates)}…", foreground="orange"))
+                def _report_progress(i, total):
+                    popup.after(0, lambda v=i: prog_label.config(
+                        text=f"Checking {v}/{total}…", foreground="orange"))
 
-                    # Magnitude filter (applied before the expensive altitude calc)
-                    if mag_limit is not None:
-                        mag_val = t.get("surf_br") if use_surf_br else t.get("v_mag")
-                        if mag_val is None or mag_val > mag_limit:
-                            continue
-
-                    max_alt, rise_label = _alt_rise_tonight(
-                        t["ra_deg"], t["dec_deg"], lat, lon, min_alt, dark_range)
-                    if max_alt >= min_alt:
-                        results.append((t, max_alt, rise_label))
-
-                # Sort by altitude descending
-                results.sort(key=lambda x: x[1], reverse=True)
+                # Re-filters candidates (cheap — dict iteration over the
+                # catalog) before repeating the same expensive per-candidate
+                # altitude scan the "No candidates matched" check above already
+                # sized; fallback_note is recomputed identically to the outer
+                # one from the same inputs, so the outer copy (used in _show
+                # below) is kept and this one is discarded.
+                results, _fallback_note = self._scan_visible_targets(
+                    lat, lon, min_alt=min_alt, obj_type=type_filter,
+                    mag_limit=mag_limit, use_surf_br=use_surf_br,
+                    seasonal_only=seasonal_only, progress_cb=_report_progress)
 
                 def _show():
                     tree.delete(*tree.get_children())
@@ -6081,16 +8094,52 @@ class AstroApp:
     # INTEGRATION PLAN & NINA PROFILE IMPORT
     # ═══════════════════════════════════════════════════════════════════
 
-    def _rf_for_filter_mode(self, mode):
-        """Return the sky-background reduction factor for a given filter_mode string.
+    def _filter_mode_choices(self):
+        """Return the filter_mode dropdown's current options: Mono Lum, then
+        every user-managed Filter Set name (see the Filter Library panel /
+        self.data["filter_sets"]), alphabetically.
 
-        Broadband:  None (Luminance) → 1.0,  LRGB → 3.0
-        Narrowband: any string containing a number followed by 'nm' →  348 / nm
-                    (derived from the physics of bandwidth vs sky flux suppression)
-        Unknown:    falls back to 1.0 (no suppression)
+        A rig no longer points at one specific filter or a generic "LRGB"
+        preset — it points at a whole Filter Set (what's actually loaded in
+        your filter wheel, e.g. Ha/OIII/SII/L/R/G/B all together), so
+        "Add to Tonight" can fan out to every filter in it at once. Shared
+        by every place that used to hardcode a filter list — the chips row,
+        the equipment drawer, Explore's Rig Builder, and the Edit Rig
+        dialog — so all of them always agree on what's selectable.
+        """
+        return ["Mono Lum"] + sorted(self.data.get("filter_sets", {}).keys())
+
+    def _rf_for_filter_mode(self, mode):
+        """Return the sky-background reduction factor for a given filter_mode value.
+
+        Mono Lum:     1.0 (no filter wheel).
+        A Filter Set: looked up in self.data["filter_sets"]. A set can mix
+                      narrowband and LRGB channels in one wheel, but the app
+                      only recommends ONE sub-exposure length for the whole
+                      set (same simplification it already made for LRGB
+                      alone) — so a set containing ANY narrowband member
+                      uses that set's shared bandwidth (rf = 348 / nm; a
+                      real astro session mixing NB and broadband usually
+                      sizes subs for the narrowband requirement anyway,
+                      since broadband tolerates shorter subs but narrowband
+                      doesn't). A pure-LRGB set uses the flat 3.0 broadband
+                      factor.
+        Legacy:       a pre-Filter-Set bandwidth-only string (e.g.
+                      "NB (7nm)") or a bare "LRGB" from before Filter Sets
+                      existed still resolves, so old rigs/plan entries keep
+                      working without a forced migration.
+        Unknown:      falls back to 1.0 (no suppression)
         """
         if mode == "Mono Lum" or mode == "None (Luminance)":
             return 1.0
+        fs = self.data.get("filter_sets", {}).get(mode)
+        if fs:
+            members = fs.get("members", [])
+            has_nb = any(m.get("type") == "narrowband" for m in members)
+            if has_nb and fs.get("bandwidth_nm"):
+                return 348.0 / max(float(fs["bandwidth_nm"]), 0.1)
+            if members:
+                return 3.0   # pure-LRGB set
         if mode == "LRGB":
             return 3.0
         import re as _re
@@ -6103,30 +8152,37 @@ class AstroApp:
     def _get_filter_names(self):
         """Return the list of individual filter names for the current camera/filter selection.
 
-        For a color camera or luminance-only mono, returns ['Lum'].
-        For LRGB returns the imported NINA names if available, else ['L', 'R', 'G', 'B'].
-        For narrowband returns the imported NINA narrowband names if available, else ['Ha', 'O3', 'S2'].
+        For a color camera or Mono Lum, returns ['Lum']. Otherwise
+        filter_mode names a Filter Set, and this returns EVERY member's
+        name in the order they were added to that set (a mixed wheel might
+        be ['L', 'R', 'G', 'B', 'Ha', 'OIII', 'SII']) — this is what makes
+        "Add to Tonight" fan out to one plan row per filter in the set.
+        Falls back to ['Lum'] for a legacy value that no longer names a
+        real set (e.g. a pre-Filter-Set "NB (7nm)" or "LRGB").
         """
         cam = self.data["cameras"].get(self.camera_choice.get(), {})
         if cam.get("is_color", True):
             return ["Lum"]                          # color — single-pass
 
-        nf = self.data.get("nina_filters", {})
         mode = self.filter_mode.get()
-        if mode == "LRGB":
-            return nf.get("lrgb") or ["L", "R", "G", "B"]
-        elif "NB" in mode or "Narrowband" in mode:
-            return nf.get("narrowband") or ["Ha", "O3", "S2"]
-        else:
-            return ["Lum"]                          # "Mono Lum" — single luminance channel
+        if mode == "Mono Lum":
+            return ["Lum"]
+        fs = self.data.get("filter_sets", {}).get(mode)
+        if fs and fs.get("members"):
+            return [m["name"] for m in fs["members"]]
+        return ["Lum"]                              # legacy/unrecognized — safe fallback
 
     def show_integration_plan(self, silent=False):
-        """Populate the Targets List stat cards with integration plan figures.
+        """Compute integration-plan figures (subs, total time, SNR, overhead).
 
         Uses the sub-exposure and sky-flux values stored by the most recent
-        analyze_framing() run, and the session duration entered in the Session Plan
-        field.  All values are purely computational — no network calls needed.
-        Pass silent=True (auto-calls from analyze_framing) to suppress warning dialogs.
+        analyze_framing() run, and the allocated-hours state in
+        session_hours_var.  All values are purely computational — no
+        network calls needed. The StringVars this writes into are headless
+        now (the Targets List tab that displayed them as stat cards is
+        retired) but are still read internally, so this keeps running on
+        every analysis. Pass silent=True (auto-calls from analyze_framing)
+        to suppress warning dialogs.
         """
         if self._last_exp_s is None:
             if not silent:
@@ -6215,7 +8271,7 @@ class AstroApp:
         else:
             filter_breakdown = noise_note
 
-        # ── Update Targets List stat cards ────────────────────────────
+        # ── Update headless integration-plan state ──────────────────────
         target_id = self.current_target_info["id"] if self.current_target_info else "unknown"
         common    = (self.current_target_info.get("common", "").split(";")[0].strip()
                      if self.current_target_info else "")
@@ -6615,16 +8671,6 @@ class AstroApp:
         nb_names   = [f for f in filters if self._is_narrowband(f)]
 
         def _do_import():
-            # Build the filter_mode key for the narrowband bandwidth
-            nb_mode = None
-            if nb_names and chosen_bw is not None:
-                try:
-                    bw_val = float(chosen_bw)
-                    bw_int = int(bw_val) if bw_val == int(bw_val) else bw_val
-                    nb_mode = f"NB ({bw_int}nm)"
-                except (TypeError, ValueError):
-                    pass
-
             # 1) Persist the scope first (if any) so the inventory refresh below
             #    picks it up.  We do NOT touch the active scope selection —
             #    the user keeps whatever was selected before the import.
@@ -6665,6 +8711,32 @@ class AstroApp:
                 nf["scope"]         = scope_breadcrumb
                 nf["imported_date"] = datetime.now().strftime("%Y-%m-%d %H:%M")
 
+            # 2b) Merge into the Filter Library (self.data["filter_sets"]) —
+            # NINA exports a whole filter wheel in one profile, which maps
+            # naturally onto one Filter Set. Named after the imported scope
+            # when there is one (a wheel is normally tied to a specific
+            # rig/scope), else a generic fallback name. Unlike nina_filters
+            # above (a snapshot of the LAST import, wholly overwritten each
+            # time), this only ADDS the names this import found — members
+            # already in the set from elsewhere are left alone — and
+            # refreshes the set's one shared bandwidth for its narrowband
+            # members (all NB filters in a set share one bandwidth).
+            if lrgb_names or nb_names:
+                set_name = scope_info["name"] if scope_info is not None else "Imported Filters"
+                filter_sets = self.data.setdefault("filter_sets", {})
+                fs = filter_sets.setdefault(set_name, {"bandwidth_nm": None, "members": []})
+                existing_member_names = {m["name"] for m in fs["members"]}
+                for _name in lrgb_names:
+                    if _name not in existing_member_names:
+                        fs["members"].append({"name": _name, "type": "lrgb"})
+                        existing_member_names.add(_name)
+                for _name in nb_names:
+                    if _name not in existing_member_names:
+                        fs["members"].append({"name": _name, "type": "narrowband"})
+                        existing_member_names.add(_name)
+                if chosen_bw is not None:
+                    fs["bandwidth_nm"] = float(chosen_bw)
+
             self._persist_data()
 
             # 3) Refresh UI — inventory tables pick up the new scope, dropdowns
@@ -6672,9 +8744,14 @@ class AstroApp:
             self.refresh_inventory_tables()
             self.refresh_dropdowns()
 
-            # If a narrowband bandwidth was specified, select it in the dropdown
-            if nb_mode and nb_mode in self.filter_dropdown["values"]:
-                self.filter_mode.set(nb_mode)
+            # We do NOT touch the active filter selection here — same rule as
+            # the scope above. This used to auto-select the just-imported
+            # bandwidth (e.g. "NB (6.5nm)"), which silently swapped the live
+            # filter chip out from under whatever rig was active — surprising
+            # since a NINA import is often run just to refresh scope data,
+            # not to change which filter you're using right now. The
+            # imported bandwidth is still added to the dropdown's values (see
+            # refresh_dropdowns) so it's available to pick deliberately.
 
             # Update the settings panel status label
             self._update_nina_profile_status()
@@ -6721,20 +8798,32 @@ class AstroApp:
     # through macOS Cocoa Tk's update_idletasks() cascade.
 
     def toggle_filter_visibility(self, *args):
-        """Show or hide the filter-mode chip based on whether the selected camera is mono."""
+        """Show or hide the filter-mode chip based on whether the selected
+        camera is mono — in the Planner tab's chips bar, and (independently)
+        the equipment drawer's own filter row/combobox if the drawer
+        happens to be open (a separate widget bound to the same
+        self.filter_mode StringVar — see _open_equip_drawer for why it
+        can't just be the same widget moved back and forth)."""
         c = self.data["cameras"].get(self.camera_choice.get())
-        if c and not c.get("is_color", True):
-            # Show filter dropdown in the chips bar (pack before NINA button)
+        show = bool(c and not c.get("is_color", True))
+        if show:
             if not self.filter_dropdown.winfo_ismapped():
                 self.filter_dropdown.pack(side="left", padx=(0, 6),
                                           before=self._equip_summary_label)
         else:
             self.filter_dropdown.pack_forget()
 
+        drawer_row = getattr(self, "_drawer_filter_row", None)
+        if drawer_row is not None and drawer_row.winfo_exists():
+            if show:
+                drawer_row.pack(fill="x", pady=(0, 6))
+            else:
+                drawer_row.pack_forget()
+
     def _mark_analysis_dirty(self):
         """Flag that input data has changed and analysis needs to re-run.
 
-        If the Target Planner or Session tab is currently visible, schedules
+        If the Target Planner tab is currently visible, schedules
         analyze_framing via after() so the tab can finish rendering first.
         If a different tab is active, just sets the flag — _on_tab_changed
         will pick it up when the user returns to the Planner tab.
@@ -6742,7 +8831,7 @@ class AstroApp:
         self._analysis_dirty = True
         try:
             current = self.tab_control.select()
-            if current in (str(self.tab_planner), str(self.tab_session)):
+            if current == str(self.tab_planner):
                 self._schedule_analysis()
         except Exception:
             pass
@@ -6763,12 +8852,12 @@ class AstroApp:
         self._analysis_after_id = None
         if not self._analysis_dirty:
             return
-        # Only run if the Planner or Session tab is still active — the user
-        # may have switched away during the after(100) delay.  If so, leave
-        # the dirty flag set; _on_tab_changed will pick it up later.
+        # Only run if the Planner tab is still active — the user may have
+        # switched away during the after(100) delay.  If so, leave the
+        # dirty flag set; _on_tab_changed will pick it up later.
         try:
             current = self.tab_control.select()
-            if current not in (str(self.tab_planner), str(self.tab_session)):
+            if current != str(self.tab_planner):
                 return  # dirty flag stays set
         except Exception:
             pass
@@ -6801,14 +8890,13 @@ class AstroApp:
             "scope":     self.scope_choice.get(),
             "reduction": self.reduction_factor.get(),
             "camera":    cam_name,
-            "bortle":    self.bortle_choice.get(),
             "filter":    self.filter_mode.get() if is_mono else "",
         }
 
     def _chips_match_rig(self, rig):
         """Return True if current chip values match every key in the rig snapshot."""
         snap = self._current_rig_snapshot()
-        for key in ("scope", "reduction", "camera", "bortle", "filter"):
+        for key in ("scope", "reduction", "camera", "filter"):
             if snap.get(key) != rig.get(key):
                 return False
         return True
@@ -6828,6 +8916,9 @@ class AstroApp:
         # Explore's saved-rig quick-add mirrors the same list
         if hasattr(self, "_explore_rig_pick"):
             self._explore_rig_pick["values"] = names
+        # Equipment tab's inline Rig Library mirrors the same list
+        if hasattr(self, "_equip_rig_refresh"):
+            self._equip_rig_refresh(preserve_name=self.data.get("settings", {}).get("active_rig", ""))
         self._update_rig_indicator()
 
     def _update_rig_indicator(self):
@@ -6879,8 +8970,6 @@ class AstroApp:
                 self.scope_choice.set(rig["scope"])
             if rig.get("camera") in self.data.get("cameras", {}):
                 self.camera_choice.set(rig["camera"])
-            if rig.get("bortle") in BORTLE_FACTORS:
-                self.bortle_choice.set(rig["bortle"])
             if rig.get("reduction"):
                 self.reduction_factor.set(rig["reduction"])
             if rig.get("filter") in self.filter_dropdown["values"]:
@@ -6893,6 +8982,343 @@ class AstroApp:
         self._update_rig_indicator()
         if getattr(self, "auto_update_enabled", False):
             self._mark_analysis_dirty()
+
+    def _build_rig_list_and_details(self, list_parent, details_parent, *, list_height=8, list_width=22):
+        """Build a saved-rigs Listbox plus a Scope/Reducer/Camera/Filter
+        details grid, wired together by a shared selection handler.
+
+        Shared by the modal Manage Rigs dialog and the Equipment tab's inline
+        Rig Library panel so both present identical widgets and behavior from
+        one place, instead of two copies drifting apart. Neither widget is
+        packed/gridded here — the caller places them (list_parent and
+        details_parent may be the same frame, as in the inline panel, or two
+        different frames side by side, as in the dialog). Returns
+        ``(listbox, details, name_list, detail_labels, refresh_list)`` — call
+        ``refresh_list()`` whenever the underlying rig data changes, and
+        ``refresh_list(preserve_name=...)`` to keep a given rig selected
+        across the rebuild.
+        """
+        lb = tk.Listbox(list_parent, height=list_height, width=list_width,
+                        font=("Helvetica", 11),
+                        bg="#1e2d3e", fg="#ffffff",
+                        selectbackground="#1e3a5f", selectforeground="#aaddff",
+                        relief="flat", borderwidth=1,
+                        exportselection=False, activestyle="none")
+
+        name_list = []   # parallel index → rig name (for reliable lookup)
+
+        details = tk.Frame(details_parent, bg="#0e1a28")
+        detail_labels = {}
+        for i, k in enumerate(["Scope", "Reducer", "Camera", "Filter"]):
+            tk.Label(details, text=f"{k}:", bg="#0e1a28", fg="#8a94a3",
+                     font=("Helvetica", 10), anchor="w", width=8
+                     ).grid(row=i, column=0, sticky="w", padx=(10, 4), pady=3)
+            lbl = tk.Label(details, text="—", bg="#0e1a28", fg="#cfd4dc",
+                           font=("Helvetica", 10), anchor="w")
+            lbl.grid(row=i, column=1, sticky="w", padx=(0, 10), pady=3)
+            detail_labels[k.lower()] = lbl
+
+        def _on_select(event=None):
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(name_list):
+                for lbl in detail_labels.values():
+                    lbl.configure(text="—")
+                return
+            rig = self._find_rig(name_list[sel[0]])
+            if rig is None:
+                return
+            detail_labels["scope"].configure(text=rig.get("scope")     or "(none)")
+            detail_labels["reducer"].configure(text=rig.get("reduction") or "1.0×")
+            detail_labels["camera"].configure(text=rig.get("camera")    or "(none)")
+            # Filter only applies to mono cameras; show em-dash for color rigs
+            rig_cam = rig.get("camera", "")
+            if rig_cam and self._camera_is_color(rig_cam):
+                detail_labels["filter"].configure(text="— (color sensor)")
+            else:
+                filt_val = rig.get("filter") or ""
+                fs = self.data.get("filter_sets", {}).get(filt_val)
+                if fs:
+                    n = len(fs.get("members", []))
+                    detail_labels["filter"].configure(
+                        text=f"{filt_val}  ({n} filter{'s' if n != 1 else ''})")
+                else:
+                    detail_labels["filter"].configure(text=filt_val or "(none)")
+
+        def _refresh_list(preserve_name=None):
+            rigs = self.data.get("settings", {}).get("rigs", [])
+            active = self.data.get("settings", {}).get("active_rig", "")
+            lb.delete(0, tk.END)
+            name_list.clear()
+            for r in rigs:
+                name = r.get("name", "")
+                if not name:
+                    continue
+                prefix = "★ " if name == active else "   "
+                lb.insert(tk.END, f"{prefix}{name}")
+                name_list.append(name)
+            # Restore selection to the requested rig if still present
+            if preserve_name and preserve_name in name_list:
+                idx = name_list.index(preserve_name)
+                lb.selection_set(idx)
+                lb.see(idx)
+            elif name_list:
+                lb.selection_set(0)
+            _on_select()
+
+        lb.bind("<<ListboxSelect>>", _on_select)
+        return lb, details, name_list, detail_labels, _refresh_list
+
+    def _rig_manager_rename(self, name_list, lb, refresh_list, parent):
+        """Rename the rig currently selected in ``lb``.
+
+        Shared by the Manage Rigs dialog and the Equipment tab's inline Rig
+        Library — ``parent`` is whichever window should own the rename
+        prompt's modal grab (the dialog itself, or ``self.root`` for the
+        inline panel).
+        """
+        sel = lb.curselection()
+        if not sel or sel[0] >= len(name_list):
+            return
+        name = name_list[sel[0]]
+        rig = self._find_rig(name)
+        if not rig:
+            return
+        new_name = simpledialog.askstring("Rename Rig",
+                                           f"Rename '{name}' to:",
+                                           parent=parent, initialvalue=name)
+        if new_name is None:
+            return
+        new_name = new_name.strip()
+        if not new_name or new_name == name:
+            return
+        if new_name == "Custom…":
+            messagebox.showerror("Reserved name",
+                                 "\"Custom…\" is a reserved label.", parent=parent)
+            return
+        if self._find_rig(new_name):
+            messagebox.showerror("Name exists",
+                                 f"A rig named '{new_name}' already exists.",
+                                 parent=parent)
+            return
+        rig["name"] = new_name
+        settings = self.data.setdefault("settings", {})
+        if settings.get("active_rig") == name:
+            settings["active_rig"] = new_name
+        self._persist_data()
+        refresh_list(preserve_name=new_name)
+        self._refresh_rig_dropdown()
+
+    def _rig_manager_update(self, name_list, lb, refresh_list, parent):
+        """Overwrite the rig selected in ``lb`` with the current chip values.
+
+        Shared by the Manage Rigs dialog and the Equipment tab's inline Rig
+        Library — see :meth:`_rig_manager_rename` for the ``parent`` argument.
+        """
+        sel = lb.curselection()
+        if not sel or sel[0] >= len(name_list):
+            return
+        name = name_list[sel[0]]
+        rig = self._find_rig(name)
+        if not rig:
+            return
+        if not messagebox.askyesno("Update Rig",
+                                    f"Overwrite '{name}' with the current equipment settings?\n\n"
+                                    "This replaces the saved snapshot with whatever's selected in "
+                                    "the planner right now.",
+                                    parent=parent):
+            return
+        rig.update(self._current_rig_snapshot())
+        # Rig now matches current chips → make it active
+        self.data.setdefault("settings", {})["active_rig"] = name
+        self._persist_data()
+        refresh_list(preserve_name=name)
+        self._refresh_rig_dropdown()
+        self._show_toast(f"Updated rig: {name}")
+
+    def _rig_manager_delete(self, name_list, lb, refresh_list, parent):
+        """Delete the rig selected in ``lb`` after confirmation.
+
+        Shared by the Manage Rigs dialog and the Equipment tab's inline Rig
+        Library — see :meth:`_rig_manager_rename` for the ``parent`` argument.
+        """
+        sel = lb.curselection()
+        if not sel or sel[0] >= len(name_list):
+            return
+        name = name_list[sel[0]]
+        if not messagebox.askyesno("Delete Rig",
+                                    f"Delete the rig '{name}'?\n\nThis cannot be undone.",
+                                    parent=parent):
+            return
+        settings = self.data.setdefault("settings", {})
+        rigs = settings.setdefault("rigs", [])
+        rigs[:] = [r for r in rigs if r.get("name") != name]
+        if settings.get("active_rig") == name:
+            settings["active_rig"] = ""
+        self._persist_data()
+        refresh_list()
+        self._refresh_rig_dropdown()
+        self._show_toast(f"Deleted rig: {name}")
+
+    def _rig_manager_edit(self, name_list, lb, refresh_list, parent):
+        """Open a direct editor for the rig selected in ``lb``.
+
+        Unlike :meth:`_rig_manager_update` (which overwrites the rig with
+        whatever the live equipment chips currently hold — fine when those
+        chips are right there in the same drawer, confusing on the
+        Equipment tab where they aren't visible at all), this edits the
+        rig's own stored scope/reducer/camera/filter values directly
+        and only writes anything on an explicit Save.
+        """
+        sel = lb.curselection()
+        if not sel or sel[0] >= len(name_list):
+            return
+        name = name_list[sel[0]]
+        if not self._find_rig(name):
+            return
+        self._open_edit_rig_dialog(name, refresh_list, parent)
+
+    def _open_edit_rig_dialog(self, name, refresh_list, parent):
+        """Modal add/edit dialog for one saved rig's name/scope/reducer/camera/filter.
+
+        ``name=None`` opens a blank "New Rig" form; otherwise pre-fills from
+        that rig's own saved snapshot — never from the live equipment chips
+        (self.scope_choice etc.), since those live on the Planner tab /
+        Plan-tab drawer, which may not even be open, so adding or editing a
+        rig here shouldn't depend on their current state. The Name field is
+        editable in BOTH modes — renaming is just "change the Name field and
+        Save" here, no separate Rename button (Jerry: "move the rename
+        function into the edit function ... remove the 'rename' button").
+        Nothing is written until Save is clicked. Mirrors
+        :meth:`_open_edit_filter_dialog`'s same add/edit-in-one-dialog shape.
+        """
+        is_new = name is None
+        rig = None if is_new else self._find_rig(name)
+        if not is_new and rig is None:
+            return
+
+        dlg = tk.Toplevel(parent)
+        dlg.title("New Rig" if is_new else f"Edit Rig — {name}")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        ttk.Label(dlg, text=("New rig:" if is_new else f"Edit “{name}”:"),
+                  font=("Helvetica", 11, "bold")).pack(padx=20, pady=(14, 10), anchor="w")
+
+        form = ttk.Frame(dlg)
+        form.pack(padx=20, pady=(0, 4), fill="x")
+
+        _reduction_values = ["0.63×", "0.67×", "0.70×", "0.75×", "0.80×",
+                              "1.0×", "1.5×", "2.0×", "2.5×", "3.0×"]
+        _filter_values = self._filter_mode_choices()
+
+        name_var = tk.StringVar(value="" if is_new else name)
+        ttk.Label(form, text="Name:").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+        name_entry = ttk.Entry(form, textvariable=name_var, width=24)
+        name_entry.grid(row=0, column=1, sticky="w", pady=4)
+        next_row = 1
+
+        scope_var  = tk.StringVar(value=rig.get("scope", "")     if rig else "")
+        reduc_var  = tk.StringVar(value=(rig.get("reduction") if rig else None) or "1.0×")
+        camera_var = tk.StringVar(value=rig.get("camera", "")    if rig else "")
+        filter_var = tk.StringVar(value=(rig.get("filter") if rig else None) or "Mono Lum")
+
+        rows = [
+            ("Scope:",   scope_var,  sorted(self.data.get("scopes", {}).keys())),
+            ("Reducer:", reduc_var,  _reduction_values),
+            ("Camera:",  camera_var, sorted(self.data.get("cameras", {}).keys())),
+        ]
+        for i, (label, var, values) in enumerate(rows):
+            r = next_row + i
+            ttk.Label(form, text=label).grid(row=r, column=0, sticky="e", padx=(0, 8), pady=4)
+            ttk.Combobox(form, textvariable=var, values=values,
+                         state="readonly", width=22).grid(row=r, column=1, sticky="w", pady=4)
+
+        # Filter row is shown/hidden based on whether the chosen camera is
+        # mono — same rule used everywhere else a rig's filter is displayed.
+        filter_row_idx = next_row + len(rows)
+        filter_label = ttk.Label(form, text="Filter:")
+        filter_dd = ttk.Combobox(form, textvariable=filter_var, values=_filter_values,
+                                  state="readonly", width=22)
+
+        def _sync_filter_visibility(*_a):
+            if camera_var.get() and not self._camera_is_color(camera_var.get()):
+                filter_label.grid(row=filter_row_idx, column=0, sticky="e", padx=(0, 8), pady=4)
+                filter_dd.grid(row=filter_row_idx, column=1, sticky="w", pady=4)
+            else:
+                filter_label.grid_forget()
+                filter_dd.grid_forget()
+        camera_var.trace_add("write", _sync_filter_visibility)
+        _sync_filter_visibility()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(padx=20, pady=(10, 14), fill="x")
+
+        def _do_save():
+            is_mono = bool(camera_var.get()) and not self._camera_is_color(camera_var.get())
+
+            new_name = name_var.get().strip()
+            if not new_name:
+                messagebox.showerror("Invalid name",
+                                     "Please enter a name for this rig.", parent=dlg)
+                return
+            if new_name == "Custom…":
+                messagebox.showerror("Reserved name",
+                                     "\"Custom…\" is a reserved label — please choose another name.",
+                                     parent=dlg)
+                return
+            if new_name != name and self._find_rig(new_name):
+                messagebox.showerror("Name exists",
+                                     f"A rig named '{new_name}' already exists.", parent=dlg)
+                return
+
+            if is_new:
+                new_rig = {
+                    "name":      new_name,
+                    "scope":     scope_var.get(),
+                    "reduction": reduc_var.get(),
+                    "camera":    camera_var.get(),
+                    "filter":    filter_var.get() if is_mono else "",
+                }
+                self.data.setdefault("settings", {}).setdefault("rigs", []).append(new_rig)
+                self._persist_data()
+                if refresh_list is not None:
+                    refresh_list(preserve_name=new_name)
+                self._refresh_rig_dropdown()
+                self._show_toast(f"Added rig: {new_name}")
+            else:
+                renamed = new_name != name
+                settings = self.data.setdefault("settings", {})
+                was_active = settings.get("active_rig", "") == name
+                rig["name"]      = new_name
+                rig["scope"]     = scope_var.get()
+                rig["reduction"] = reduc_var.get()
+                rig["camera"]    = camera_var.get()
+                rig["filter"]    = filter_var.get() if is_mono else ""
+                if was_active and renamed:
+                    settings["active_rig"] = new_name
+                self._persist_data()
+                if refresh_list is not None:
+                    refresh_list(preserve_name=new_name)
+                self._refresh_rig_dropdown()
+                # If this rig is the currently-active one, push the edit into
+                # the live equipment chips too, so "active" doesn't silently
+                # drift from what's actually saved.
+                if was_active:
+                    self._apply_rig(rig)
+                self._show_toast(f"Renamed to '{new_name}' and updated" if renamed
+                                  else f"Updated rig: {new_name}")
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btn_row, text="Save",   command=_do_save   ).pack(side="right")
+        dlg.bind("<Return>", lambda e: _do_save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        name_entry.focus_set()
+        if is_new:
+            name_entry.select_range(0, tk.END)
+
+        self._theme_popup(dlg)
 
     def _open_save_rig_dialog(self):
         """Open the modal 'Save as rig' dialog to name and save the current chip combination."""
@@ -6929,7 +9355,6 @@ class AstroApp:
             ("Scope",   snap["scope"]     or "(none)"),
             ("Reducer", snap["reduction"] or "1.0×"),
             ("Camera",  snap["camera"]    or "(none)"),
-            ("Bortle",  snap["bortle"]    or "(none)"),
             ("Filter",  filter_display),
         ]
         for i, (k, v) in enumerate(rows):
@@ -6981,6 +9406,506 @@ class AstroApp:
 
         self._theme_popup(dlg)
 
+    # ── Filter Library (Filter Sets) ─────────────────────────────────────────
+    # Mirrors the Rig Library's list+detail-card+New/Edit/Delete pattern
+    # (_build_rig_list_and_details / _rig_manager_* / _open_edit_rig_dialog
+    # above) so both "always-visible libraries" on the Equipment tab look
+    # and behave the same way. self.data["filter_sets"] is the single
+    # source of truth (schema 8+) — a rig points at a whole Filter Set
+    # (its filter wheel's contents) rather than one filter at a time; see
+    # _filter_mode_choices, _rf_for_filter_mode, _get_filter_names, and
+    # _split_entry_into_plan for how a set is consumed.
+
+    def _filter_row_color(self, name, ftype):
+        """A small color cue for a filter member's row — recognizable film
+        names get their familiar color (Ha red, OIII/B cyan, SII/L/etc.),
+        anything custom falls back to a generic narrowband/LRGB tint."""
+        palette = {
+            "ha": "#ff8a80", "oiii": "#80d8ff", "sii": "#ffcc80",
+            "l": "#e5e7eb", "r": "#ff8a80", "g": "#80e5a0", "b": "#80d8ff",
+        }
+        key = name.strip().lower()
+        if key in palette:
+            return palette[key]
+        return "#c9a8ff" if ftype == "narrowband" else "#cfd4dc"
+
+    def _build_filter_set_list_and_details(self, list_parent, details_parent, *, list_height=7, list_width=20):
+        """Build a Filter Set Listbox plus a Name/Bandwidth/Members details
+        grid, wired together by a shared selection handler — the Filter
+        Library counterpart of :meth:`_build_rig_list_and_details`.
+
+        Each row is one whole Filter Set (e.g. "Wheel A  (7)"), not one
+        individual filter — a set is what a rig actually points at now, and
+        its member filters (name + narrowband/LRGB type) are added/removed
+        from inside the Set's own New/Edit dialog, not managed as a
+        separate top-level list.
+
+        Returns ``(listbox, details, name_list, detail_labels, refresh_list)``.
+        """
+        lb = tk.Listbox(list_parent, height=list_height, width=list_width,
+                        font=("Helvetica", 11),
+                        bg="#1e2d3e", fg="#ffffff",
+                        selectbackground="#1e3a5f", selectforeground="#aaddff",
+                        relief="flat", borderwidth=1,
+                        exportselection=False, activestyle="none")
+
+        name_list = []   # parallel index → set name, or None for the empty-state row
+
+        details = tk.Frame(details_parent, bg="#0e1a28")
+        detail_labels = {}
+        for i, k in enumerate(["Name", "Bandwidth", "Members"]):
+            tk.Label(details, text=f"{k}:", bg="#0e1a28", fg="#8a94a3",
+                     font=("Helvetica", 10), anchor="w", width=8
+                     ).grid(row=i, column=0, sticky="nw", padx=(10, 4), pady=3)
+            lbl = tk.Label(details, text="—", bg="#0e1a28", fg="#cfd4dc",
+                           font=("Helvetica", 10), anchor="w", justify="left", wraplength=170)
+            lbl.grid(row=i, column=1, sticky="w", padx=(0, 10), pady=3)
+            detail_labels[k.lower()] = lbl
+
+        def _on_select(event=None):
+            sel = lb.curselection()
+            if not sel or sel[0] >= len(name_list) or name_list[sel[0]] is None:
+                for lbl in detail_labels.values():
+                    lbl.configure(text="—")
+                return
+            name = name_list[sel[0]]
+            fs = self.data.get("filter_sets", {}).get(name)
+            if fs is None:
+                return
+            members = fs.get("members", [])
+            has_nb = any(m.get("type") == "narrowband" for m in members)
+            bw = fs.get("bandwidth_nm")
+            detail_labels["name"].configure(text=name)
+            detail_labels["bandwidth"].configure(text=f"{bw:g} nm" if (has_nb and bw) else "—")
+            detail_labels["members"].configure(
+                text=", ".join(m["name"] for m in members) if members else "(empty)")
+
+        def _refresh_list(preserve_name=None):
+            filter_sets = self.data.get("filter_sets", {})
+            lb.delete(0, tk.END)
+            name_list.clear()
+            for set_name in sorted(filter_sets.keys()):
+                n = len(filter_sets[set_name].get("members", []))
+                lb.insert(tk.END, f"{set_name}  ({n})")
+                name_list.append(set_name)
+            if not name_list:
+                lb.insert(tk.END, "  (no filter sets yet — click + New)")
+                name_list.append(None)
+                lb.itemconfig(tk.END, fg="#556677")
+
+            if preserve_name and preserve_name in name_list:
+                idx = name_list.index(preserve_name)
+                lb.selection_set(idx)
+                lb.see(idx)
+            else:
+                for i, n in enumerate(name_list):
+                    if n is not None:
+                        lb.selection_set(i)
+                        break
+            _on_select()
+
+        lb.bind("<<ListboxSelect>>", _on_select)
+        return lb, details, name_list, detail_labels, _refresh_list
+
+    def _filter_manager_edit(self, name_list, lb, refresh_list, parent):
+        """Open the add/edit dialog for the filter set currently selected in ``lb``."""
+        sel = lb.curselection()
+        if not sel or sel[0] >= len(name_list) or name_list[sel[0]] is None:
+            return
+        name = name_list[sel[0]]
+        self._open_edit_filter_dialog(name, refresh_list, parent)
+
+    def _filter_manager_delete(self, name_list, lb, refresh_list, parent):
+        """Delete the filter set selected in ``lb`` after confirmation.
+
+        No "in use" check: existing rigs/plan entries that reference a
+        deleted set's name degrade gracefully (see _rf_for_filter_mode /
+        _get_filter_names' legacy fallbacks) — exactly like deleting a
+        camera or scope that's still referenced elsewhere isn't blocked
+        either.
+        """
+        sel = lb.curselection()
+        if not sel or sel[0] >= len(name_list) or name_list[sel[0]] is None:
+            return
+        name = name_list[sel[0]]
+        if not messagebox.askyesno(
+                "Delete Filter Set",
+                f"Delete the filter set '{name}'?\n\n"
+                "This cannot be undone. Rigs or Tonight's Plan entries that "
+                "already reference it keep working — they just won't offer "
+                "it as a selectable option going forward.",
+                parent=parent):
+            return
+        filter_sets = self.data.setdefault("filter_sets", {})
+        filter_sets.pop(name, None)
+        if self.filter_mode.get() == name:
+            self.filter_mode.set("Mono Lum")
+        self._persist_data()
+        self.refresh_dropdowns()
+        refresh_list()
+        self._show_toast(f"Deleted filter set: {name}")
+
+    def _open_edit_filter_dialog(self, name, refresh_list, parent):
+        """Modal add/edit dialog for one Filter Set (Filter Library).
+
+        ``name=None`` opens a blank "New Filter Set" form; otherwise
+        pre-fills from ``self.data["filter_sets"][name]`` and allows
+        renaming it — same editable-Name-field, no-separate-Rename-button
+        pattern as the Rig Library's Edit dialog. Filters are added to and
+        removed from the set directly here (name + type), "similar to the
+        way you add components to a rig" — they aren't drawn from a
+        separate global filter catalog, so the same filter name can appear
+        independently in different sets. Nothing is written until Save is
+        clicked.
+
+        Adding filters is split into two modes via a segmented LRGB/
+        Narrowband toggle (Jerry: adding narrowband filters "feels
+        awkward" one at a time):
+          • LRGB channel (the default for a new/pure-LRGB set) — a single
+            name field + "+", same as before.
+          • Narrowband — expands to three named slots (Hα / S2 / O3),
+            each pre-filled with the conventional name but freely
+            editable, with the set's shared bandwidth field right below
+            them (Jerry: "to make it simple, all NB filters in a set must
+            have the same bandwidth"). "+ Add narrowband filters" adds
+            every non-blank slot at once, all using that one bandwidth.
+        Editing a set that already has a narrowband member opens straight
+        into Narrowband mode instead, so its shared bandwidth is visible
+        (and editable via Save alone, with no new filters added) without
+        having to hunt for the toggle first.
+        """
+        existing = self.data.get("filter_sets", {}).get(name) if name else None
+        # Local working copy — nothing touches self.data until Save.
+        members = [dict(m) for m in (existing.get("members", []) if existing else [])]
+        has_existing_nb = any(m["type"] == "narrowband" for m in members)
+
+        dlg = tk.Toplevel(parent)
+        dlg.title(f"Edit Filter Set — {name}" if name else "New Filter Set")
+        dlg.resizable(False, False)
+        dlg.grab_set()
+        dlg.transient(self.root)
+
+        # A plain "hint text" placeholder for the LRGB add field — same
+        # dedicated-style-swap pattern as the Planner tab's catalog search
+        # box (see _plan_search_show_placeholder): a derived style only
+        # ever grey while the placeholder itself is showing, so real typed
+        # text keeps tracking the normal day/night Entry color instead of
+        # getting stuck grey.
+        style = ttk.Style()
+        style.configure("FSAdd.TEntry")
+        style.configure("FSAddPlaceholder.TEntry", foreground="#667788")
+        style.map("FSAddPlaceholder.TEntry",
+                  foreground=[("!disabled", "#667788"), ("focus", "#667788"), ("", "#667788")])
+
+        ttk.Label(dlg, text=(f"Edit “{name}”:" if name else "New filter set:"),
+                  font=("Helvetica", 11, "bold")).pack(padx=20, pady=(14, 10), anchor="w")
+
+        name_row = ttk.Frame(dlg)
+        name_row.pack(padx=20, fill="x")
+        ttk.Label(name_row, text="Name:", width=9).pack(side="left")
+        name_var = tk.StringVar(value=name or "")
+        name_entry = ttk.Entry(name_row, textvariable=name_var, width=26)
+        name_entry.pack(side="left", padx=(4, 0))
+
+        ttk.Label(dlg, text="Filters in this set:",
+                  font=("Helvetica", 9, "bold"), foreground="#778899"
+                  ).pack(padx=20, pady=(14, 4), anchor="w")
+
+        # Listbox + an always-visible Scrollbar (not just once content
+        # overflows) — a list with no visible scrollbar reads as "this is
+        # all there is" rather than "there's more, scroll for it".
+        members_wrap = tk.Frame(dlg, bg="#1e2d3e")
+        members_wrap.pack(padx=20, fill="x")
+        # A monospace font, not Helvetica — the row text below pads the
+        # filter name to a fixed CHARACTER width so the type column lines
+        # up, which only actually lines up in pixels with a fixed-width
+        # font. In a proportional font, "Ha" and "OIII" pad out to the same
+        # character count but very different pixel widths, so the type
+        # column reads as trailing a fixed gap after each name instead of
+        # sitting in a real aligned column.
+        members_lb = tk.Listbox(members_wrap, height=6, width=32, font=("Courier New", 10),
+                                bg="#1e2d3e", fg="#ffffff",
+                                selectbackground="#1e3a5f", selectforeground="#aaddff",
+                                relief="flat", borderwidth=1,
+                                exportselection=False, activestyle="none")
+        members_lb.pack(side="left", fill="both", expand=True)
+        members_scroll = ttk.Scrollbar(members_wrap, orient="vertical", command=members_lb.yview)
+        members_scroll.pack(side="right", fill="y")
+        members_lb.configure(yscrollcommand=members_scroll.set)
+
+        def _refresh_members_lb():
+            members_lb.delete(0, tk.END)
+            for m in members:
+                label = "LRGB channel" if m["type"] == "lrgb" else "Narrowband"
+                members_lb.insert(tk.END, f"  {m['name']:<14}{label}")
+                members_lb.itemconfig(tk.END, fg=self._filter_row_color(m["name"], m["type"]))
+
+        def _do_remove_member():
+            sel = members_lb.curselection()
+            if not sel or sel[0] >= len(members):
+                return
+            del members[sel[0]]
+            _refresh_members_lb()
+
+        remove_row = ttk.Frame(dlg)
+        remove_row.pack(padx=20, pady=(4, 0), fill="x")
+        remove_btn = ttk.Button(remove_row, text="✕ Remove selected", command=_do_remove_member)
+        remove_btn.pack(side="right")
+        ToolTip(remove_btn, "Remove the selected filter from this set")
+
+        # ── Segmented LRGB channel / Narrowband toggle ──────────────────
+        ttk.Label(dlg, text="Add filters:",
+                  font=("Helvetica", 9, "bold"), foreground="#778899"
+                  ).pack(padx=20, pady=(10, 4), anchor="w")
+
+        # _theme_popup (called once, at the very end, so night mode's red
+        # overlay reaches this dialog's plain-tk backgrounds) repaints
+        # EVERY plain tk.Frame/Label to the theme's flat background —
+        # including the deliberately-custom-colored ones below (the toggle
+        # pills, the narrowband trio's card and band chips). Each is
+        # registered here so _reapply_custom_colors() can restore them
+        # right after that walk runs.
+        _custom_colored = []   # (widget, bg, fg-or-None) pairs
+
+        SEG_ACTIVE_BG, SEG_ACTIVE_FG = "#38bdf8", "#04202e"
+        SEG_INACTIVE_BG, SEG_INACTIVE_FG = "#263545", "#8a94a3"
+        add_mode_var = tk.StringVar(value="narrowband" if has_existing_nb else "lrgb")
+
+        seg_frame = tk.Frame(dlg, bg="#1e2d3e")
+        seg_frame.pack(padx=20, fill="x")
+        seg_lrgb = tk.Label(seg_frame, text="LRGB channel", font=("Helvetica", 10, "bold"),
+                             padx=10, pady=6, cursor="hand2")
+        seg_nb = tk.Label(seg_frame, text="Narrowband", font=("Helvetica", 10, "bold"),
+                           padx=10, pady=6, cursor="hand2")
+        seg_lrgb.pack(side="left", fill="x", expand=True, padx=(0, 1))
+        seg_nb.pack(side="left", fill="x", expand=True)
+
+        # Both add-mode frames are built regardless of which is showing —
+        # only one is ever packed at a time via _refresh_add_block().
+        lrgb_add_frame = ttk.Frame(dlg)
+        nb_add_frame = ttk.Frame(dlg)
+
+        # Created (and packed) here, ahead of the Save/Cancel buttons that
+        # get added into it later, purely so _refresh_add_block() below has
+        # something to anchor "before" on. Without an anchor, pack_forget()
+        # followed by pack() moves a frame to the END of dlg's packing
+        # order instead of back to its original spot — which is what made
+        # toggling LRGB -> Narrowband -> LRGB walk the add block below the
+        # Save/Cancel row (and push that row up) instead of leaving both
+        # exactly where they started.
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(padx=20, pady=(14, 14), fill="x")
+
+        def _refresh_add_block():
+            if add_mode_var.get() == "lrgb":
+                nb_add_frame.pack_forget()
+                lrgb_add_frame.pack(padx=20, pady=(8, 0), fill="x", before=btn_row)
+            else:
+                lrgb_add_frame.pack_forget()
+                nb_add_frame.pack(padx=20, pady=(8, 0), fill="x", before=btn_row)
+
+        def _update_segmented():
+            if add_mode_var.get() == "lrgb":
+                seg_lrgb.configure(bg=SEG_ACTIVE_BG, fg=SEG_ACTIVE_FG)
+                seg_nb.configure(bg=SEG_INACTIVE_BG, fg=SEG_INACTIVE_FG)
+            else:
+                seg_lrgb.configure(bg=SEG_INACTIVE_BG, fg=SEG_INACTIVE_FG)
+                seg_nb.configure(bg=SEG_ACTIVE_BG, fg=SEG_ACTIVE_FG)
+
+        def _set_add_mode(mode):
+            add_mode_var.set(mode)
+            _update_segmented()
+            _refresh_add_block()
+
+        seg_lrgb.bind("<Button-1>", lambda e: _set_add_mode("lrgb"))
+        seg_nb.bind("<Button-1>", lambda e: _set_add_mode("narrowband"))
+
+        # ── LRGB channel add block: one name field + "+" ────────────────
+        add_name_var = tk.StringVar(value="")
+        add_entry = ttk.Entry(lrgb_add_frame, textvariable=add_name_var, width=22,
+                               style="FSAdd.TEntry")
+        add_entry.pack(side="left", fill="x", expand=True)
+
+        _FS_ADD_PLACEHOLDER = "Filter name"
+        _placeholder_state = {"active": False}
+
+        def _show_add_placeholder():
+            if add_name_var.get():
+                return
+            _placeholder_state["active"] = True
+            add_entry.configure(style="FSAddPlaceholder.TEntry")
+            add_name_var.set(_FS_ADD_PLACEHOLDER)
+
+        def _clear_add_placeholder(event=None):
+            if _placeholder_state["active"]:
+                _placeholder_state["active"] = False
+                add_name_var.set("")
+                add_entry.configure(style="FSAdd.TEntry")
+
+        add_entry.bind("<FocusIn>", _clear_add_placeholder)
+        add_entry.bind("<FocusOut>", lambda e: _show_add_placeholder())
+
+        def _do_add_lrgb_member(event=None):
+            nm = add_name_var.get().strip()
+            if not nm or _placeholder_state["active"]:
+                return "break"
+            if any(m["name"].lower() == nm.lower() for m in members):
+                messagebox.showerror("Already in set",
+                                     f"'{nm}' is already in this set.", parent=dlg)
+                return "break"
+            members.append({"name": nm, "type": "lrgb"})
+            add_name_var.set("")
+            _refresh_members_lb()
+            add_entry.focus_set()
+            return "break"
+
+        add_lrgb_btn = ttk.Button(lrgb_add_frame, text="+", width=3, command=_do_add_lrgb_member)
+        add_lrgb_btn.pack(side="left", padx=(4, 0))
+        ToolTip(add_lrgb_btn, "Add this filter to the set")
+        add_entry.bind("<Return>", _do_add_lrgb_member)
+        _show_add_placeholder()
+
+        # ── Narrowband add block: Hα / S2 / O3 slots + shared bandwidth ─
+        existing_bw = existing.get("bandwidth_nm") if existing else None
+        bw_var = tk.StringVar(value=f"{existing_bw:g}" if existing_bw else "7")
+        ha_var, s2_var, o3_var = tk.StringVar(value="Ha"), tk.StringVar(value="SII"), tk.StringVar(value="OIII")
+
+        TRIO_BG = "#1a2b3c"
+        trio_card = tk.Frame(nb_add_frame, bg=TRIO_BG,
+                              highlightbackground="#2e4a63", highlightthickness=1)
+        trio_card.pack(fill="x")
+        _custom_colored.append((trio_card, TRIO_BG, None))
+
+        def _trio_slot(label_text, chip_bg, chip_fg, var):
+            row = tk.Frame(trio_card, bg=TRIO_BG)
+            row.pack(fill="x", padx=10, pady=(8, 0))
+            _custom_colored.append((row, TRIO_BG, None))
+            chip = tk.Label(row, text=label_text, bg=chip_bg, fg=chip_fg, font=("Helvetica", 9, "bold"),
+                             width=3, padx=2, pady=2)
+            chip.pack(side="left")
+            _custom_colored.append((chip, chip_bg, chip_fg))
+            e = ttk.Entry(row, textvariable=var, width=16)
+            e.pack(side="left", padx=(8, 0), fill="x", expand=True)
+            return e
+
+        ha_entry = _trio_slot("Hα", "#3a1a1a", "#ff6b6b", ha_var)
+        s2_entry = _trio_slot("S2", "#2a1a3a", "#b98bff", s2_var)
+        o3_entry = _trio_slot("O3", "#1a2e3a", "#5fd0e8", o3_var)
+
+        nb_bw_row = tk.Frame(trio_card, bg=TRIO_BG)
+        nb_bw_row.pack(fill="x", padx=10, pady=(10, 4))
+        _custom_colored.append((nb_bw_row, TRIO_BG, None))
+        bw_label = tk.Label(nb_bw_row, text="NB Bandwidth (nm):", bg=TRIO_BG, fg="#8a94a3",
+                             font=("Helvetica", 9))
+        bw_label.pack(side="left")
+        _custom_colored.append((bw_label, TRIO_BG, "#8a94a3"))
+        bw_entry = ttk.Entry(nb_bw_row, textvariable=bw_var, width=8)
+        bw_entry.pack(side="left", padx=(6, 0))
+        trio_note = tk.Label(trio_card, text="Shared by every narrowband filter in this set. Leave any\n"
+                                              "slot blank to skip it — you don't have to add all three.",
+                              bg=TRIO_BG, fg="#556677", font=("Helvetica", 8), justify="left")
+        trio_note.pack(fill="x", padx=10, pady=(0, 8), anchor="w")
+        _custom_colored.append((trio_note, TRIO_BG, "#556677"))
+
+        def _do_add_nb_members(event=None):
+            slots = [("Hα", ha_var), ("S2", s2_var), ("O3", o3_var)]
+            non_blank = [(label, var.get().strip()) for label, var in slots if var.get().strip()]
+            if not non_blank:
+                return "break"
+            dupes = [nm for _, nm in non_blank if any(m["name"].lower() == nm.lower() for m in members)]
+            if dupes:
+                messagebox.showerror(
+                    "Already in set",
+                    f"{', '.join(dupes)} {'is' if len(dupes) == 1 else 'are'} already in this set.",
+                    parent=dlg)
+                return "break"
+            for _, nm in non_blank:
+                members.append({"name": nm, "type": "narrowband"})
+            _refresh_members_lb()
+            # Reset to the conventional defaults, ready for another wheel's worth.
+            ha_var.set("Ha"); s2_var.set("SII"); o3_var.set("OIII")
+            return "break"
+
+        add_nb_btn = ttk.Button(nb_add_frame, text="+ Add narrowband filters", command=_do_add_nb_members)
+        add_nb_btn.pack(fill="x", pady=(8, 0))
+        for _e in (ha_entry, s2_entry, o3_entry, bw_entry):
+            _e.bind("<Return>", _do_add_nb_members)
+
+        _refresh_members_lb()
+        _update_segmented()
+        _refresh_add_block()
+
+        # btn_row itself was already created and packed above (see the
+        # comment by _refresh_add_block) — its Cancel/Save buttons are
+        # added into it here, once _do_save is ready to be wired up.
+
+        def _do_save():
+            new_name = name_var.get().strip()
+            if not new_name:
+                messagebox.showerror("Invalid name",
+                                     "Please enter a name for this filter set.", parent=dlg)
+                return
+            if new_name == "Mono Lum":
+                messagebox.showerror("Reserved name",
+                                     "\"Mono Lum\" is a reserved built-in option — "
+                                     "please choose another name.", parent=dlg)
+                return
+            if new_name != name and new_name in self.data.get("filter_sets", {}):
+                messagebox.showerror("Name exists",
+                                     f"A filter set named '{new_name}' already exists.", parent=dlg)
+                return
+            has_nb = any(m["type"] == "narrowband" for m in members)
+            bw_val = None
+            if has_nb:
+                try:
+                    bw_val = float(bw_var.get().strip())
+                except ValueError:
+                    bw_val = None
+                if bw_val is None or bw_val <= 0:
+                    messagebox.showerror("Invalid bandwidth",
+                                         "Please enter a positive bandwidth in nm for "
+                                         "this set's narrowband filters.", parent=dlg)
+                    return
+
+            filter_sets = self.data.setdefault("filter_sets", {})
+            if name and name in filter_sets and name != new_name:
+                del filter_sets[name]
+            filter_sets[new_name] = {"bandwidth_nm": bw_val, "members": [dict(m) for m in members]}
+
+            # Keep the live filter chip pointed at the right place across a rename.
+            if name and name != new_name and self.filter_mode.get() == name:
+                self.filter_mode.set(new_name)
+
+            self._persist_data()
+            self.refresh_dropdowns()
+            if refresh_list is not None:
+                refresh_list(preserve_name=new_name)
+            self._show_toast(f"{'Updated' if name else 'Added'} filter set: {new_name}")
+            dlg.destroy()
+
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="right", padx=(6, 0))
+        ttk.Button(btn_row, text="Save",   command=_do_save   ).pack(side="right")
+        dlg.bind("<Return>", lambda e: _do_save())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        name_entry.focus_set()
+        if not name:
+            name_entry.select_range(0, tk.END)
+
+        self._theme_popup(dlg)
+        # _theme_popup just flattened every plain tk widget above (including
+        # the toggle pills and narrowband trio) to the theme's plain
+        # background — put their deliberate colors back, and re-highlight
+        # whichever toggle pill is actually active.
+        for _widget, _bg, _fg in _custom_colored:
+            _kwargs = {}
+            if _bg is not None:
+                _kwargs["bg"] = _bg
+            if _fg is not None:
+                _kwargs["fg"] = _fg
+            if _kwargs:
+                _widget.configure(**_kwargs)
+        _update_segmented()
+
     def _open_manage_rigs_dialog(self):
         """Open the modal 'Manage Rigs' dialog for rename/update/delete operations."""
         dlg = tk.Toplevel(self.root)
@@ -6992,7 +9917,7 @@ class AstroApp:
         main = ttk.Frame(dlg)
         main.pack(padx=16, pady=14, fill="both", expand=True)
 
-        # ── Left column: list of saved rigs ─────────────────────────────
+        # ── Left column: list of saved rigs ───────────────────────────────────
         left = ttk.Frame(main)
         left.pack(side="left", fill="y", padx=(0, 14))
 
@@ -7000,17 +9925,7 @@ class AstroApp:
                   font=("Helvetica", 9, "bold"),
                   foreground="#778899").pack(anchor="w", pady=(0, 4))
 
-        lb = tk.Listbox(left, height=8, width=22,
-                        font=("Helvetica", 11),
-                        bg="#1e2d3e", fg="#ffffff",
-                        selectbackground="#1e3a5f", selectforeground="#aaddff",
-                        relief="flat", borderwidth=1,
-                        exportselection=False, activestyle="none")
-        lb.pack(fill="y")
-
-        name_list = []   # parallel index → rig name (for reliable lookup)
-
-        # ── Right column: details of selected rig ───────────────────────
+        # ── Right column: details of selected rig ─────────────────────
         right = ttk.Frame(main)
         right.pack(side="left", fill="both", expand=True)
 
@@ -7018,153 +9933,26 @@ class AstroApp:
                   font=("Helvetica", 9, "bold"),
                   foreground="#778899").pack(anchor="w", pady=(0, 4))
 
-        details = tk.Frame(right, bg="#0e1a28", width=220, height=150)
+        lb, details, name_list, detail_labels, refresh_list = \
+            self._build_rig_list_and_details(left, right, list_height=8, list_width=22)
+        lb.pack(fill="y")
+        details.configure(width=220, height=150)
         details.pack(fill="both", expand=True)
         details.pack_propagate(False)
 
-        detail_labels = {}
-        for i, k in enumerate(["Scope", "Reducer", "Camera", "Bortle", "Filter"]):
-            tk.Label(details, text=f"{k}:", bg="#0e1a28", fg="#8a94a3",
-                     font=("Helvetica", 10), anchor="w", width=8
-                     ).grid(row=i, column=0, sticky="w", padx=(10, 4), pady=3)
-            lbl = tk.Label(details, text="—", bg="#0e1a28", fg="#cfd4dc",
-                           font=("Helvetica", 10), anchor="w")
-            lbl.grid(row=i, column=1, sticky="w", padx=(0, 10), pady=3)
-            detail_labels[k.lower()] = lbl
-
-        # ── Button row ──────────────────────────────────────────────────
+        # ── Button row ───────────────────────────────────
         btn_row = ttk.Frame(dlg)
         btn_row.pack(padx=16, pady=(0, 14), fill="x")
 
-        def _selected_name():
-            sel = lb.curselection()
-            if not sel or sel[0] >= len(name_list):
-                return None
-            return name_list[sel[0]]
-
-        def _refresh_list(preserve_name=None):
-            rigs = self.data.get("settings", {}).get("rigs", [])
-            active = self.data.get("settings", {}).get("active_rig", "")
-            lb.delete(0, tk.END)
-            name_list.clear()
-            for r in rigs:
-                name = r.get("name", "")
-                if not name:
-                    continue
-                prefix = "★ " if name == active else "   "
-                lb.insert(tk.END, f"{prefix}{name}")
-                name_list.append(name)
-            # Restore selection to the requested rig if still present
-            if preserve_name and preserve_name in name_list:
-                idx = name_list.index(preserve_name)
-                lb.selection_set(idx)
-                lb.see(idx)
-            elif name_list:
-                lb.selection_set(0)
-            _on_select()
-
-        def _on_select(event=None):
-            sel = lb.curselection()
-            if not sel or sel[0] >= len(name_list):
-                for lbl in detail_labels.values():
-                    lbl.configure(text="—")
-                return
-            rig = self._find_rig(name_list[sel[0]])
-            if rig is None:
-                return
-            detail_labels["scope"].configure(text=rig.get("scope")     or "(none)")
-            detail_labels["reducer"].configure(text=rig.get("reduction") or "1.0×")
-            detail_labels["camera"].configure(text=rig.get("camera")    or "(none)")
-            detail_labels["bortle"].configure(text=rig.get("bortle")    or "(none)")
-            # Filter only applies to mono cameras; show em-dash for color rigs
-            rig_cam = rig.get("camera", "")
-            if rig_cam and self._camera_is_color(rig_cam):
-                detail_labels["filter"].configure(text="— (color sensor)")
-            else:
-                detail_labels["filter"].configure(text=rig.get("filter") or "(none)")
-
-        lb.bind("<<ListboxSelect>>", _on_select)
-
-        def _do_rename():
-            name = _selected_name()
-            if not name:
-                return
-            rig = self._find_rig(name)
-            if not rig:
-                return
-            new_name = simpledialog.askstring("Rename Rig",
-                                               f"Rename '{name}' to:",
-                                               parent=dlg, initialvalue=name)
-            if new_name is None:
-                return
-            new_name = new_name.strip()
-            if not new_name or new_name == name:
-                return
-            if new_name == "Custom…":
-                messagebox.showerror("Reserved name",
-                                     "\"Custom…\" is a reserved label.", parent=dlg)
-                return
-            if self._find_rig(new_name):
-                messagebox.showerror("Name exists",
-                                     f"A rig named '{new_name}' already exists.",
-                                     parent=dlg)
-                return
-            rig["name"] = new_name
-            settings = self.data.setdefault("settings", {})
-            if settings.get("active_rig") == name:
-                settings["active_rig"] = new_name
-            self._persist_data()
-            _refresh_list(preserve_name=new_name)
-            self._refresh_rig_dropdown()
-
-        def _do_update():
-            name = _selected_name()
-            if not name:
-                return
-            rig = self._find_rig(name)
-            if not rig:
-                return
-            if not messagebox.askyesno("Update Rig",
-                                        f"Overwrite '{name}' with the current equipment settings?\n\n"
-                                        "This replaces the saved snapshot with whatever's selected in "
-                                        "the planner right now.",
-                                        parent=dlg):
-                return
-            rig.update(self._current_rig_snapshot())
-            # Rig now matches current chips → make it active
-            self.data.setdefault("settings", {})["active_rig"] = name
-            self._persist_data()
-            _refresh_list(preserve_name=name)
-            self._refresh_rig_dropdown()
-            self._show_toast(f"Updated rig: {name}")
-
-        def _do_delete():
-            name = _selected_name()
-            if not name:
-                return
-            if not messagebox.askyesno("Delete Rig",
-                                        f"Delete the rig '{name}'?\n\nThis cannot be undone.",
-                                        parent=dlg):
-                return
-            settings = self.data.setdefault("settings", {})
-            rigs = settings.setdefault("rigs", [])
-            rigs[:] = [r for r in rigs if r.get("name") != name]
-            if settings.get("active_rig") == name:
-                settings["active_rig"] = ""
-            self._persist_data()
-            _refresh_list()
-            self._refresh_rig_dropdown()
-            self._show_toast(f"Deleted rig: {name}")
-
-        ttk.Button(btn_row, text="Rename", command=_do_rename).pack(side="left")
-        ttk.Button(btn_row, text="Update", command=_do_update).pack(side="left", padx=(6, 0))
-        ttk.Button(btn_row, text="Delete", command=_do_delete).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Rename", command=lambda: self._rig_manager_rename(name_list, lb, refresh_list, dlg)).pack(side="left")
+        ttk.Button(btn_row, text="Update", command=lambda: self._rig_manager_update(name_list, lb, refresh_list, dlg)).pack(side="left", padx=(6, 0))
+        ttk.Button(btn_row, text="Delete", command=lambda: self._rig_manager_delete(name_list, lb, refresh_list, dlg)).pack(side="left", padx=(6, 0))
         ttk.Button(btn_row, text="Close",  command=dlg.destroy).pack(side="right")
         dlg.bind("<Escape>", lambda e: dlg.destroy())
 
         # Initial populate — select the active rig if any, else the first
         active = self.data.get("settings", {}).get("active_rig", "")
-        _refresh_list(preserve_name=active if active else None)
+        refresh_list(preserve_name=active if active else None)
 
         self._theme_popup(dlg)
 
@@ -7422,29 +10210,161 @@ class AstroApp:
         self._theme_popup(dlg)
 
     def on_parameter_change(self, *args):
-        """Called whenever a planner Combobox changes — clears queue-edit link, marks dirty if auto-update is on."""
-        # Skip if we're programmatically restoring equipment from a queue row
-        if getattr(self, "_loading_queue_row", False):
-            return
-        # Clear the queue editing link when equipment changes on the Planner tab —
-        # prevents the new exposure/settings from bleeding into a previously-clicked
-        # queue entry that was configured with different equipment.
-        try:
-            if self.tab_control.select() != str(self.tab_session):
-                self._editing_queue_idx = None
-        except Exception:
-            pass
+        """Called whenever a planner Combobox changes — marks dirty if auto-update is on."""
         # Update the rig chip indicator (shows "Custom…" if chips diverge from
         # the active rig's saved snapshot)
         self._update_rig_indicator()
         if self.auto_update_enabled:
             self._mark_analysis_dirty()
+        # A browsing-grid card's ✓/✚ icon is rig-aware now (see
+        # _build_target_card) -- it reflects whether THIS target already
+        # has a plan entry under the CURRENTLY selected scope/camera/
+        # filter mode. So switching rigs has to re-render the grid, or a
+        # stale checkmark from the old rig sticks around and makes an
+        # addable target look already-planned.
+        self._schedule_grid_rig_refresh()
+
+    def _schedule_grid_rig_refresh(self):
+        """Debounced rescan of the Plan tab's browsing grid after an
+        equipment change.
+
+        Switching rigs via the rig chip fires several StringVar writes
+        back to back (scope, camera, filter mode, reduction all change in
+        one go), each landing here via on_parameter_change. Collapsing
+        those into a single rescan shortly after the last one avoids
+        kicking off a full rescan per write -- same debounce shape as
+        _mark_analysis_dirty/_schedule_analysis above.
+        """
+        if getattr(self, "_grid_rig_refresh_after_id", None) is not None:
+            return  # already scheduled -- don't stack
+        self._grid_rig_refresh_after_id = self.root.after(150, self._run_grid_rig_refresh)
+
+    def _run_grid_rig_refresh(self):
+        """Fire the debounced rescan scheduled by _schedule_grid_rig_refresh."""
+        self._grid_rig_refresh_after_id = None
+        self._refresh_visible_grid()
+
+    def _on_bortle_changed(self, *args):
+        """Sky darkness (Bortle) changed — unconditionally refresh everything
+        that depends on it.
+
+        Bortle lives at the top of the screen as a standalone "sky
+        conditions" setting now, decoupled from rig presets entirely (it's
+        an environmental fact, not equipment). Per Jerry: changing it should
+        always recalculate everything that uses it, regardless of whether
+        Auto Update is on, which tab is currently showing, or whether the
+        Target Planner tab is even reachable in navigation right now — never
+        just mark it dirty and hope the user revisits a tab that shows it.
+
+        So this bypasses _mark_analysis_dirty/_schedule_analysis (both of
+        which gate on tab visibility) and calls the analysis pipeline
+        directly. suppress_incomplete_warning=True keeps this silent when no
+        target/scope/camera is loaded yet -- it fires on every dropdown
+        change, so popping a blocking "Incomplete" dialog just because
+        nothing happens to be selected would be intrusive, not helpful.
+
+        The Plan tab's browsing grid is NOT rescanned here — its visibility
+        filter runs off each catalog target's static magnitude/surface-
+        brightness fields, not the live sky-darkness setting, so there's
+        nothing there for a Bortle change to invalidate.
+
+        Explore's Rig Builder also has no Bortle control of its own anymore
+        (removed — every analyzed rig now reads this same global value), so
+        its currently-shown report is refreshed here too, whether or not the
+        Explore tab happens to be the one on screen right now.
+
+        Tonight's Plan is different from those two: its rows aren't a live
+        view recomputed from scratch on every render — each row's
+        recommended exposure/sub-count was baked in once, at the moment it
+        was added, using whatever Bortle setting was active then. Left
+        alone, a later Bortle change would make every already-added row
+        silently stale (Jerry: "refresh the exposure times on the list of
+        targets when I change the sky/bortle setting"), so every row gets
+        rescaled here too.
+        """
+        self.analyze_framing(suppress_incomplete_warning=True)
+        if hasattr(self, "_explore_report_txt"):
+            self._explore_refresh_report()
+        self._rescale_plan_exposures_for_bortle(self.bortle_choice.get())
+
+    def _rescale_plan_exposures_for_bortle(self, new_bortle_key):
+        """Rescale every Tonight's Plan row's exp_s/n_subs/total_int_hrs for
+        a change in the global sky-darkness (Bortle) setting, then redraw
+        the plan list.
+
+        A full from-scratch recompute (like the one _split_entry_into_plan
+        does when a target is first added) would need each row's original
+        scope geometry and reduction factor — neither of which is stored on
+        the row, only its scope/camera NAMES are. Re-deriving isn't needed
+        though: exp_s is directly proportional to the Bortle sky-background
+        factor and nothing else about a row changes, so each row's new
+        exposure is just its OLD exposure scaled by
+        (its own old Bortle factor ÷ the new one) — exact, using only what's
+        already on the row (its stored "bortle" key from when it was added,
+        its camera, its exp_s, and its allocated_hrs share).
+        """
+        new_b_data = BORTLE_FACTORS.get(new_bortle_key)
+        if new_b_data is None or not self._plan_entries:
+            return
+        changed = False
+        for e in self._plan_entries:
+            old_bortle_key = e.get("bortle") or new_bortle_key
+            if old_bortle_key == new_bortle_key:
+                continue
+            old_b_data = BORTLE_FACTORS.get(old_bortle_key)
+            e["bortle"] = new_bortle_key   # keep this row's own record current either way
+            if old_b_data is None:
+                continue
+            cam = self.data["cameras"].get(e.get("camera", ""), {})
+            key = "color" if cam.get("is_color", True) else "mono"
+            old_val, new_val = old_b_data.get(key), new_b_data.get(key)
+            if not old_val or not new_val:
+                continue
+            new_exp_s = e.get("exp_s", 0.0) * (old_val / new_val)
+            alloc_hrs_this = e.get("allocated_hrs", 0.0)
+            n_subs = int(alloc_hrs_this * 3600.0 / max(new_exp_s, 0.1))
+            e["exp_s"]         = round(new_exp_s, 1)
+            e["n_subs"]        = n_subs
+            e["total_int_hrs"] = round((n_subs * new_exp_s) / 3600.0, 2)
+            changed = True
+        if changed:
+            self._refresh_plan_tree()
 
     # ═══════════════════════════════════════════════════════════════════
     # MAIN ANALYSIS — framing, exposure, imaging window, altitude chart
     # ═══════════════════════════════════════════════════════════════════
 
-    def analyze_framing(self):
+    @staticmethod
+    def _moon_condition(ra_deg, dec_deg):
+        """Categorize how much the Moon interferes with imaging a target
+        right now.
+
+        Shared by the "Analyze Target" results panel and the target-card
+        moon-interference line, so both use identical thresholds instead of
+        duplicating them. Mirrors the exact tiers that used to be inlined in
+        ``_analyze_framing_impl``: negligible illumination, then separation
+        bands at 45° and 20°.
+
+        Returns ``(tag, icon, note, impact, illum_pct, sep_deg)`` — ``tag``
+        is one of "optimal"/"highlight"/"warning" (matches the results
+        panel's text-tag names so callers there don't need translating).
+        """
+        _, illum_pct, _, _, _, _ = _calc_moon_phase()
+        sep_deg, _, _ = _calc_moon_separation(ra_deg, dec_deg)
+        if illum_pct <= 10:
+            return ("optimal", "🟢", f"Moon {illum_pct}% — negligible",
+                     "Negligible interference", illum_pct, sep_deg)
+        elif sep_deg >= 45:
+            return ("optimal", "🟢", f"Moon {sep_deg:.0f}° away ({illum_pct}%)",
+                     "Minimal interference", illum_pct, sep_deg)
+        elif sep_deg >= 20:
+            return ("highlight", "🟡", f"Moon {sep_deg:.0f}° away ({illum_pct}%)",
+                     "Moderate — consider NB filters", illum_pct, sep_deg)
+        else:
+            return ("warning", "🔴", f"Moon {sep_deg:.0f}° away ({illum_pct}%)",
+                     "Significant interference", illum_pct, sep_deg)
+
+    def analyze_framing(self, **kwargs):
         """Public entry point for the main analysis pipeline (re-entrancy-guarded wrapper)."""
         # Re-entrancy guard — if update_idletasks() flushes a stacked call,
         # this prevents it from clearing results_txt mid-draw.
@@ -7452,15 +10372,22 @@ class AstroApp:
             return
         self._analyzing = True
         try:
-            self._analyze_framing_impl()
+            self._analyze_framing_impl(**kwargs)
         finally:
             self._analyzing = False
 
-    def _analyze_framing_impl(self):
+    def _analyze_framing_impl(self, suppress_incomplete_warning=False):
         """Compute FOV, scale, exposure, imaging window, moon separation for the selected target.
 
         Populates self.results_txt with the analysis report, renders the DSS thumbnail
-        and altitude chart, and updates the Targets List's integration-plan preview.
+        and altitude chart, and updates the (now headless) integration-plan state
+        that show_integration_plan reads.
+
+        ``suppress_incomplete_warning`` skips the blocking "Incomplete" dialog
+        when no target/scope/camera is resolved yet — used by
+        :meth:`_on_bortle_changed`, which forces this to run on every sky-
+        darkness change regardless of what else is loaded, and shouldn't pop
+        a dialog just because nothing happens to be selected right now.
         """
         raw = self.target_search.get().strip().upper().replace(" ", "")
         raw = self._normalize_catalog_key(raw)
@@ -7475,7 +10402,7 @@ class AstroApp:
             dynamic_reduction = 1.0
 
         if not t or not s or not c:
-            if not self.auto_update_enabled:
+            if not self.auto_update_enabled and not suppress_incomplete_warning:
                 messagebox.showwarning("Incomplete", "Please select Scope, Camera, and a valid Target.")
             return
 
@@ -7579,29 +10506,9 @@ class AstroApp:
         self.results_txt.insert(tk.END, f"{regime_text}\n", regime_tag)
         self.results_txt.insert(tk.END, "\n")
 
-        # ── Moon separation ───────────────────────────────────────────────
-        _, illum_pct, _, _, _, _ = _calc_moon_phase()
-        sep_deg, _, _ = _calc_moon_separation(t["ra_deg"], t["dec_deg"])
-        if illum_pct <= 10:
-            moon_tag  = "optimal"
-            moon_icon = "🟢"
-            moon_note = f"Moon {illum_pct}% — negligible"
-            moon_impact = "Negligible interference"
-        elif sep_deg >= 45:
-            moon_tag  = "optimal"
-            moon_icon = "🟢"
-            moon_note = f"Moon {sep_deg:.0f}° away ({illum_pct}%)"
-            moon_impact = "Minimal interference"
-        elif sep_deg >= 20:
-            moon_tag  = "highlight"
-            moon_icon = "🟡"
-            moon_note = f"Moon {sep_deg:.0f}° away ({illum_pct}%)"
-            moon_impact = "Moderate — consider NB filters"
-        else:
-            moon_tag  = "warning"
-            moon_icon = "🔴"
-            moon_note = f"Moon {sep_deg:.0f}° away ({illum_pct}%)"
-            moon_impact = "Significant interference"
+        # ── Moon separation (shared with the target-card moon line) ────────
+        moon_tag, _moon_icon, _moon_note, moon_impact, illum_pct, sep_deg = \
+            self._moon_condition(t["ra_deg"], t["dec_deg"])
 
         # Store values the integration planner needs
         self._last_exp_s    = exp
@@ -7616,26 +10523,20 @@ class AstroApp:
             self._last_win_hrs   = win_hrs if win_hrs else None
             self._last_win_start = win_start
             self._last_win_end   = win_end
-            # Auto-fill the Targets List with tonight's actual dark window,
-            # but only if the active queue entry doesn't already have a user-set alloc_hrs.
+            # Auto-fill the (headless) allocated-hours state that
+            # show_integration_plan reads, from tonight's actual dark
+            # window.
             if win_hrs and win_hrs > 0:
-                editing_idx = getattr(self, "_editing_queue_idx", None)
-                has_user_alloc = (
-                    editing_idx is not None
-                    and editing_idx < len(self._queue_entries)
-                    and self._queue_entries[editing_idx].get("alloc_hrs")
-                )
-                if not has_user_alloc:
-                    # Use default_alloc_hrs from settings if configured, else window
-                    default_alloc = self.data.get("settings", {}).get("default_alloc_hrs", "0")
-                    try:
-                        default_alloc_f = float(default_alloc)
-                    except (ValueError, TypeError):
-                        default_alloc_f = 0
-                    if default_alloc_f > 0:
-                        self.session_hours_var.set(f"{default_alloc_f:.1f}")
-                    else:
-                        self.session_hours_var.set(f"{win_hrs:.1f}")
+                # Use default_alloc_hrs from settings if configured, else window
+                default_alloc = self.data.get("settings", {}).get("default_alloc_hrs", "0")
+                try:
+                    default_alloc_f = float(default_alloc)
+                except (ValueError, TypeError):
+                    default_alloc_f = 0
+                if default_alloc_f > 0:
+                    self.session_hours_var.set(f"{default_alloc_f:.1f}")
+                else:
+                    self.session_hours_var.set(f"{win_hrs:.1f}")
 
             # ── TONIGHT'S WINDOW section ──────────────────────────────────
             self.results_txt.insert(tk.END, "━ TONIGHT'S WINDOW ━━━━━━━━━━━━━━━━━━━━\n", "sec_window")
@@ -7675,7 +10576,7 @@ class AstroApp:
         # Store FOV params so the image callback can draw the overlay
         self._fov_params = (fw, fh, t_maj, t_min)
 
-        needed_survey = min(max(fw, fh, 0.1) * 1.6, 5.0)
+        needed_survey = _dss_survey_size_deg(fw, fh)
 
         cached_ok = (self._cached_dss_img is not None
                      and self._cached_dss_target == t['id']
@@ -7685,43 +10586,82 @@ class AstroApp:
         if cached_ok:
             self._draw_fov_overlay(self._cached_dss_img, self._cached_dss_survey_deg, t['id'])
         else:
-            # New target or FOV scale changed significantly — reset framing and fetch fresh DSS
+            # New target or FOV scale changed significantly — reset framing and fetch fresh DSS.
+            #
+            # If this exact target/rig/filter is already on tonight's plan
+            # with a real framing (a pan and/or a rotation), that framing is
+            # what NINA will actually use on export — reopening the Frame
+            # dialog on it (e.g. right after loading a saved session, when
+            # the DSS cache is always empty so this branch always runs)
+            # should show THAT framing, not a blank reset, and "Update
+            # Framing" should never silently overwrite a good saved framing
+            # with a fresh 0°/centered one just because the dialog was
+            # reopened to look at it (Jerry: "saving a session that has
+            # been framed and re-loading it causes the framing to reset").
+            # The pixel pan can't be computed here — it depends on the DSS
+            # image's fetched survey size and the canvas width, neither
+            # known until the fetch below completes — so it's only STAGED
+            # here; _show_dss_result applies it once those are known.
+            existing_framed = next(
+                (pe for pe in self._plan_entries
+                 if pe["target_id"] == t['id'] and pe.get("scope") == s_name
+                 and pe.get("camera") == c_name and pe.get("filter_mode") == self.filter_mode.get()
+                 and (pe.get("rotation_angle") or pe.get("framed_ra_deg") is not None)),
+                None)
             self._fov_offset_x = 0.0
             self._fov_offset_y = 0.0
             self._fov_angle    = 0.0
             self._zoom_level   = 1.0
+            self._pending_frame_restore = {
+                "target_id":      t['id'],
+                "ra0_deg":        t['ra_deg'],
+                "dec0_deg":       t['dec_deg'],
+                "framed_ra_deg":  existing_framed.get("framed_ra_deg"),
+                "framed_dec_deg": existing_framed.get("framed_dec_deg"),
+                "rotation_angle": existing_framed.get("rotation_angle", 0.0) or 0.0,
+            } if existing_framed is not None else None
             self._rot_label.config(text=f"{self._screen_to_sky_pa(0.0):.1f}°")
             self._zoom_label.config(text="1.0×")
             self.preview_canvas.delete("all")
-            self.preview_canvas.create_text(cw//2, ch//2, text="Loading DSS image…", fill="yellow", font=("Helvetica", 9))
+            _lw = self.preview_canvas.winfo_width() or cw
+            _lh = self.preview_canvas.winfo_height() or ch
+            self.preview_canvas.create_text(_lw//2, _lh//2, text="Loading DSS image…", fill="yellow", font=("Helvetica", 9))
             self.root.after(50, lambda: self.fetch_thumbnail(t, fw, fh))
 
-        # Auto-refresh the Targets List tab so it always reflects the current target
+        # Refresh the headless integration-plan state for the current target
+        # (read by the Frame dialog / NINA export, not displayed directly)
         self.root.after(20, lambda: self.show_integration_plan(silent=True))
 
-    def _draw_altitude_chart(self, t, lat, lon):
-        """Draw an altitude-vs-time chart covering tonight's nautical dark window."""
-        canvas = self.alt_canvas
-        canvas.update_idletasks()
-        cw = canvas.winfo_width() or 860
-        ch = canvas.winfo_height() or 180
-        canvas.delete("all")
-        self._moon_bar_hits = []   # reset for this draw
+    def _sample_altitude_series(self, t, lat, lon):
+        """Sample a target's altitude across tonight's nautical-dark window.
 
-        # Text colours depend on night mode
-        nm = self.night_mode
-        fg_main   = "#cc0000" if nm else "#ffffff"
-        fg_dim    = "#880000" if nm else "#aabbcc"
-        fg_label  = "#aa0000" if nm else "#ccaa00"
+        Shared by ``_draw_altitude_chart`` (the full Planner/Frame-dialog chart)
+        and the target-card sparkline, so both draw from identical astronomy
+        math instead of duplicating the dark-window scan.
 
-        # ── Scan full night in 5-min steps to find nautical dark bounds ────
-        real_now      = datetime.now()   # kept for the "Now" marker below
-        utc_offset_h  = _utc_offset_hours()
-
+        Returns a dict:
+          dark_start_jd, dark_end_jd: JD bounds of nautical dark (None if no
+              dark window tonight at this location — other keys are then
+              empty/None and callers should bail out early, same as the old
+              inline "No nautical dark window" message).
+          scan_start, scan_end, total_jd: JD bounds of the padded (±30 min)
+              sample window used for times_h/alts below.
+          n_steps: number of samples in times_h/alts.
+          times_h: local hour-of-day (float, wraps 0-24) per sample.
+          alts: target altitude in degrees per sample, same length/order.
+          moon_rise_frac, moon_set_frac: fractional position (0..1) of moon
+              rise/set within the scan window, or None if it doesn't occur
+              in-window. Convert back to local time via
+              ``scan_start + frac * total_jd`` -> the usual jd-to-local-hour
+              formula, same as the chart does for its rise/set labels.
+          utc_offset_h: local UTC offset used for all the hour conversions
+              above, so callers don't need to recompute it.
+        """
+        utc_offset_h = _utc_offset_hours()
         jd_noon      = _jd_local_noon()
 
-        step_jd  = 5.0 / 1440.0
-        n_full   = int(30 * 60 / 5) + 1   # 30-hour window
+        step_jd = 5.0 / 1440.0
+        n_full  = int(30 * 60 / 5) + 1   # 30-hour window
 
         dark_start_jd = dark_end_jd = None
         been_dark = False
@@ -7738,11 +10678,13 @@ class AstroApp:
                 break   # sun has risen again
 
         if dark_start_jd is None:
-            # No dark window — draw message
-            canvas.create_text(cw // 2, ch // 2,
-                text="No nautical dark window tonight at this location",
-                fill=fg_main, font=("Helvetica", 9))
-            return
+            return {
+                "dark_start_jd": None, "dark_end_jd": None,
+                "scan_start": None, "scan_end": None, "total_jd": None,
+                "n_steps": 0, "times_h": [], "alts": [],
+                "moon_rise_frac": None, "moon_set_frac": None,
+                "utc_offset_h": utc_offset_h,
+            }
 
         # Add 30-min padding on each side so curve doesn't clip at edges
         pad_jd = 30.0 / 1440.0
@@ -7763,8 +10705,7 @@ class AstroApp:
             alts.append(alt)
 
         # ── Moon rise/set within the scan window ────────────────────────────
-        moon_rise_x = moon_set_x = None
-        moon_rise_label = moon_set_label = ""
+        moon_rise_frac = moon_set_frac = None
         prev_moon_alt = None
         for i in range(n_steps):
             jd = scan_start + i * step
@@ -7772,15 +10713,68 @@ class AstroApp:
             m_alt = _ra_dec_to_altaz(m_ra, m_dec, lat, lon, jd)
             if prev_moon_alt is not None:
                 frac_x = i / (n_steps - 1)
-                if prev_moon_alt < 0 <= m_alt and moon_rise_x is None:
-                    moon_rise_x = frac_x
-                    lh = (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
-                    moon_rise_label = f"🌕 {int(lh):02d}:{int((lh%1)*60):02d}"
-                elif prev_moon_alt >= 0 > m_alt and moon_set_x is None:
-                    moon_set_x = frac_x
-                    lh = (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
-                    moon_set_label = f"🌑 {int(lh):02d}:{int((lh%1)*60):02d}"
+                if prev_moon_alt < 0 <= m_alt and moon_rise_frac is None:
+                    moon_rise_frac = frac_x
+                elif prev_moon_alt >= 0 > m_alt and moon_set_frac is None:
+                    moon_set_frac = frac_x
             prev_moon_alt = m_alt
+
+        return {
+            "dark_start_jd": dark_start_jd, "dark_end_jd": dark_end_jd,
+            "scan_start": scan_start, "scan_end": scan_end, "total_jd": total_jd,
+            "n_steps": n_steps, "times_h": times_h, "alts": alts,
+            "moon_rise_frac": moon_rise_frac, "moon_set_frac": moon_set_frac,
+            "utc_offset_h": utc_offset_h,
+        }
+
+    def _draw_altitude_chart(self, t, lat, lon):
+        """Draw an altitude-vs-time chart covering tonight's nautical dark window."""
+        canvas = self.alt_canvas
+        canvas.update_idletasks()
+        cw = canvas.winfo_width() or 860
+        ch = canvas.winfo_height() or 180
+        canvas.delete("all")
+        self._moon_bar_hits = []   # reset for this draw
+
+        # Text colours depend on night mode
+        nm = self.night_mode
+        fg_main   = "#cc0000" if nm else "#ffffff"
+        fg_dim    = "#880000" if nm else "#aabbcc"
+        fg_label  = "#aa0000" if nm else "#ccaa00"
+
+        # ── Sample tonight's dark window + target altitude (shared helper) ──
+        real_now = datetime.now()   # kept for the "Now" marker below
+
+        series = self._sample_altitude_series(t, lat, lon)
+        if series["dark_start_jd"] is None:
+            # No dark window — draw message
+            canvas.create_text(cw // 2, ch // 2,
+                text="No nautical dark window tonight at this location",
+                fill=fg_main, font=("Helvetica", 9))
+            return
+
+        utc_offset_h  = series["utc_offset_h"]
+        dark_start_jd = series["dark_start_jd"]
+        dark_end_jd   = series["dark_end_jd"]
+        scan_start    = series["scan_start"]
+        total_jd      = series["total_jd"]
+        n_steps       = series["n_steps"]
+        times_h       = series["times_h"]
+        alts          = series["alts"]
+
+        # ── Moon rise/set within the scan window ────────────────────────────
+        moon_rise_x = moon_set_x = None
+        moon_rise_label = moon_set_label = ""
+        if series["moon_rise_frac"] is not None:
+            moon_rise_x = series["moon_rise_frac"]
+            jd = scan_start + moon_rise_x * total_jd
+            lh = (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
+            moon_rise_label = f"🌕 {int(lh):02d}:{int((lh%1)*60):02d}"
+        if series["moon_set_frac"] is not None:
+            moon_set_x = series["moon_set_frac"]
+            jd = scan_start + moon_set_x * total_jd
+            lh = (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
+            moon_set_label = f"🌑 {int(lh):02d}:{int((lh%1)*60):02d}"
 
         # ── Layout ─────────────────────────────────────────────────────────
         lm, rm, tm, bm = 46, 16, 22, 28
@@ -7990,76 +10984,308 @@ class AstroApp:
 
         Stale-result guard: the image is fetched on a background thread, and
         the user may switch targets (via Planner search or a queue-card auto-
-        load) before the download completes.  The ``_apply`` callback checks
-        that ``self.current_target_info`` still matches the fetched target
-        before writing the cache or drawing the overlay; a mismatch means the
-        user has moved on and this result is discarded.  Without this guard,
-        a slow-arriving fetch for a previous target will overwrite the FOV
-        canvas with the wrong galaxy.
+        load) before the download completes. ``_show_dss_result``/
+        ``_show_fov_error`` check that ``self.current_target_info`` still
+        matches the fetched target, AND that ``self._fov_wait_token`` still
+        matches the token this call captured, before touching the canvas —
+        either a target switch or a newer fetch_thumbnail() call for the
+        SAME target (e.g. a re-analysis) makes this one's results stale.
+        Without this guard, a slow-arriving fetch can overwrite the FOV
+        canvas with the wrong picture, or fight a newer fetch for it.
+
+        For a wide-FOV rig whose real size needs the "slow lane" (see
+        _dss_fetch_plan), this no longer shows the small fast-lane image
+        while waiting — Jerry: that risked being mistaken for the final,
+        still-clipped result rather than a placeholder. Instead
+        _draw_fov_wait_frame puts up an explicit wait screen (spinner,
+        elapsed time, "this can take up to 90s") with a "Show 5° field
+        instead" pill, and only actually displays a picture once the full
+        request lands, the user cancels, or the slow lane gives up.
         """
         target_id = target_info['id']
 
         # Survey size: show enough sky so the FOV fits with some padding.
-        # We fetch a square patch; the larger of FOV dims sets the size, +40% padding.
-        survey_size = max(fov_w_deg, fov_h_deg, 0.1) * 1.6
-        survey_size = min(survey_size, 5.0)  # SkyView cap
+        # We fetch a square patch; the larger of FOV dims sets the size,
+        # +40% padding. See _dss_fetch_plan for the fast/slow lane split.
+        survey_size = _dss_survey_size_deg(fov_w_deg, fov_h_deg)
+        fast_lane, slow_lane = _dss_fetch_plan(survey_size)
 
-        # DSS2 cutouts are assembled server-side from scanned photographic
-        # plates, and SkyView itself notes that optical fields of several
-        # degrees "can take a long time" to build.  A cold first fetch pegged
-        # at the survey-size cap can therefore exceed a short timeout, throw,
-        # and fall back to the geometric ellipse — independent of the camera,
-        # since any wide sensor clamps to the same cap.  So we give the full
-        # request real headroom, then retry once at a smaller, faster field
-        # before giving up: the FOV box may overflow the smaller image a little,
-        # but the user still sees real sky instead of a bare ellipse.
-        attempts = [(survey_size, 30), (min(survey_size, 3.0), 20)]
+        self._fov_wait_token += 1
+        token = self._fov_wait_token
+        self._cancel_fov_wait_tick()
+        self._fov_wait_fast_ready = None
+        self._fov_wait_cancelled = False
 
-        def _fetch():
-            for size_deg, timeout_s in attempts:
-                try:
-                    pixels = 600  # fetch high-res, we'll downscale
-                    url = (
-                        f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
-                        f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
-                        f"&Size={size_deg:.4f}&Pixels={pixels}&Return=GIF&Catalog=none"
-                    )
-                    req = urllib.request.Request(url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
-                    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                        raw = resp.read()
+        if slow_lane is None:
+            # Narrow FOV — single lane, no wait screen: this was already
+            # fast before the wide-FOV wait state existed, and still is.
+            threading.Thread(
+                target=self._fetch_dss_lane,
+                args=(target_id, fast_lane,
+                      lambda img, deg: self._show_dss_result(target_id, img, deg, token),
+                      lambda: self._show_fov_error(target_id, token)),
+                daemon=True).start()
+            return
 
-                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+        # Wide FOV — put up the wait state, then run both lanes
+        # CONCURRENTLY underneath it (not fast-then-slow): the fast lane
+        # is what Cancel falls back to, the slow lane is the real request.
+        self._fov_wait_target = target_id
+        self._fov_wait_survey_deg = survey_size
+        self._fov_wait_start_ts = time.monotonic()
+        self._fov_wait_angle = 0
+        self._draw_fov_wait_frame(token)
 
-                    def _apply(img=img, fetched_deg=size_deg):
-                        # Discard if the user has navigated to a different target
-                        # while this fetch was in flight.
-                        cur = self.current_target_info
-                        if cur is None or cur.get("id") != target_id:
-                            return
-                        self._cached_dss_img = img
-                        self._cached_dss_target = target_id
-                        self._cached_dss_survey_deg = fetched_deg
-                        self._draw_fov_overlay(img, fetched_deg, target_id)
+        def _fast_success(img, deg):
+            if token != self._fov_wait_token:
+                return  # superseded by a newer fetch_thumbnail() call
+            self._fov_wait_fast_ready = (img, deg)
+            if self._fov_wait_cancelled:
+                self._show_dss_result(target_id, img, deg, token)
 
-                    self.root.after(0, _apply)
-                    return  # success — skip the smaller fallback attempt
-                except Exception:
-                    continue  # slow/failed — fall through to the next attempt
+        def _fast_failed():
+            if token == self._fov_wait_token and self._fov_wait_cancelled:
+                # User asked for the small field, and even that failed —
+                # nothing left to fall back to.
+                self._show_fov_error(target_id, token)
 
-            # Every attempt failed — show the geometric preview, but only if the
-            # user is still on this target (stale-result guard).
-            def _apply_err():
-                cur = self.current_target_info
-                if cur is None or cur.get("id") != target_id:
-                    return
-                self._fov_image_error()
-            self.root.after(0, _apply_err)
+        def _slow_success(img, deg):
+            self._show_dss_result(target_id, img, deg, token)
 
-        threading.Thread(target=_fetch, daemon=True).start()
+        def _slow_failed():
+            if self._fov_wait_fast_ready is not None:
+                img, deg = self._fov_wait_fast_ready
+                self._show_dss_result(target_id, img, deg, token)
+            else:
+                self._show_fov_error(target_id, token)
+
+        threading.Thread(target=self._fetch_dss_lane,
+                          args=(target_id, fast_lane, _fast_success, _fast_failed),
+                          daemon=True).start()
+        threading.Thread(target=self._fetch_dss_lane,
+                          args=(target_id, [slow_lane], _slow_success, _slow_failed),
+                          daemon=True).start()
+
+    def _fetch_dss_lane(self, target_id, lane_attempts, on_success, on_all_failed):
+        """Run one DSS fetch lane (an ordered list of (size_deg, timeout_s)
+        attempts) on a background thread, trying each size until one
+        succeeds. Pure I/O + Tk-safe callback scheduling — does no direct
+        Tk calls itself, so it's safe to run from any thread.
+
+        ``on_success(img, fetched_deg)`` / ``on_all_failed()`` are invoked
+        on the main thread via ``root.after(0, ...)``.
+        """
+        for size_deg, timeout_s in lane_attempts:
+            try:
+                pixels = 600  # fetch high-res, we'll downscale
+                url = (
+                    f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
+                    f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
+                    f"&Size={size_deg:.4f}&Pixels={pixels}&Return=GIF&Catalog=none"
+                )
+                req = urllib.request.Request(url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
+                with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                    raw = resp.read()
+
+                # SkyView returns HTTP 200 with an HTML error/warning page
+                # (not a GIF) for a request it can't honor — e.g. a size it
+                # won't build, or a malformed query — so a successful HTTP
+                # fetch does NOT by itself mean we got a real image.
+                # Image.open() is what actually proves it, and its
+                # exception (below) is what tells us which case this was.
+                img = Image.open(io.BytesIO(raw)).convert("RGB")
+                print(f"[DSS fetch] {target_id}: {size_deg:.2f}° request OK "
+                      f"— {len(raw)} bytes → {img.size[0]}x{img.size[1]}px image")
+                self.root.after(0, lambda img=img, deg=size_deg: on_success(img, deg))
+                return
+            except Exception as exc:
+                # Diagnostic only — printed to the console (visible when
+                # running the .py directly) so a report like "still
+                # clipped" can be tied to a concrete cause (timeout vs.
+                # SkyView rejecting the size vs. something else) instead of
+                # guessed at again.
+                print(f"[DSS fetch] {target_id}: {size_deg:.2f}° request FAILED "
+                      f"(timeout={timeout_s}s): {exc!r}")
+                continue  # slow/failed — fall through to this lane's next size
+        self.root.after(0, on_all_failed)
+
+    def _show_dss_result(self, target_id, img, fetched_deg, token):
+        """Cache and display a fetched DSS image — the shared landing
+        point for every fetch_thumbnail() path (narrow-FOV single lane,
+        wide-FOV fast lane, wide-FOV slow lane, and the post-cancel
+        fast-lane fallback)."""
+        cur = self.current_target_info
+        if cur is None or cur.get("id") != target_id:
+            return  # user moved to a different target while this was in flight
+        if token != self._fov_wait_token:
+            return  # superseded by a newer fetch_thumbnail() call
+        # The fast and slow lanes race — don't let a smaller result that
+        # happens to land SECOND clobber a bigger one already on screen
+        # (matters if the slow lane wins the race, then the fast lane's
+        # own late callback still fires). Scoped to THIS token only: once
+        # token == self._fov_wait_token (checked above), any result here
+        # belongs to the current fetch_thumbnail() call, but the currently
+        # cached image may be a leftover from an EARLIER call (a different
+        # rig/FOV) — comparing sizes against that stale image would wrongly
+        # suppress a legitimately smaller new result (e.g. switching from a
+        # wide rig to a narrow one), which looked like the fetch hanging.
+        cur_deg = self._cached_dss_survey_deg
+        if (self._fov_result_token == token and cur_deg is not None
+                and fetched_deg < cur_deg):
+            return
+        self._cancel_fov_wait_tick()
+        self._cached_dss_img = img
+        self._cached_dss_target = target_id
+        self._cached_dss_survey_deg = fetched_deg
+        self._fov_result_token = token
+        self._apply_pending_frame_restore(target_id, fetched_deg)
+        self._draw_fov_overlay(img, fetched_deg, target_id)
+
+    def _apply_pending_frame_restore(self, target_id, survey_deg):
+        """Restore a previously-saved pan/rotation staged by
+        _analyze_framing_impl's reset branch, now that the DSS fetch has
+        landed and the survey size (needed to convert the saved RA/Dec back
+        into pixels) is finally known. Consumes (clears) the staged restore
+        either way, so it's never mistakenly reapplied to a later, unrelated
+        fetch for a different target."""
+        pending = getattr(self, "_pending_frame_restore", None)
+        self._pending_frame_restore = None
+        if pending is None or pending["target_id"] != target_id:
+            return
+
+        self._fov_angle = self._screen_to_sky_pa(pending["rotation_angle"])
+        self._rot_label.config(text=f"{pending['rotation_angle']:.1f}°")
+
+        framed_ra, framed_dec = pending["framed_ra_deg"], pending["framed_dec_deg"]
+        if framed_ra is None or framed_dec is None:
+            return  # rotation-only framing — no pan to restore
+
+        # Inverse of _framed_center: recover the pixel pan that would have
+        # produced this saved (framed_ra, framed_dec) from the catalog
+        # centre, using the now-known survey size and current canvas/zoom —
+        # same px_per_deg source of truth _framed_center/_draw_fov_overlay
+        # already share.
+        zoom       = getattr(self, "_zoom_level", 1.0) or 1.0
+        canvas_w   = self.preview_canvas.winfo_width() or 240
+        deg_per_px = survey_deg / (canvas_w * zoom)
+        if deg_per_px <= 0:
+            return
+
+        ra0_deg, dec0_deg = pending["ra0_deg"], pending["dec0_deg"]
+        d_north_deg = framed_dec - dec0_deg
+        d_ra_deg    = ((framed_ra - ra0_deg + 540.0) % 360.0) - 180.0  # shortest signed delta
+        cos_dec     = math.cos(math.radians(dec0_deg))
+        d_east_deg  = d_ra_deg * cos_dec
+
+        self._fov_offset_x = -d_east_deg / deg_per_px
+        self._fov_offset_y = -d_north_deg / deg_per_px
+
+    def _show_fov_error(self, target_id, token):
+        """Show the geometric-ellipse fallback — every lane relevant to
+        this fetch has now failed with nothing to show."""
+        cur = self.current_target_info
+        if cur is None or cur.get("id") != target_id:
+            return
+        if token != self._fov_wait_token:
+            return
+        self._cancel_fov_wait_tick()
+        self._fov_image_error()
+
+    def _cancel_fov_wait_tick(self):
+        """Stop the wide-field wait screen's spinner/elapsed-timer redraw
+        loop, if one is scheduled. Idempotent — safe to call any time."""
+        if self._fov_wait_after_id is not None:
+            try:
+                self.root.after_cancel(self._fov_wait_after_id)
+            except Exception:
+                pass
+            self._fov_wait_after_id = None
+
+    def _draw_fov_wait_frame(self, token):
+        """Draw one frame of the wide-field wait screen (spinner, message,
+        elapsed timer, and — unless already cancelled — a 'Show 5° field
+        instead' pill) and reschedule itself. Stops on its own once
+        superseded (token mismatch) or once the user has navigated away."""
+        if token != self._fov_wait_token:
+            return
+        cur = self.current_target_info
+        if cur is None or cur.get("id") != self._fov_wait_target:
+            return
+
+        cw = self.preview_canvas.winfo_width() or 240
+        ch = self.preview_canvas.winfo_height() or 240
+        self.preview_canvas.delete("all")
+        self.preview_canvas.create_rectangle(0, 0, cw, ch, fill="#0a1420", outline="")
+
+        cx, cy = cw // 2, ch // 2 - 22
+        r = 17
+        self._fov_wait_angle = (self._fov_wait_angle + 24) % 360
+        self.preview_canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                         outline="#1e2d3e", width=3)
+        self.preview_canvas.create_arc(cx - r, cy - r, cx + r, cy + r,
+                                        start=self._fov_wait_angle, extent=100,
+                                        style="arc", outline="#38bdf8", width=3)
+
+        if self._fov_wait_cancelled:
+            msg = "Fetching 5° field…"
+            sub1 = "showing that instead of the full"
+            sub2 = f"{self._fov_wait_survey_deg:.1f}° field"
+        else:
+            msg = "Fetching wide field…"
+            sub1 = f"{self._fov_wait_target} needs a {self._fov_wait_survey_deg:.1f}° image —"
+            sub2 = "this can take up to 90s"
+
+        self.preview_canvas.create_text(cx, cy + 32, text=msg,
+                                         fill="#ffffff", font=("Helvetica", 10, "bold"))
+        self.preview_canvas.create_text(cx, cy + 49, text=sub1,
+                                         fill="#7f93a6", font=("Helvetica", 8))
+        self.preview_canvas.create_text(cx, cy + 62, text=sub2,
+                                         fill="#7f93a6", font=("Helvetica", 8))
+
+        elapsed = int(time.monotonic() - self._fov_wait_start_ts)
+        self.preview_canvas.create_text(cx, cy + 79, text=f"{elapsed}s elapsed",
+                                         fill="#4a6478", font=("Helvetica", 8))
+
+        if not self._fov_wait_cancelled:
+            pill_id = self.preview_canvas.create_text(
+                cx, cy + 101, text="Show 5° field instead",
+                fill="#aaddff", font=("Helvetica", 8, "bold"))
+            bbox = self.preview_canvas.bbox(pill_id)
+            if bbox:
+                pad = 6
+                bg_id = self.preview_canvas.create_rectangle(
+                    bbox[0] - pad, bbox[1] - 4, bbox[2] + pad, bbox[3] + 4,
+                    fill="#182636", outline="#2a3f55")
+                self.preview_canvas.tag_lower(bg_id, pill_id)
+                for item in (bg_id, pill_id):
+                    self.preview_canvas.tag_bind(
+                        item, "<Button-1>", lambda e, t=token: self._fov_wait_cancel(t))
+                    self.preview_canvas.tag_bind(
+                        item, "<Enter>", lambda e: self.preview_canvas.configure(cursor="hand2"))
+                    self.preview_canvas.tag_bind(
+                        item, "<Leave>", lambda e: self.preview_canvas.configure(cursor=""))
+
+        self._fov_wait_after_id = self.root.after(90, lambda: self._draw_fov_wait_frame(token))
+
+    def _fov_wait_cancel(self, token):
+        """'Show 5° field instead' pill handler: stop waiting on the slow
+        lane's full-size request and show the fast lane's result the
+        moment it's available (immediately, if it already landed)."""
+        if token != self._fov_wait_token:
+            return
+        self._fov_wait_cancelled = True
+        if self._fov_wait_fast_ready is not None:
+            img, deg = self._fov_wait_fast_ready
+            self._show_dss_result(self._fov_wait_target, img, deg, token)
+        # else: the fast lane hasn't landed yet — _draw_fov_wait_frame's
+        # next tick switches the message to "Fetching 5° field…", and
+        # _fast_success (in fetch_thumbnail) will display it the moment
+        # it arrives.
 
     def _draw_fov_overlay(self, dss_img, survey_deg, target_id):
         """Scale DSS image to the canvas and draw the sensor FOV rectangle (with pan/rotate) on top."""
-        cw, ch = 240, 240
+        cw = self.preview_canvas.winfo_width() or 240
+        ch = self.preview_canvas.winfo_height() or 240
 
         # Apply zoom: center-crop a 1/zoom fraction of the image then resize to canvas
         zoom = max(1.0, self._zoom_level)
@@ -8110,7 +11336,15 @@ class AstroApp:
             self.preview_canvas.create_line(cx, cy-arm, cx, cy+arm, fill="yellow", width=1)
 
         fits = self._fov_params and self._fov_params[0] >= self._fov_params[2] and self._fov_params[1] >= self._fov_params[3]
-        label = f"{target_id}  {'✅ fits' if fits else '❌ too big'}  {self._screen_to_sky_pa(self._fov_angle):.1f}°"
+        # "img N.N°" is the actual sky field the DISPLAYED picture covers —
+        # separate from the ✅/❌ above, which is about whether the sensor
+        # frame contains the TARGET's own angular size. When the frame
+        # overlay itself runs off the edge of the picture, this number is
+        # what to check: if it's smaller than expected, a large request
+        # fell back to a smaller one (see the [DSS fetch] console log for
+        # why) rather than the frame math being wrong.
+        label = (f"{target_id}  {'✅ fits' if fits else '❌ too big'}  "
+                 f"{self._screen_to_sky_pa(self._fov_angle):.1f}°  ·  img {survey_deg:.1f}°")
         self.preview_canvas.create_text(cw//2+1, ch-9,  text=label, fill="black", font=("Helvetica", 8, "bold"))
         self.preview_canvas.create_text(cw//2,   ch-10, text=label, fill="white", font=("Helvetica", 8, "bold"))
 
@@ -8125,7 +11359,8 @@ class AstroApp:
 
     def _fov_centre(self):
         """Return the current (x, y) centre of the FOV overlay on the preview canvas."""
-        cw, ch = 240, 240
+        cw = self.preview_canvas.winfo_width() or 240
+        ch = self.preview_canvas.winfo_height() or 240
         return cw / 2 + self._fov_offset_x, ch / 2 + self._fov_offset_y
 
     @staticmethod
@@ -8155,11 +11390,16 @@ class AstroApp:
     def _framed_center(self, ra0_deg, dec0_deg):
         """Return (ra_deg, dec_deg) of the FOV box centre after any pan.
 
-        The preview maps sky to canvas as px_per_deg = 240 / survey_deg * zoom,
-        and the pan is accumulated in canvas pixels (self._fov_offset_x/y).
-        SkyView DSS2 images are North-up / East-left, so screen +x is West and
-        screen +y is South.  The box centre is positioned before the box
-        rotation is applied, so the rotation angle is not needed here.
+        The preview maps sky to canvas as px_per_deg = canvas_width / survey_deg
+        * zoom, and the pan is accumulated in canvas pixels (self._fov_offset_x/y).
+        Reads the live preview canvas width so this stays correct regardless of
+        which widget self.preview_canvas currently points at (the Planner tab's
+        240px canvas, or the Frame dialog's larger one) — same source of truth
+        ``_draw_fov_overlay``/``_fov_centre`` use, so all three always agree on
+        the same pixel scale.  SkyView DSS2 images are North-up / East-left, so
+        screen +x is West and screen +y is South.  The box centre is positioned
+        before the box rotation is applied, so the rotation angle is not needed
+        here.
 
         Falls back to the catalog centre when there is no pan or the survey
         scale is unknown.
@@ -8173,7 +11413,8 @@ class AstroApp:
         if (offset_x == 0.0 and offset_y == 0.0) or not survey_deg:
             return ra0_deg, dec0_deg
 
-        deg_per_px  = survey_deg / (240.0 * zoom)
+        canvas_w    = self.preview_canvas.winfo_width() or 240
+        deg_per_px  = survey_deg / (canvas_w * zoom)
         d_east_deg  = -offset_x * deg_per_px   # screen +x (right) = West  = -East
         d_north_deg = -offset_y * deg_per_px   # screen +y (down)  = South = -North
 
@@ -8258,7 +11499,8 @@ class AstroApp:
 
     def _fov_image_error(self):
         """Display 'DSS image unavailable' fallback on the preview canvas."""
-        cw, ch = 240, 240
+        cw = self.preview_canvas.winfo_width() or 240
+        ch = self.preview_canvas.winfo_height() or 240
         self.preview_canvas.delete("all")
         self.preview_canvas.create_text(cw//2, ch//2 - 10, text="DSS image unavailable", fill="gray", font=("Helvetica", 9))
         self.preview_canvas.create_text(cw//2, ch//2 + 10, text="(check network)", fill="gray", font=("Helvetica", 8))
@@ -8315,8 +11557,35 @@ class AstroApp:
         self._explore_view = None        # {"img": PIL|None, "deg": span, "target_id": id}
         self._explore_fetch_seq = 0      # stale-fetch guard (monotonic counter)
         self._explore_hilite = None      # key of hover-highlighted rig, or None
+        self._explore_active_rig_key = None  # key of the rig whose report shows on the right
         self._explore_photo = None       # keep PhotoImage alive
-        self._explore_photo_cache = None # (img ref, deg, photo) → avoid re-resizing per hover
+        self._explore_photo_cache = None # (img ref, deg, zoom, photo) → avoid re-resizing per hover
+        self._explore_pa_deg = 0.0       # shared NINA-style sky PA (CCW N→E); applied to every visible rig frame
+        self._explore_zoom   = 1.0       # shared zoom (1.0–16.0), crop+resize of the fetched image
+        self._explore_redraw_after_id = None  # throttle guard — see _explore_schedule_redraw
+
+        # Wide-field wait state — same idea as the Planner tab's
+        # fetch_thumbnail/_draw_fov_wait_frame: shown instead of a picture
+        # while a DSS request big enough to need the "slow lane" is still
+        # in flight, with a live elapsed timer and a "Show 5° field
+        # instead" cancel pill drawn on the Explore canvas.
+        self._explore_wait_token = 0
+        self._explore_wait_after_id = None
+        self._explore_wait_fast_ready = None   # (img, fetched_deg), cached for Cancel
+        self._explore_wait_cancelled = False
+        self._explore_wait_target_id = None
+        self._explore_wait_span_deg = None
+        self._explore_wait_start_ts = None
+        self._explore_wait_angle = 0
+        self._explore_result_token = None  # token that produced the currently cached/
+                                            # displayed image — see _explore_show_result's
+                                            # size tie-break, which must only compare
+                                            # results racing within the SAME _explore_fetch()
+                                            # call, never against a stale image left over
+                                            # from an earlier call for a different rig set
+        self._explore_pan_x  = 0.0       # shared pixel pan — moves every visible frame together,
+        self._explore_pan_y  = 0.0       # same as _explore_pa_deg, while the DSS image stays fixed
+        self._explore_dragging = False   # click-drag on the canvas pans; rotation stays on the slider
 
         RAIL_BG = "#131f2e"
 
@@ -8366,6 +11635,23 @@ class AstroApp:
             state="readonly")
         self.explore_reduction_dropdown.pack(fill="x", padx=12, pady=(0, 6))
 
+        # Bortle (sky darkness) isn't part of the Rig Builder anymore — it's
+        # a single global "sky conditions" setting that lives in the header
+        # (see setup_header / _on_bortle_changed), and every analyzed rig's
+        # report here reads that live value rather than a per-rig snapshot.
+
+        # Filter-mode combo — only shown once a mono camera is selected
+        # (mirrors the Planner tab's own filter_mode chip/toggle_filter_visibility,
+        # but as a separate StringVar/widget since Explore can hold several
+        # rigs with different filter sets analyzed at once).
+        self.explore_filter_var = tk.StringVar(value="Mono Lum")
+        self.explore_filter_dropdown = ttk.Combobox(
+            rail, textvariable=self.explore_filter_var,
+            values=self._filter_mode_choices(), state="readonly")
+        ToolTip(self.explore_filter_dropdown,
+                "Filter set for this rig — narrows the\nsky-flux estimate for narrowband/LRGB")
+        self.explore_camera_var.trace_add('write', self._explore_toggle_filter_visibility)
+
         analyze_row = tk.Frame(rail, bg=RAIL_BG)
         analyze_row.pack(fill="x", padx=12, pady=(0, 4))
         explore_analyze_btn = ttk.Button(analyze_row, text="⊕ Analyze",
@@ -8407,18 +11693,138 @@ class AstroApp:
         self._explore_span_lbl = tk.Label(status_row, text="", bg="#0e1a28",
                                           fg="#7eb8d4", font=("Helvetica", 9))
         self._explore_span_lbl.pack(side="left")
+        # "Show Sky Map" — moved here from the (now hidden) Planner tab,
+        # above the FOV image, and rewired to Explore's own target/active-
+        # rig/rotation state (see _explore_open_sky_map) rather than the
+        # Planner tab's separate framing state.
+        explore_skymap_btn = ttk.Button(status_row, text="Show Sky Map",
+                                        command=self._explore_open_sky_map)
+        explore_skymap_btn.pack(side="left", padx=(12, 0))
+        ToolTip(explore_skymap_btn, "Open the interactive sky map centred\n"
+                                    "on the current target and active rig")
         explore_reload_btn = ttk.Button(status_row, text="⟳", width=3,
                                         command=lambda: self._explore_ensure_image(force=True))
         explore_reload_btn.pack(side="right")
         ToolTip(explore_reload_btn, "Re-download the DSS image\n(sized to the largest analyzed FOV)")
-        tk.Label(status_row, text="frames centred on target · PA 0° · N up / E left",
+        tk.Label(status_row, text="frames centred on target · N up / E left",
                  bg="#0e1a28", fg="#556677", font=("Helvetica", 8)).pack(side="right", padx=(0, 10))
 
         cpx = self._EXPLORE_CANVAS_PX
-        self.explore_canvas = tk.Canvas(right, width=cpx, height=cpx, bg="black",
+
+        content_row = tk.Frame(right, bg="#0e1a28")
+        content_row.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+
+        canvas_col = tk.Frame(content_row, bg="#0e1a28")
+        canvas_col.pack(side="left", anchor="n")
+
+        self.explore_canvas = tk.Canvas(canvas_col, width=cpx, height=cpx, bg="black",
                                         highlightthickness=1, highlightbackground="#2e4a63")
-        self.explore_canvas.pack(padx=14, pady=(0, 10), anchor="n")
-        self._explore_draw_empty()
+        self.explore_canvas.pack()
+        self.explore_canvas.bind("<MouseWheel>", self._explore_mousewheel)   # Windows / macOS
+        self.explore_canvas.bind("<Button-4>",   self._explore_mousewheel)   # Linux scroll up
+        self.explore_canvas.bind("<Button-5>",   self._explore_mousewheel)   # Linux scroll down
+        # Click-drag pans every visible rig frame together over the fixed
+        # DSS image (rotation stays on the slider below, which already
+        # spins every frame together too — no need to handle frames
+        # separately for either).
+        self.explore_canvas.bind("<ButtonPress-1>",   self._explore_fov_mouse_down)
+        self.explore_canvas.bind("<B1-Motion>",       self._explore_fov_mouse_drag)
+        self.explore_canvas.bind("<ButtonRelease-1>", self._explore_fov_mouse_up)
+
+        # Zoom pill — floats on the canvas's own top-right corner via
+        # .place(), so it's a real ttk.Button pair (not a canvas item) and
+        # is completely untouched by _explore_redraw's cv.delete("all").
+        # Each click steps by the same ×1.25 factor the mousewheel uses,
+        # clamped to 1.0–16.0, reusing the identical crop/resize redraw —
+        # no continuous-drag path left to desync from the mouse.
+        zoom_pill = tk.Frame(self.explore_canvas, bg="#131f2e",
+                             highlightthickness=1, highlightbackground="#3a5a7a")
+        zoom_plus_btn = ttk.Button(zoom_pill, text="+", width=2,
+                                   style="ExploreZoom.TButton",
+                                   command=lambda: self._explore_apply_zoom(1.25))
+        zoom_plus_btn.pack(fill="x")
+        tk.Frame(zoom_pill, bg="#3a5a7a", height=1).pack(fill="x")
+        zoom_minus_btn = ttk.Button(zoom_pill, text="−", width=2,
+                                    style="ExploreZoom.TButton",
+                                    command=lambda: self._explore_apply_zoom(1 / 1.25))
+        zoom_minus_btn.pack(fill="x")
+        tk.Frame(zoom_pill, bg="#3a5a7a", height=1).pack(fill="x")
+        self._explore_zoom_label = tk.Label(zoom_pill, text="1.0×", bg="#131f2e", fg="#cc8833",
+                                            font=("Helvetica", 8, "bold"))
+        self._explore_zoom_label.pack(fill="x", pady=(2, 3))
+        zoom_pill.place(in_=self.explore_canvas, relx=1.0, x=-10, y=10, anchor="ne")
+        ToolTip(zoom_pill, "Zoom in/out (scroll wheel over the image works too)")
+
+        # Rotate bar — one shared slider spins every visible rig frame
+        # together; the DSS image itself stays fixed North-up, same
+        # convention as the Planner tab's FOV preview.
+        rotate_bar = tk.Frame(canvas_col, bg="#131f2e")
+        rotate_bar.pack(fill="x", pady=(6, 0))
+        tk.Label(rotate_bar, text="↻ ROTATE", bg="#131f2e", fg="#778899",
+                 font=("Helvetica", 9)).pack(side="left", padx=(8, 6))
+        self._explore_pa_var = tk.DoubleVar(value=0.0)
+        explore_pa_scale = ttk.Scale(rotate_bar, from_=0.0, to=360.0, orient="horizontal",
+                                     variable=self._explore_pa_var,
+                                     style="Explore.Horizontal.TScale",
+                                     command=self._explore_on_rotate)
+        explore_pa_scale.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
+        self._explore_pa_label = tk.Label(rotate_bar, text="0.0°",
+                                          bg="#131f2e", fg="#cc8833",
+                                          font=("Helvetica", 9, "bold"), width=6, anchor="e")
+        self._explore_pa_label.pack(side="left")
+        explore_reset_lbl = tk.Label(rotate_bar, text="reset", bg="#131f2e", fg="#7eb8d4",
+                                     font=("Helvetica", 8), cursor="hand2")
+        explore_reset_lbl.pack(side="left", padx=(8, 8))
+        explore_reset_lbl.bind("<Button-1>", lambda e: self._explore_reset_view())
+        ToolTip(explore_pa_scale,
+               "Rotate every visible rig frame together\n(the image itself stays fixed North-up)")
+        ToolTip(explore_reset_lbl, "Reset rotation, zoom, and pan\nto 0° / 1.0× / centred")
+
+        tk.Label(canvas_col, text="drag the image to pan every frame",
+                 bg="#0e1a28", fg="#556677", font=("Helvetica", 8)).pack(pady=(2, 0))
+
+        # ── Report column — the Planner tab's framing/exposure/window/moon
+        # report, relocated here so it sits beside the shared image instead
+        # of on its own tab. Explore can hold up to 6 analyzed rigs at once,
+        # so a row of rig chips picks which one's report is showing; clicking
+        # a rig's legend card in the rail (see _explore_refresh_cards) does
+        # the same thing. ────────────────────────────────────────────────
+        report_col = tk.Frame(content_row, bg="#131f2e",
+                              highlightthickness=1, highlightbackground="#2e4a63")
+        report_col.pack(side="left", fill="both", expand=True, padx=(14, 0))
+
+        self._explore_chip_frame = tk.Frame(report_col, bg="#131f2e")
+        self._explore_chip_frame.pack(fill="x", padx=10, pady=(10, 0))
+
+        report_body = tk.Frame(report_col, bg="#131f2e")
+        report_body.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        self._explore_report_txt = tk.Text(report_body, font=("Helvetica", 11), wrap="word",
+                                           width=32, height=14, padx=6, pady=4,
+                                           relief="flat", borderwidth=0,
+                                           bg="#263545", fg="#ffffff", insertbackground="#ffffff")
+        report_sb = ttk.Scrollbar(report_body, orient="vertical",
+                                  command=self._explore_report_txt.yview)
+        self._explore_report_txt.configure(yscrollcommand=report_sb.set)
+        self._explore_report_txt.pack(side="left", fill="both", expand=True)
+        report_sb.pack(side="right", fill="y")
+        self._explore_report_txt.tag_configure("optimal",   foreground="#4caf50", font=("Helvetica", 11, "bold"))
+        self._explore_report_txt.tag_configure("warning",   foreground="#ef5350", font=("Helvetica", 11, "bold"))
+        self._explore_report_txt.tag_configure("highlight", foreground="#38bdf8", font=("Helvetica", 11, "bold"))
+        self._explore_report_txt.tag_configure("header",    foreground="#ffffff", font=("Helvetica", 13, "bold"))
+        self._explore_report_txt.tag_configure("sec_framing",  foreground="#38bdf8", font=("Helvetica", 10, "bold"))
+        self._explore_report_txt.tag_configure("sec_exposure", foreground="#f59e0b", font=("Helvetica", 10, "bold"))
+        self._explore_report_txt.tag_configure("sec_window",   foreground="#4caf50", font=("Helvetica", 10, "bold"))
+        self._explore_report_txt.tag_configure("sec_moon",     foreground="#ef5350", font=("Helvetica", 10, "bold"))
+        self._explore_report_txt.tag_configure("dim",          foreground="#778899", font=("Helvetica", 11))
+        self._explore_report_txt.tag_configure("amber",        foreground="#f59e0b", font=("Helvetica", 11, "bold"))
+
+        # Animated idle graphic shown until the first real target is
+        # loaded (see _start_startup_bloom's docstring) -- replaces the
+        # plain "Explore — compare rigs on a target" text just for this
+        # initial, from-launch empty state; clearing a search later still
+        # falls back to that plain text via _explore_draw_empty as before.
+        self._start_startup_bloom()
+        self._explore_refresh_report()
 
     # ── Search plumbing (shares the Planner's floating suggestion popup) ──
 
@@ -8460,6 +11866,9 @@ class AstroApp:
         changed = (self._explore_target is None
                    or self._explore_target.get("id") != t.get("id"))
         self._explore_target = t
+        # A real target is loaded -- permanently stop the startup bloom
+        # animation (see _start_startup_bloom's docstring; one-way flag).
+        self._bloom_active = False
         common = t['common'].split(';')[0].strip() if t.get('common') else ""
         size_str = ""
         if t.get("size_maj"):
@@ -8468,8 +11877,23 @@ class AstroApp:
             text=f"{t['id']}{('  —  ' + common) if common else ''}\n"
                  f"{t.get('obj_type', 'Object')}{size_str}")
         self._explore_refresh_cards()
+        self._explore_refresh_report()
         if fetch:
             self._explore_ensure_image(force=changed)
+
+    def _explore_toggle_filter_visibility(self, *args):
+        """Show or hide the Rig Builder's filter-mode dropdown based on
+        whether the currently selected camera is mono — mirrors the
+        Planner tab's toggle_filter_visibility, but for Explore's own
+        separate explore_camera_var/explore_filter_var pair."""
+        c = self.data["cameras"].get(self.explore_camera_var.get())
+        show = bool(c and not c.get("is_color", True))
+        if show:
+            if not self.explore_filter_dropdown.winfo_ismapped():
+                self.explore_filter_dropdown.pack(fill="x", padx=12, pady=(0, 6),
+                                                  after=self.explore_reduction_dropdown)
+        else:
+            self.explore_filter_dropdown.pack_forget()
 
     # ── Analysis ──────────────────────────────────────────────────────────
 
@@ -8525,13 +11949,29 @@ class AstroApp:
             slot = next(i for i in range(self._EXPLORE_MAX_RIGS) if i not in used)
             color, dash = self._EXPLORE_PALETTE[slot]
 
+            is_color = c.get("is_color", True)
+            filter_mode = None if is_color else (self.explore_filter_var.get() or "Mono Lum")
+
             self._explore_rigs.append({
                 "key": key, "scope": s_name, "camera": c_name, "reduction": red_str,
                 "fov_w": fov_w, "fov_h": fov_h, "scale": scale,
                 "eff_fl": eff_fl, "f_ratio": eff_fl / aperture,
                 "slot": slot, "color": color, "dash": dash, "visible": True,
+                # Filter mode is still captured per-rig at analyze time (not
+                # re-read live later) so a rig's report stays put even if the
+                # filter chip changes while comparing — only re-analyzing
+                # that combo updates its own report. Bortle is NOT captured
+                # here anymore — it's a single global sky-conditions setting
+                # now, so every rig's report always reads it live (see
+                # _explore_compute_report / _on_bortle_changed).
+                "filter_mode": filter_mode,
+                "is_color": is_color,
             })
+            # Newest rig becomes the one shown in the report panel — same
+            # "just analyzed" default the Planner tab's single box always had.
+            self._explore_active_rig_key = key
             self._explore_refresh_cards()
+            self._explore_refresh_report()
         finally:
             # Runs on success AND on every early return above, so the canvas
             # never shows a stale target after a deferred-fetch load.
@@ -8563,10 +12003,23 @@ class AstroApp:
 
     def _explore_needed_span(self):
         """Sky span (deg) the image should cover: the largest visible FOV or
-        the target itself, plus padding, capped at SkyView's 5° limit."""
-        dims = [max(r["fov_w"], r["fov_h"]) for r in self._explore_rigs if r["visible"]]
+        the target itself, plus padding.
+
+        No longer capped at a flat 5deg — a wide-FOV rig (or several
+        stacked rigs) can legitimately need more sky than that, and
+        capping the REQUEST just guaranteed the frames wouldn't fit the
+        picture (see _dss_fetch_plan, which is what actually protects
+        against a wide request being slow: a fast fallback lane runs
+        alongside the real one instead of a request being shrunk
+        up front).
+
+        Uses each rig's diagonal (not its raw width/height) so the frame
+        still fits the fetched image at any rotation — the rotate slider
+        spins frames in screen space without changing the fetched span.
+        """
+        dims = [math.hypot(r["fov_w"], r["fov_h"]) for r in self._explore_rigs if r["visible"]]
         base = max(dims + [self._explore_target_span_deg() * 1.2, 0.2])
-        return min(base * 1.35, 5.0)
+        return base * 1.35
 
     def _explore_ensure_image(self, force=False):
         """Fetch a DSS image if the current one is missing, for the wrong
@@ -8585,52 +12038,387 @@ class AstroApp:
         self._explore_fetch(t, span)
 
     def _explore_fetch(self, t, span_deg):
-        """Background DSS fetch with the Planner's two-attempt strategy and a
-        sequence-number stale guard.  Falls back to the geometric view."""
+        """Fetch a DSS image sized to show every visible rig frame, using
+        the same fast-lane/slow-lane split as the Planner tab's
+        fetch_thumbnail (see _dss_fetch_plan): a small/quick request runs
+        alongside the real one instead of after it, so a wide span (needing
+        the slow lane) doesn't stall the whole view behind a long timeout
+        before showing anything.
+
+        Stale-result guard: self._explore_fetch_seq is a monotonic counter
+        bumped on every call — if the user picks a different target or
+        rig set while a fetch is in flight, a late-arriving result checks
+        its own captured ``seq`` against the current one and discards
+        itself on a mismatch, the same principle as the Planner tab's
+        current_target_info check.
+
+        For a span needing the slow lane, this no longer shows the small
+        fast-lane image while waiting (Jerry: same fix as the Planner
+        tab, applied here too — "let's do the same thing for the explore
+        panel"). Instead _draw_explore_wait_frame puts up an explicit
+        wait screen (spinner, elapsed time, "this can take up to 90s")
+        with a "Show 5° field instead" pill, and only actually displays a
+        picture once the full request lands, the user cancels, or every
+        lane gives up.
+        """
         self._explore_fetch_seq += 1
         seq = self._explore_fetch_seq
         target_id = t["id"]
-        self._explore_view = None          # marks "loading" for _explore_redraw
+
+        fast_lane, slow_lane = _dss_fetch_plan(span_deg)
+
+        self._explore_wait_token += 1
+        token = self._explore_wait_token
+        self._cancel_explore_wait_tick()
+        self._explore_wait_fast_ready = None
+        self._explore_wait_cancelled = False
+
+        if slow_lane is None:
+            # Narrow span — single lane, no wait screen: this was already
+            # fast before the wide-field wait state existed, and still is.
+            self._explore_view = None          # marks "loading" for _explore_redraw
+            self._explore_redraw()
+            threading.Thread(
+                target=self._fetch_dss_lane,
+                args=(target_id, fast_lane,
+                      lambda img, deg: self._explore_show_result(target_id, seq, img, deg, token),
+                      lambda: self._explore_show_error(target_id, seq, token)),
+                daemon=True).start()
+            return
+
+        # Wide span — put up the wait state, then run both lanes
+        # CONCURRENTLY underneath it (not fast-then-slow): the fast lane
+        # is what Cancel falls back to, the slow lane is the real request.
+        self._explore_wait_target_id = target_id
+        self._explore_wait_span_deg = span_deg
+        self._explore_wait_start_ts = time.monotonic()
+        self._explore_wait_angle = 0
+        self._draw_explore_wait_frame(token, seq)
+
+        def _fast_success(img, deg):
+            if token != self._explore_wait_token:
+                return  # superseded by a newer _explore_fetch() call
+            self._explore_wait_fast_ready = (img, deg)
+            if self._explore_wait_cancelled:
+                self._explore_show_result(target_id, seq, img, deg, token)
+
+        def _fast_failed():
+            if token == self._explore_wait_token and self._explore_wait_cancelled:
+                # User asked for the small field, and even that failed.
+                self._explore_show_error(target_id, seq, token)
+
+        def _slow_success(img, deg):
+            self._explore_show_result(target_id, seq, img, deg, token)
+
+        def _slow_failed():
+            if self._explore_wait_fast_ready is not None:
+                img, deg = self._explore_wait_fast_ready
+                self._explore_show_result(target_id, seq, img, deg, token)
+            else:
+                self._explore_show_error(target_id, seq, token)
+
+        threading.Thread(target=self._fetch_dss_lane,
+                          args=(target_id, fast_lane, _fast_success, _fast_failed),
+                          daemon=True).start()
+        threading.Thread(target=self._fetch_dss_lane,
+                          args=(target_id, [slow_lane], _slow_success, _slow_failed),
+                          daemon=True).start()
+
+    def _explore_show_result(self, target_id, seq, img, fetched_deg, token):
+        """Cache and display a fetched DSS image — the shared landing
+        point for every _explore_fetch() path (narrow-span single lane,
+        wide-span fast lane, wide-span slow lane, and the post-cancel
+        fast-lane fallback)."""
+        if seq != self._explore_fetch_seq:
+            return  # user moved on to a different target/rig set
+        if token != self._explore_wait_token:
+            return  # superseded by a newer _explore_fetch() call
+        t = self._explore_target
+        if t is None or t.get("id") != target_id:
+            return
+        # The fast and slow lanes race — don't let a smaller result that
+        # happens to land SECOND clobber a bigger one already on screen.
+        # Scoped to THIS token only — see _show_dss_result's matching
+        # comment: the currently displayed image may be a leftover from an
+        # EARLIER _explore_fetch() call (a wider rig set that's since been
+        # swapped for a narrower one), and comparing against that stale
+        # image would wrongly suppress a legitimately smaller new result.
+        v = self._explore_view
+        if (self._explore_result_token == token and v is not None
+                and v.get("target_id") == target_id
+                and v.get("deg") is not None and fetched_deg < v["deg"]):
+            return
+        self._cancel_explore_wait_tick()
+        self._explore_view = {"img": img, "deg": fetched_deg, "target_id": target_id}
+        self._explore_result_token = token
         self._explore_redraw()
 
-        attempts = [(span_deg, 30), (min(span_deg, 3.0), 20)]
+    def _explore_show_error(self, target_id, seq, token):
+        """Show the geometric-ellipse fallback — every lane relevant to
+        this fetch has now failed with nothing to show."""
+        if seq != self._explore_fetch_seq:
+            return
+        if token != self._explore_wait_token:
+            return
+        t = self._explore_target
+        if t is None or t.get("id") != target_id:
+            return
+        self._cancel_explore_wait_tick()
+        self._explore_view = {"img": None,
+                              "deg": self._explore_wait_span_deg or 5.0,
+                              "target_id": target_id}
+        self._explore_redraw()
 
-        def _fetch():
-            for size_deg, timeout_s in attempts:
-                try:
-                    url = (
-                        f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
-                        f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
-                        f"&Size={size_deg:.4f}&Pixels=600&Return=GIF&Catalog=none"
-                    )
-                    req = urllib.request.Request(
-                        url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
-                    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-                        raw = resp.read()
-                    img = Image.open(io.BytesIO(raw)).convert("RGB")
+    def _cancel_explore_wait_tick(self):
+        """Stop the Explore tab's wide-field wait screen's spinner/
+        elapsed-timer redraw loop, if one is scheduled. Idempotent."""
+        if self._explore_wait_after_id is not None:
+            try:
+                self.root.after_cancel(self._explore_wait_after_id)
+            except Exception:
+                pass
+            self._explore_wait_after_id = None
 
-                    def _apply(img=img, fetched=size_deg):
-                        if seq != self._explore_fetch_seq:
-                            return   # user moved on — discard
-                        self._explore_view = {"img": img, "deg": fetched,
-                                              "target_id": target_id}
-                        self._explore_redraw()
-                    self.root.after(0, _apply)
-                    return
-                except Exception:
-                    continue
+    def _draw_explore_wait_frame(self, token, seq):
+        """Draw one frame of the Explore tab's wide-field wait screen
+        (spinner, message, elapsed timer, and — unless already cancelled —
+        a 'Show 5° field instead' pill) and reschedule itself. Stops on
+        its own once superseded (token/seq mismatch) or once the user has
+        navigated away from this target."""
+        if token != self._explore_wait_token or seq != self._explore_fetch_seq:
+            return
+        t = self._explore_target
+        if t is None or t.get("id") != self._explore_wait_target_id:
+            return
 
-            def _apply_err():
-                if seq != self._explore_fetch_seq:
-                    return
-                self._explore_view = {"img": None, "deg": span_deg,
-                                      "target_id": target_id}
-                self._explore_redraw()
-            self.root.after(0, _apply_err)
+        cpx = self._EXPLORE_CANVAS_PX
+        cv = self.explore_canvas
+        cv.delete("all")
+        cv.create_rectangle(0, 0, cpx, cpx, fill="#0a1420", outline="")
 
-        threading.Thread(target=_fetch, daemon=True).start()
+        cx, cy = cpx // 2, cpx // 2 - 22
+        r = 17
+        self._explore_wait_angle = (self._explore_wait_angle + 24) % 360
+        cv.create_oval(cx - r, cy - r, cx + r, cy + r, outline="#1e2d3e", width=3)
+        cv.create_arc(cx - r, cy - r, cx + r, cy + r,
+                      start=self._explore_wait_angle, extent=100,
+                      style="arc", outline="#38bdf8", width=3)
+
+        if self._explore_wait_cancelled:
+            msg = "Fetching 5° field…"
+            sub1 = "showing that instead of the full"
+            sub2 = f"{self._explore_wait_span_deg:.1f}° field"
+        else:
+            msg = "Fetching wide field…"
+            sub1 = f"{self._explore_wait_target_id} needs a {self._explore_wait_span_deg:.1f}° image —"
+            sub2 = "this can take up to 90s"
+
+        cv.create_text(cx, cy + 32, text=msg, fill="#ffffff", font=("Helvetica", 10, "bold"))
+        cv.create_text(cx, cy + 49, text=sub1, fill="#7f93a6", font=("Helvetica", 8))
+        cv.create_text(cx, cy + 62, text=sub2, fill="#7f93a6", font=("Helvetica", 8))
+
+        elapsed = int(time.monotonic() - self._explore_wait_start_ts)
+        cv.create_text(cx, cy + 79, text=f"{elapsed}s elapsed", fill="#4a6478", font=("Helvetica", 8))
+
+        if not self._explore_wait_cancelled:
+            pill_id = cv.create_text(cx, cy + 101, text="Show 5° field instead",
+                                     fill="#aaddff", font=("Helvetica", 8, "bold"))
+            bbox = cv.bbox(pill_id)
+            if bbox:
+                pad = 6
+                bg_id = cv.create_rectangle(
+                    bbox[0] - pad, bbox[1] - 4, bbox[2] + pad, bbox[3] + 4,
+                    fill="#182636", outline="#2a3f55")
+                cv.tag_lower(bg_id, pill_id)
+                for item in (bg_id, pill_id):
+                    cv.tag_bind(item, "<Button-1>",
+                               lambda e, t=token: self._explore_wait_cancel(t))
+                    cv.tag_bind(item, "<Enter>", lambda e: cv.configure(cursor="hand2"))
+                    cv.tag_bind(item, "<Leave>", lambda e: cv.configure(cursor=""))
+
+        self._explore_span_lbl.config(text="")
+        self._explore_wait_after_id = self.root.after(
+            90, lambda: self._draw_explore_wait_frame(token, seq))
+
+    def _explore_wait_cancel(self, token):
+        """'Show 5° field instead' pill handler: stop waiting on the slow
+        lane's full-size request and show the fast lane's result the
+        moment it's available (immediately, if it already landed)."""
+        if token != self._explore_wait_token:
+            return
+        self._explore_wait_cancelled = True
+        if self._explore_wait_fast_ready is not None:
+            img, deg = self._explore_wait_fast_ready
+            self._explore_show_result(self._explore_wait_target_id,
+                                      self._explore_fetch_seq, img, deg, token)
+        # else: the fast lane hasn't landed yet — _draw_explore_wait_frame's
+        # next tick switches the message to "Fetching 5° field…", and
+        # _fast_success (in _explore_fetch) will display it once it lands.
 
     # ── Drawing ───────────────────────────────────────────────────────────
+
+    # ═══════════════════════════════════════════════════════════════════
+    # STARTUP GRAPHIC — "Aperture Bloom" idle animation for the Explore
+    # tab's canvas (the app's default tab, so this is what's on screen
+    # from launch, before anything has been searched)
+    # ═══════════════════════════════════════════════════════════════════
+    # Approved design: lightbucket-startup-splash-options.html Option C,
+    # refined by lightbucket-optionC-colorcycle.html's C1 ("smooth blend").
+    # Palette mostly reuses colors already used elsewhere in the app (the
+    # type chip's teal/violet/pink, the card accent blue) plus one new
+    # warm gold to round the loop back to blue. Ordered by hue (not the
+    # order they were first picked in) so every step around the cycle,
+    # including the wrap from gold back to teal, is as short a hop as this
+    # particular set of colors allows -- _lerp_hex_color_hsv still sweeps
+    # through a bit of green on that one longer hop, but a sorted order
+    # keeps it brief rather than the worse jump an arbitrary order can hit.
+    _BLOOM_PALETTE = ["#2dd4bf", "#38bdf8", "#a78bfa", "#f472b6", "#f0b429"]
+    _BLOOM_ROTATION_PERIOD_S = 20.0   # one full spin == one full pass through the palette
+    _BLOOM_TICK_MS = 50               # ~20fps -- smooth without burning CPU while idle
+
+    @staticmethod
+    def _lerp_hex_color(c1, c2, frac):
+        """Blend two '#rrggbb' colors in RGB space; frac in [0, 1]
+        (0 -> c1, 1 -> c2). Only used to blend a color toward black/white
+        (the glow's halo/bright-core shading) -- fine there since one
+        endpoint is grayscale, but see _lerp_hex_color_hsv for blending
+        between two saturated palette colors."""
+        r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+        r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+        r = round(r1 + (r2 - r1) * frac)
+        g = round(g1 + (g2 - g1) * frac)
+        b = round(b1 + (b2 - b1) * frac)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    @staticmethod
+    def _lerp_hex_color_hsv(c1, c2, frac):
+        """Blend two '#rrggbb' colors by hue, taking the shorter way
+        around the color wheel, rather than straight RGB. Two palette
+        stops far apart in hue (e.g. gold and blue, roughly opposite each
+        other) produce a muddy gray-green halfway through a plain RGB
+        lerp, since each channel just marches independently toward the
+        other; a hue-space blend instead sweeps visibly through the
+        colors in between, which is what "cycling through a palette"
+        should look like."""
+        r1, g1, b1 = (int(c1[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+        r2, g2, b2 = (int(c2[i:i + 2], 16) / 255.0 for i in (1, 3, 5))
+        h1, s1, v1 = colorsys.rgb_to_hsv(r1, g1, b1)
+        h2, s2, v2 = colorsys.rgb_to_hsv(r2, g2, b2)
+        dh = h2 - h1
+        if dh > 0.5:
+            dh -= 1.0
+        elif dh < -0.5:
+            dh += 1.0
+        h = (h1 + dh * frac) % 1.0
+        s = s1 + (s2 - s1) * frac
+        v = v1 + (v2 - v1) * frac
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        return f"#{round(r * 255):02x}{round(g * 255):02x}{round(b * 255):02x}"
+
+    def _bloom_color_at(self, phase):
+        """Palette color at rotation phase in [0, 1) — one full pass per
+        rotation, blended smoothly between adjacent palette stops by hue
+        (matches C1 "smooth blend" from the approved color-cycle review)."""
+        pal = self._BLOOM_PALETTE
+        n = len(pal)
+        seg = (phase % 1.0) * n
+        i = int(seg) % n
+        frac = seg - int(seg)
+        return self._lerp_hex_color_hsv(pal[i], pal[(i + 1) % n], frac)
+
+    def _start_startup_bloom(self):
+        """Kick off the animated "aperture bloom" idle graphic on
+        ``self.explore_canvas`` — shown from launch (Explore is the
+        default tab) until the first real target is loaded there.
+
+        ``_explore_load_target`` clears ``self._bloom_active`` (a one-way
+        flag) the moment it resolves a real target, and this loop checks
+        that flag at the top of every tick rather than being cancelled
+        explicitly, so it just quietly stops rescheduling itself at that
+        point — it never reactivates even if the target is later cleared
+        back to the plain empty state (``_explore_draw_empty``); this is a
+        one-time "welcome" graphic, not a recurring empty-state.
+        """
+        self._bloom_active = True
+        self._bloom_frame = 0
+        self._tick_startup_bloom()
+
+    def _tick_startup_bloom(self):
+        """One frame of the startup bloom; reschedules itself via
+        ``after()`` until ``_start_startup_bloom``'s docstring's stop
+        condition is met."""
+        if not getattr(self, "_bloom_active", False):
+            return   # a real target has loaded -- stop for good, no reschedule
+        canvas = self.explore_canvas
+        try:
+            if not canvas.winfo_exists():
+                self._bloom_active = False
+                return
+        except tk.TclError:
+            self._bloom_active = False
+            return
+
+        cpx = self._EXPLORE_CANVAS_PX
+        cw = canvas.winfo_width() or cpx
+        ch = canvas.winfo_height() or cpx
+        cx, cy = cw / 2.0, ch * 0.46
+        R = min(cw, ch) * 0.19   # blade-ring radius
+
+        period_ticks = max(1, int(self._BLOOM_ROTATION_PERIOD_S * 1000 / self._BLOOM_TICK_MS))
+        phase  = (self._bloom_frame % period_ticks) / period_ticks
+        color  = self._bloom_color_at(phase)
+        angle0 = phase * 360.0
+
+        canvas.delete("all")
+
+        # Soft core glow -- Tkinter fills have no alpha channel, so this is
+        # faked with three solid concentric ovals, each hand-blended toward
+        # the canvas background (dim halo) or toward white (bright core),
+        # rather than the SVG mockup's true radial gradient.
+        bg = "#050810"
+        halo   = self._lerp_hex_color(bg, color, 0.30)
+        mid    = self._lerp_hex_color(bg, color, 0.60)
+        bright = self._lerp_hex_color(color, "#ffffff", 0.55)
+        # Kept comfortably SMALLER than the blade ring's own radius R below
+        # (0.72R at most) -- leaving a dark gap between the glow's edge and
+        # the blades so the ring reads as a distinct shape around the glow,
+        # not just a stroke buried inside a same-color filled disc.
+        for r_frac, fill in ((0.72, halo), (0.46, mid), (0.20, bright)):
+            r = R * r_frac
+            canvas.create_oval(cx - r, cy - r, cx + r, cy + r,
+                                outline="", fill=fill, tags="bloom")
+
+        # 6 curved "blades" forming the iris ring, each spanning less than
+        # its 60° sector with a clear gap on either side (butt caps, not
+        # round, so the caps don't visually bridge that gap) -- rotated
+        # together by angle0, each approximated as a smoothed polyline.
+        gap_deg = 9
+        for k in range(6):
+            a0 = math.radians(angle0 + k * 60 + gap_deg)
+            a1 = math.radians(angle0 + (k + 1) * 60 - gap_deg)
+            coords = []
+            for step in range(9):
+                a = a0 + (a1 - a0) * step / 8
+                coords.extend((cx + R * math.cos(a), cy + R * math.sin(a)))
+            canvas.create_line(*coords, fill=color, width=3,
+                                smooth=True, capstyle="butt", tags="bloom")
+
+        canvas.create_oval(cx - 3, cy - 3, cx + 3, cy + 3,
+                            fill="#f4fbff", outline="", tags="bloom")
+
+        # "Awaiting Target" status label above the bloom, tinted with the
+        # same cycling color as the ring/glow this tick so it reads as part
+        # of the same live animation rather than a separate static caption.
+        canvas.create_text(cw / 2, cy - R * 2.3, text="A W A I T I N G   T A R G E T",
+                            fill=color, font=("Helvetica", 10, "bold"), tags="bloom")
+
+        canvas.create_text(cw / 2, cy + R * 2.05, text="LIGHTBUCKET",
+                            fill="#e8eef4", font=("Helvetica", 16, "bold"), tags="bloom")
+        canvas.create_text(cw / 2, cy + R * 2.05 + 20, text="ASTRO PLANNER",
+                            fill="#556677", font=("Helvetica", 9, "bold"), tags="bloom")
+
+        self._bloom_frame += 1
+        self.root.after(self._BLOOM_TICK_MS, self._tick_startup_bloom)
 
     def _explore_draw_empty(self):
         """Empty-state canvas message."""
@@ -8661,22 +12449,38 @@ class AstroApp:
             return
 
         span = v["deg"]
-        ppd = cpx / span   # pixels per degree
+        zoom = max(1.0, min(16.0, self._explore_zoom))
+        ppd = cpx / span * zoom   # pixels per degree, after zoom
         cxc = cyc = cpx / 2
+        # Frame group's own pivot — offset from the canvas/image centre by
+        # the shared pan (see _explore_fov_mouse_drag). The fallback
+        # ellipse above uses cxc/cyc directly (it's the target itself, not
+        # an FOV frame, so it never pans); only the rig frames below do.
+        fcx = cpx / 2 + self._explore_pan_x
+        fcy = cpx / 2 + self._explore_pan_y
 
         if v["img"] is not None:
             # Cache key holds a strong reference to the source image and is
             # compared by identity (``is``).  Never key on id(img): after a
             # target switch the old image is freed and CPython frequently
-            # reuses its address for the new one, so (id, span) collides and
-            # the canvas silently shows the previous target's picture.
+            # reuses its address for the new one, so (id, span, zoom) collides
+            # and the canvas silently shows the previous target's picture.
             cache = self._explore_photo_cache
-            if cache and cache[0] is v["img"] and cache[1] == span:
-                photo = cache[2]
+            if cache and cache[0] is v["img"] and cache[1] == span and cache[2] == zoom:
+                photo = cache[3]
             else:
-                resized = v["img"].resize((cpx, cpx), Image.Resampling.LANCZOS)
+                src = v["img"]
+                if zoom > 1.0:
+                    # Center-crop a 1/zoom fraction then resize to canvas —
+                    # same technique the Planner tab's zoom uses, so no
+                    # re-download is ever needed just to zoom in/out.
+                    orig_w, orig_h = src.size
+                    crop_w, crop_h = orig_w / zoom, orig_h / zoom
+                    left, top = (orig_w - crop_w) / 2, (orig_h - crop_h) / 2
+                    src = src.crop((left, top, left + crop_w, top + crop_h))
+                resized = src.resize((cpx, cpx), Image.Resampling.LANCZOS)
                 photo = ImageTk.PhotoImage(resized)
-                self._explore_photo_cache = (v["img"], span, photo)
+                self._explore_photo_cache = (v["img"], span, zoom, photo)
             self._explore_photo = photo
             cv.create_image(0, 0, anchor="nw", image=photo)
         else:
@@ -8690,11 +12494,28 @@ class AstroApp:
                            text="DSS unavailable — geometric view (check network)",
                            fill="#778899", font=("Helvetica", 9))
 
-        # Orientation marker — DSS cutouts are North-up / East-left
-        cv.create_line(cpx - 26, 34, cpx - 26, 16, fill="#94a3b8", width=1, arrow=tk.LAST)
-        cv.create_text(cpx - 17, 22, text="N", fill="#94a3b8", font=("Helvetica", 8))
-        cv.create_line(cpx - 26, 34, cpx - 44, 34, fill="#94a3b8", width=1, arrow=tk.LAST)
-        cv.create_text(cpx - 50, 34, text="E", fill="#94a3b8", font=("Helvetica", 8))
+        # Orientation marker — DSS cutouts are North-up / East-left. Lives in
+        # the top-LEFT corner (not top-right) so it doesn't collide with the
+        # zoom +/- pill floating over the top-right corner.
+        cv.create_line(40, 34, 40, 16, fill="#94a3b8", width=1, arrow=tk.LAST)
+        cv.create_text(49, 22, text="N", fill="#94a3b8", font=("Helvetica", 8))
+        cv.create_line(40, 34, 22, 34, fill="#94a3b8", width=1, arrow=tk.LAST)
+        cv.create_text(14, 34, text="E", fill="#94a3b8", font=("Helvetica", 8))
+
+        # Shared rotation — every visible frame spins together around the
+        # image centre while the DSS image itself stays fixed North-up.
+        # _explore_pa_deg IS the displayed NINA-style sky PA (unlike the
+        # Planner tab's _fov_angle, which is a raw drag angle converted to
+        # PA only for display). The standard rotation matrix below is
+        # clockwise-positive on this y-down canvas, so the angle is negated
+        # here to make increasing PA turn the frame counter-clockwise —
+        # North (up) toward East (left) — matching both the astronomical PA
+        # convention and NINA's own rotator direction.
+        angle_rad = math.radians(-self._explore_pa_deg)
+        cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+
+        def _rot(dx, dy):
+            return fcx + dx * cos_a - dy * sin_a, fcy + dx * sin_a + dy * cos_a
 
         clipped = False
         for r in self._explore_rigs:
@@ -8702,7 +12523,9 @@ class AstroApp:
                 continue
             rw = r["fov_w"] * ppd / 2
             rh = r["fov_h"] * ppd / 2
-            if 2 * rw > cpx + 1 or 2 * rh > cpx + 1:
+            corners = [_rot(-rw, -rh), _rot(rw, -rh), _rot(rw, rh), _rot(-rw, rh)]
+            if any(px < -1 or px > cpx + 1 or py < -1 or py > cpx + 1
+                   for px, py in corners):
                 clipped = True
             color = r["color"]
             width = 2
@@ -8714,10 +12537,11 @@ class AstroApp:
             kwargs = {"outline": color, "width": width, "fill": ""}
             if r["dash"]:
                 kwargs["dash"] = r["dash"]
-            cv.create_rectangle(cxc - rw, cyc - rh, cxc + rw, cyc + rh, **kwargs)
-            # Slot number just inside the frame's top-left corner (clamped on-canvas)
-            tx = min(max(cxc - rw, 0) + 11, cpx - 10)
-            ty = min(max(cyc - rh, 0) + 10, cpx - 10)
+            flat = [coord for pt in corners for coord in pt]
+            cv.create_polygon(flat, **kwargs)
+            # Slot number just inside the frame's first corner (clamped on-canvas)
+            tx = min(max(corners[0][0], 0) + 11, cpx - 10)
+            ty = min(max(corners[0][1], 0) + 10, cpx - 10)
             cv.create_text(tx, ty, text=str(r["slot"] + 1), fill=color,
                            font=("Helvetica", 9, "bold"))
 
@@ -8735,6 +12559,99 @@ class AstroApp:
                        font=("Helvetica", 8, "bold"))
 
         self._explore_span_lbl.config(text=f"Image span {span:.2f}° × {span:.2f}°")
+
+    # ── Rotate / zoom ────────────────────────────────────────────────────
+
+    def _explore_on_rotate(self, value):
+        """Rotate slider moved — update the shared PA and redraw.
+
+        The slider's own value IS the displayed NINA-style sky PA (no
+        conversion needed here); _explore_redraw negates it when building
+        the screen rotation matrix so increasing PA turns the frames
+        counter-clockwise, matching NINA."""
+        self._explore_pa_deg = float(value) % 360.0
+        self._explore_pa_label.config(text=f"{self._explore_pa_deg:.1f}°")
+        self._explore_schedule_redraw()
+
+    def _explore_schedule_redraw(self):
+        """Coalesce rapid rotate-slider events into at most one redraw per
+        ~30ms tick (same after()-guard pattern _schedule_analysis uses
+        elsewhere in the app).
+
+        _explore_redraw() costs roughly 10-20ms — it crops/resizes the DSS
+        image with PIL and rebuilds the whole canvas — and a real drag
+        fires far more motion events than that per second. Calling it
+        straight from the rotate slider's command on every tick let Tk's
+        single main thread fall behind: the slider handle itself visibly
+        lagged the mouse because the thread was still busy painting the
+        previous frame when the next motion event arrived. The PA label is
+        updated immediately in the caller (cheap), so only the actual
+        pixel work is throttled.
+
+        Zoom no longer goes through here at all — it's discrete +/- button
+        clicks now (see _explore_apply_zoom), not a continuous drag, so
+        there's nothing to coalesce and it redraws immediately.
+        """
+        if self._explore_redraw_after_id is not None:
+            return
+        self._explore_redraw_after_id = self.root.after(30, self._run_explore_redraw)
+
+    def _run_explore_redraw(self):
+        """Fire the throttled redraw scheduled by _explore_schedule_redraw."""
+        self._explore_redraw_after_id = None
+        self._explore_redraw()
+
+    def _explore_apply_zoom(self, factor):
+        """Zoom pill's + / − buttons and scroll wheel — multiply zoom by
+        factor, clamp to 1.0-16.0, update the readout, then redraw
+        immediately (a button click is discrete, not a continuous drag,
+        so there's no need to throttle this one)."""
+        self._explore_zoom = max(1.0, min(16.0, self._explore_zoom * factor))
+        self._explore_zoom_label.config(text=f"{self._explore_zoom:.1f}×")
+        self._explore_redraw()
+
+    def _explore_mousewheel(self, event):
+        """Zoom on scroll wheel over the Explore canvas (mirrors the Planner tab)."""
+        if event.num == 4 or (hasattr(event, 'delta') and event.delta > 0):
+            self._explore_apply_zoom(1.25)
+        else:
+            self._explore_apply_zoom(1 / 1.25)
+
+    def _explore_fov_mouse_down(self, event):
+        """Begin a pan drag — records the start point; rotation stays on
+        the slider (see setup_explore_tab's rotate_bar), so there's no
+        corner-handle hit-testing to do here."""
+        self._explore_dragging = True
+        self._explore_drag_start = (event.x, event.y)
+
+    def _explore_fov_mouse_drag(self, event):
+        """Accumulate the pan offset and redraw (throttled, same as the
+        rotate slider — see _explore_schedule_redraw)."""
+        if not self._explore_dragging or self._explore_drag_start is None:
+            return
+        dx = event.x - self._explore_drag_start[0]
+        dy = event.y - self._explore_drag_start[1]
+        self._explore_pan_x += dx
+        self._explore_pan_y += dy
+        self._explore_drag_start = (event.x, event.y)
+        self._explore_schedule_redraw()
+
+    def _explore_fov_mouse_up(self, event):
+        """End the pan drag."""
+        self._explore_dragging = False
+        self._explore_drag_start = None
+
+    def _explore_reset_view(self):
+        """Reset rotation, zoom, and pan to 0° / 1.0× / centred — leaves
+        analyzed rigs and the current target untouched."""
+        self._explore_pa_deg = 0.0
+        self._explore_zoom = 1.0
+        self._explore_pan_x = 0.0
+        self._explore_pan_y = 0.0
+        self._explore_pa_var.set(0.0)
+        self._explore_pa_label.config(text="0.0°")
+        self._explore_zoom_label.config(text="1.0×")
+        self._explore_redraw()
 
     # ── Legend cards ──────────────────────────────────────────────────────
 
@@ -8772,16 +12689,20 @@ class AstroApp:
                      fg=empty_fg, font=("Helvetica", 9)).pack(anchor="w", padx=2, pady=4)
             return
 
+        active_bg = "#440000" if nm else "#16283a"
+
         t = self._explore_target
         for r in self._explore_rigs:
-            card = tk.Frame(frame, bg=card_bg,
-                            highlightthickness=1,
+            is_active = (r["key"] == self._explore_active_rig_key)
+            this_bg = active_bg if is_active else card_bg
+            card = tk.Frame(frame, bg=this_bg,
+                            highlightthickness=2 if is_active else 1,
                             highlightbackground=r["color"] if r["visible"] else border_off)
             card.pack(fill="x", pady=3)
 
-            row1 = tk.Frame(card, bg=card_bg)
+            row1 = tk.Frame(card, bg=this_bg)
             row1.pack(fill="x", padx=6, pady=(4, 0))
-            sw = tk.Canvas(row1, width=14, height=10, bg=card_bg,
+            sw = tk.Canvas(row1, width=14, height=10, bg=this_bg,
                            highlightthickness=0)
             sw.pack(side="left", pady=1)
             line_kwargs = {"fill": r["color"], "width": 2}
@@ -8794,18 +12715,18 @@ class AstroApp:
             if len(title) > 34:
                 title = title[:33] + "…"
             title += f" · {r['reduction']}"
-            name_lbl = tk.Label(row1, text=title, bg=card_bg,
+            name_lbl = tk.Label(row1, text=title, bg=this_bg,
                                 fg=name_fg, font=("Helvetica", 9, "bold"), anchor="w")
             name_lbl.pack(side="left", padx=(4, 0), fill="x", expand=True)
 
-            del_lbl = tk.Label(row1, text="✕", bg=card_bg, fg=del_fg,
+            del_lbl = tk.Label(row1, text="✕", bg=this_bg, fg=del_fg,
                                font=("Helvetica", 9, "bold"), cursor="hand2")
             del_lbl.pack(side="right", padx=(2, 0))
             del_lbl.bind("<Button-1>", lambda e, k=r["key"]: self._explore_remove_rig(k))
             ToolTip(del_lbl, "Remove this rig from the comparison")
 
             eye_lbl = tk.Label(row1, text="👁" if r["visible"] else "‒",
-                               bg=card_bg,
+                               bg=this_bg,
                                fg=eye_on if r["visible"] else eye_off,
                                font=("Helvetica", 9), cursor="hand2", width=2)
             eye_lbl.pack(side="right")
@@ -8815,7 +12736,7 @@ class AstroApp:
             stats = (f"{r['fov_w']:.2f}°×{r['fov_h']:.2f}°  ·  "
                      f"{r['scale']:.2f}\"/px  ·  f/{r['f_ratio']:.1f}  ·  "
                      f"{r['eff_fl']:.0f}mm")
-            stats_lbl = tk.Label(card, text=stats, bg=card_bg,
+            stats_lbl = tk.Label(card, text=stats, bg=this_bg,
                                  fg=stats_fg, font=("Helvetica", 8), anchor="w")
             stats_lbl.pack(fill="x", padx=24, pady=(0, 0))
 
@@ -8828,7 +12749,7 @@ class AstroApp:
                                / max(r["fov_w"] * r["fov_h"], 1e-9))
                 fit_txt = (f"✅ fits · target fills {fill_pct:.0f}%" if fits
                            else "❌ too big for sensor")
-                fit_lbl = tk.Label(card, text=fit_txt, bg=card_bg,
+                fit_lbl = tk.Label(card, text=fit_txt, bg=this_bg,
                                    fg=fits_fg if fits else nofit_fg,
                                    font=("Helvetica", 8), anchor="w")
                 fit_lbl.pack(fill="x", padx=24, pady=(0, 4))
@@ -8841,6 +12762,13 @@ class AstroApp:
             for w in hover_widgets:
                 w.bind("<Enter>", lambda e, k=r["key"]: self._explore_set_hilite(k))
                 w.bind("<Leave>", lambda e: self._explore_set_hilite(None))
+
+            # Click (anywhere except the ✕/👁 controls, which have their own
+            # actions) — show this rig's report on the right, same as
+            # clicking its chip above the report panel.
+            select_widgets = [card, row1, sw, name_lbl, stats_lbl] + extra_widgets
+            for w in select_widgets:
+                w.bind("<Button-1>", lambda e, k=r["key"]: self._explore_select_rig_for_report(k))
 
     def _explore_set_hilite(self, key):
         """Set / clear the hover-highlighted rig and redraw the frames."""
@@ -8862,7 +12790,12 @@ class AstroApp:
         """Remove a rig from the comparison, freeing its colour slot."""
         self._explore_hilite = None
         self._explore_rigs = [r for r in self._explore_rigs if r["key"] != key]
+        if self._explore_active_rig_key == key:
+            # Fall back to whichever rig is now last in the list (or none
+            # left at all) — same "most recent" default _explore_analyze uses.
+            self._explore_active_rig_key = self._explore_rigs[-1]["key"] if self._explore_rigs else None
         self._explore_refresh_cards()
+        self._explore_refresh_report()
         self._explore_ensure_image()
 
     def _explore_clear(self):
@@ -8871,21 +12804,192 @@ class AstroApp:
             return
         self._explore_hilite = None
         self._explore_rigs = []
+        self._explore_active_rig_key = None
         self._explore_refresh_cards()
+        self._explore_refresh_report()
         self._explore_redraw()
+
+    # ── Report panel ─────────────────────────────────────────────────────
+
+    def _explore_select_rig_for_report(self, key):
+        """Rig chip or rail-card clicked — show that rig's report on the
+        right. Independent of hover (which only highlights the canvas
+        frame) and of the eye toggle (which only affects overlay visibility)."""
+        if key == self._explore_active_rig_key:
+            return
+        self._explore_active_rig_key = key
+        self._explore_refresh_cards()
+        self._explore_refresh_report()
+
+    def _explore_compute_report(self, r):
+        """Compute the same framing/exposure/window/moon figures the
+        Planner tab's results_txt shows (see _analyze_framing_impl), for
+        one analyzed Explore rig against the currently loaded target.
+
+        Returns a dict of computed values, or None if there's no target
+        or camera data to compute from. r's own fov_w/fov_h/scale/eff_fl/
+        f_ratio are reused as-is — only the exposure/window/moon figures
+        (which need the target, the rig's filter_mode captured at analyze
+        time, and the live global Bortle setting) are computed here.
+        """
+        t = self._explore_target
+        c = self.data["cameras"].get(r["camera"])
+        if t is None or c is None:
+            return None
+
+        t_maj = (t.get("size_maj") or 10.0) / 60.0
+        t_min = (t.get("size_min") or t.get("size_maj") or 10.0) / 60.0
+        scale = r["scale"]
+        if scale < 0.67:
+            status, tag = "Over-sampled", "warning"
+        elif scale <= 2.0:
+            status, tag = "Optimal", "optimal"
+        else:
+            status, tag = "Under-sampled", "warning"
+        f_fits = (t_maj < r["fov_w"] and t_min < r["fov_h"])
+
+        b_data = BORTLE_FACTORS.get(self.bortle_choice.get(),
+                                    BORTLE_FACTORS.get("4 (Rural/Suburban)"))
+        is_color = r.get("is_color", True)
+        rf = 1.0 if is_color else self._rf_for_filter_mode(r.get("filter_mode") or "Mono Lum")
+        ps = float(c.get("pixel_size", 1))
+        sky_flux = (((b_data["color"] if is_color else b_data["mono"])
+                    * (c.get("qe", 0.5) * (ps ** 2))) / (r["f_ratio"] ** 2)) / rf
+        read_noise = c.get("read_noise", 1)
+        exp = (C_VALUE * (float(read_noise) ** 2)) / (sky_flux + 1e-5)
+        if sky_flux * exp > float(read_noise) ** 2 * 5:
+            regime_text, regime_tag = "Sky-limited ✓", "amber"
+        elif sky_flux * exp > float(read_noise) ** 2:
+            regime_text, regime_tag = "Transitional", "highlight"
+        else:
+            regime_text, regime_tag = "Read-noise limited", "warning"
+
+        moon_tag, _icon, _note, moon_impact, illum_pct, sep_deg = \
+            self._moon_condition(t["ra_deg"], t["dec_deg"])
+
+        win_start = win_end = win_hrs = peak_t = peak_a = transit_str = None
+        min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
+        lat, lon = self._get_saved_location()
+        if lat is not None:
+            win_start, win_end, win_hrs, peak_t, peak_a, _ = _calc_best_imaging_window(
+                t["ra_deg"], t["dec_deg"], lat, lon, min_alt=min_alt)
+            try:
+                transit_str = _calc_transit_time(t["ra_deg"], lon)
+            except Exception:
+                transit_str = None
+
+        return dict(
+            status=status, tag=tag, f_fits=f_fits, exp=exp, sky_flux=sky_flux,
+            read_noise=read_noise, regime_text=regime_text, regime_tag=regime_tag,
+            moon_tag=moon_tag, moon_impact=moon_impact, illum_pct=illum_pct, sep_deg=sep_deg,
+            win_start=win_start, win_end=win_end, win_hrs=win_hrs, peak_t=peak_t, peak_a=peak_a,
+            transit_str=transit_str, min_alt=min_alt,
+        )
+
+    def _explore_refresh_report(self):
+        """Rebuild the rig-chip row and the analysis report body for
+        whichever rig is currently active — the Explore tab's version of
+        the Planner tab's results_txt, except it can show a report for any
+        one of the up-to-6 analyzed rigs rather than always just one."""
+        chip_frame = self._explore_chip_frame
+        for w in chip_frame.winfo_children():
+            w.destroy()
+
+        txt = self._explore_report_txt
+        txt.delete('1.0', tk.END)
+
+        if not self._explore_rigs:
+            txt.insert(tk.END, "Analyze a rig on the left to see its\n"
+                                "framing, exposure, tonight's window,\n"
+                                "and moon report here.", "dim")
+            return
+
+        active_key = self._explore_active_rig_key
+        if active_key not in {r["key"] for r in self._explore_rigs}:
+            active_key = self._explore_rigs[-1]["key"]
+            self._explore_active_rig_key = active_key
+
+        for r in self._explore_rigs:
+            is_active = (r["key"] == active_key)
+            chip = tk.Label(chip_frame, text=f"●  {r['scope']} · {r['camera']}",
+                            bg="#0f2233" if is_active else "#1a2b3c",
+                            fg=r["color"] if is_active else "#8899aa",
+                            font=("Helvetica", 8, "bold" if is_active else "normal"),
+                            padx=8, pady=3, cursor="hand2")
+            chip.pack(side="left", padx=(0, 5), pady=(0, 6))
+            chip.bind("<Button-1>", lambda e, k=r["key"]: self._explore_select_rig_for_report(k))
+
+        r = next(rr for rr in self._explore_rigs if rr["key"] == active_key)
+        rep = self._explore_compute_report(r)
+        t = self._explore_target
+
+        common = t['common'].split(';')[0].strip() if t and t.get('common') else ""
+        txt.insert(tk.END, f"{r['scope']} · {r['camera']} · {r['reduction']}\n", "header")
+        if t is not None:
+            txt.insert(tk.END, f"{t['id']}{('  —  ' + common) if common else ''}\n", "dim")
+
+        if rep is None:
+            txt.insert(tk.END, "\nNo target loaded — search for one to see\n"
+                                "this rig's framing, exposure and window report.", "dim")
+            return
+
+        txt.insert(tk.END, "\n━ FRAMING ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_framing")
+        txt.insert(tk.END, "  Image scale: ", "dim")
+        txt.insert(tk.END, f"{r['scale']:.2f}\"/px ", "highlight")
+        txt.insert(tk.END, f"({rep['status']})\n", rep['tag'])
+        txt.insert(tk.END, "  Focal length: ", "dim")
+        txt.insert(tk.END, f"{r['eff_fl']:.0f}mm (f/{r['f_ratio']:.1f})\n")
+        txt.insert(tk.END, "  FOV: ", "dim")
+        txt.insert(tk.END, f"{r['fov_w']:.2f}° × {r['fov_h']:.2f}°\n")
+        txt.insert(tk.END, "  Framing: ", "dim")
+        txt.insert(tk.END, "✅ Fits sensor\n" if rep['f_fits'] else "❌ Too big for sensor\n",
+                  "optimal" if rep['f_fits'] else "warning")
+
+        txt.insert(tk.END, "\n━ EXPOSURE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_exposure")
+        txt.insert(tk.END, "  Recommended sub: ", "dim")
+        txt.insert(tk.END, f"{rep['exp']:.1f}s\n", "amber")
+        txt.insert(tk.END, "  Sky flux: ", "dim")
+        txt.insert(tk.END, f"{rep['sky_flux']:.1f} e⁻/px/s\n")
+        txt.insert(tk.END, "  Read noise: ", "dim")
+        txt.insert(tk.END, f"{rep['read_noise']} e⁻\n")
+        txt.insert(tk.END, "  Regime: ", "dim")
+        txt.insert(tk.END, f"{rep['regime_text']}\n", rep['regime_tag'])
+
+        txt.insert(tk.END, "\n━ TONIGHT'S WINDOW ━━━━━━━━━━━━━━━━━━━━\n", "sec_window")
+        if rep['win_start']:
+            txt.insert(tk.END, "  Window: ", "dim")
+            txt.insert(tk.END, f"{rep['win_start']} – {rep['win_end']}", "optimal")
+            txt.insert(tk.END, f"  ({rep['win_hrs']}h)\n", "optimal")
+            txt.insert(tk.END, "  Peak alt: ", "dim")
+            txt.insert(tk.END, f"{rep['peak_a']}° at {rep['peak_t']}\n")
+            if rep['transit_str']:
+                txt.insert(tk.END, "  Transit: ", "dim")
+                txt.insert(tk.END, f"{rep['transit_str']}\n")
+        else:
+            txt.insert(tk.END, "  ")
+            txt.insert(tk.END,
+                f"⚠️ Target below {int(rep['min_alt'])}° during all dark hours tonight\n",
+                "warning")
+
+        txt.insert(tk.END, "\n━ MOON ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_moon")
+        txt.insert(tk.END, "  Separation: ", "dim")
+        txt.insert(tk.END, f"{rep['sep_deg']:.0f}°\n", rep['moon_tag'])
+        txt.insert(tk.END, "  Illumination: ", "dim")
+        txt.insert(tk.END, f"{rep['illum_pct']}%\n", rep['moon_tag'])
+        txt.insert(tk.END, "  Impact: ", "dim")
+        txt.insert(tk.END, f"{rep['moon_impact']}\n", rep['moon_tag'])
 
     def _kick_explore_paint(self):
         """Kick the finicky Explore widgets into painting (macOS Cocoa Tk)."""
-        self._kick_paint([self.explore_canvas, self.explore_search])
+        self._kick_paint([self.explore_canvas, self.explore_search, self._explore_report_txt])
 
     def open_sky_map(self):
-        """Open the interactive sky map centred on the current target.
-
-        Feeds the embedded d3-celestial explorer (a pywebview window in a
-        separate process) the target centre, framed FOV, position angle and
-        theme via a localhost URL.  Coordinates — not the object id — are
-        passed, so Sharpless/Caldwell targets resolve correctly.  Falls back
-        to the default browser when pywebview/WebView2 is unavailable.
+        """Open the interactive sky map centred on the Planner tab's last
+        analyzed target (self.current_target_info) — kept as a thin wrapper
+        over _launch_sky_map for anything still reading that state; the
+        Explore tab's own "Show Sky Map" button calls
+        _explore_open_sky_map instead, which reads Explore's own target/
+        rig/rotation rather than the Planner tab's.
         """
         t = self.current_target_info
         if not t:
@@ -8893,6 +12997,41 @@ class AstroApp:
                 "No Target",
                 "Select and analyze a target first, then open the sky map.")
             return
+        self._launch_sky_map(
+            t,
+            getattr(self, "_skymap_fovw", 0.0) or 0.0,
+            getattr(self, "_skymap_fovh", 0.0) or 0.0,
+            self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0) or 0.0))
+
+    def _explore_open_sky_map(self):
+        """Explore tab's "Show Sky Map" button — centres the map on
+        whatever Explore currently has loaded, framed by the active rig's
+        FOV (the one shown in the report panel) rather than the Planner
+        tab's own, separate, framing state. _explore_pa_deg is already a
+        sky PA (see _explore_redraw's comment), so it's passed straight
+        through with no _screen_to_sky_pa conversion needed."""
+        t = self._explore_target
+        if not t:
+            messagebox.showinfo(
+                "No Target",
+                "Search for a target on the Explore tab first, then open the sky map.")
+            return
+        fovw = fovh = 0.0
+        active_key = self._explore_active_rig_key
+        for r in self._explore_rigs:
+            if r["key"] == active_key:
+                fovw, fovh = r["fov_w"], r["fov_h"]
+                break
+        self._launch_sky_map(t, fovw, fovh, self._explore_pa_deg)
+
+    def _launch_sky_map(self, t, fovw_deg, fovh_deg, pa_deg):
+        """Shared sky-map launcher — feeds the embedded d3-celestial
+        explorer (a pywebview window in a separate process) a target
+        centre, framed FOV, position angle and theme via a localhost URL.
+        Coordinates — not the object id — are passed, so Sharpless/Caldwell
+        targets resolve correctly. Falls back to the default browser when
+        pywebview/WebView2 is unavailable.
+        """
         ra, dec = t.get("ra_deg"), t.get("dec_deg")
         if ra is None or dec is None:
             messagebox.showinfo(
@@ -8915,9 +13054,9 @@ class AstroApp:
             "name":    t.get("id", ""),
             "common":  t.get("common", "").split(";")[0].strip(),
             "catalog": self._skymap_catalog_label(t.get("id", "")),
-            "fovw":    f"{getattr(self, '_skymap_fovw', 0.0) or 0.0:.4f}",
-            "fovh":    f"{getattr(self, '_skymap_fovh', 0.0) or 0.0:.4f}",
-            "pa":      f"{self._screen_to_sky_pa(getattr(self, '_fov_angle', 0.0) or 0.0):.1f}",
+            "fovw":    f"{fovw_deg or 0.0:.4f}",
+            "fovh":    f"{fovh_deg or 0.0:.4f}",
+            "pa":      f"{pa_deg or 0.0:.1f}",
             "theme":   "night" if getattr(self, "night_mode", False) else "day",
         }
         # Active catalog tier → which star/DSO files the map loads + mag ceiling.
@@ -9430,12 +13569,23 @@ class AstroApp:
     # ═══════════════════════════════════════════════════════════════════
 
     def _on_tab_changed(self, event=None):
-        """Redraw the queue Gantt whenever the Targets List tab becomes visible,
-        and the plan Gantt whenever Tonight's Plan tab becomes visible.
-        Also auto-selects and loads the first queue row when entering the Targets List.
-        Syncs the sidebar highlight to match the active tab."""
+        """Redraw the schedule-timeline Gantt and refresh the browsing grid
+        whenever Tonight's Plan tab becomes visible. Syncs the sidebar
+        highlight to match the active tab."""
         try:
             current = self.tab_control.select()
+
+            # Close the equipment drawer if we're navigating away from the
+            # Plan tab — it re-parents the Planner tab's own chip widgets,
+            # so leaving it open while switching tabs would leave those
+            # widgets stuck off the Planner tab's chip bar.
+            if current != str(self.tab_plan) and getattr(self, "_equip_drawer", None) is not None:
+                self._close_equip_drawer()
+
+            # Same for the unified filters popover — its .place() coordinates
+            # are only meaningful while the Plan tab is the visible one.
+            if current != str(self.tab_plan) and getattr(self, "_unified_filters_popup", None) is not None:
+                self._close_unified_filters_popup()
 
             # Sync sidebar only if a programmatic tab switch happened
             # (not when _sidebar_select already handled it)
@@ -9457,72 +13607,47 @@ class AstroApp:
                             self._sidebar_draw_btn(old)
                             self._sidebar_draw_btn(settings_idx)
 
-            if current == str(self.tab_session):
-                # Snapshot the Planner's current target + equipment state.
-                # The queue-card auto-load below will overwrite these, and
-                # they'll be restored on return to the Planner tab so the
-                # user's in-progress search isn't clobbered.
-                self._planner_state_backup = {
-                    "search":    self.target_search.get(),
-                    "scope":     self.scope_choice.get(),
-                    "camera":    self.camera_choice.get(),
-                    "bortle":    self.bortle_choice.get(),
-                    "filter":    self.filter_mode.get(),
-                    "reduction": self.reduction_factor.get(),
-                }
+            if current == str(self.tab_planner):
+                # Always re-run analysis when entering the Planner tab.
+                # This is the simplest reliable fix for macOS Tk's Cocoa
+                # backend, which can blank Text/Canvas widgets after tab
+                # switches.  The DSS image is cached so only the text
+                # output and altitude chart are recomputed — fast enough
+                # to feel instant.
+                self._analysis_dirty = False
+                if (self.current_target_info is not None
+                        and self.scope_choice.get()
+                        and self.camera_choice.get()):
+                    self.root.after(50, self.analyze_framing)
+                else:
+                    # Empty-state Planner entry (no analysis runnable).
+                    # macOS Cocoa Tk leaves the tab black until the
+                    # mouse enters the frame — the paint pipeline is
+                    # waiting on a Motion event to refresh tracking
+                    # areas on the newly-visible widgets.  Synthesize
+                    # one to un-stick the paint without requiring the
+                    # user to move the cursor.
+                    self.root.after(50, self._kick_planner_paint)
+            elif current == str(self.tab_plan):
                 self.root.after(10, self._draw_queue_gantt)
-                self.root.after(20, self._auto_load_first_queue_row)
-            else:
-                if current == str(self.tab_planner):
-                    # Restore the Planner snapshot taken when the user
-                    # entered the Targets tab, so their in-progress search
-                    # survives the round trip.  A queue-card click during
-                    # the Targets visit clears the backup (see
-                    # _queue_card_click) — in that case the user is pivoting
-                    # to the clicked target and we leave it in place.
-                    if self._planner_state_backup is not None:
-                        self._restore_planner_state(self._planner_state_backup)
-                        self._planner_state_backup = None
-                        self._editing_queue_idx = None
-                    # Always re-run analysis when entering the Planner tab.
-                    # This is the simplest reliable fix for macOS Tk's Cocoa
-                    # backend, which can blank Text/Canvas widgets after tab
-                    # switches.  The DSS image is cached so only the text
-                    # output and altitude chart are recomputed — fast enough
-                    # to feel instant.
-                    self._analysis_dirty = False
-                    if (self.current_target_info is not None
-                            and self.scope_choice.get()
-                            and self.camera_choice.get()):
-                        self.root.after(50, self.analyze_framing)
-                    else:
-                        # Empty-state Planner entry (no analysis runnable).
-                        # macOS Cocoa Tk leaves the tab black until the
-                        # mouse enters the frame — the paint pipeline is
-                        # waiting on a Motion event to refresh tracking
-                        # areas on the newly-visible widgets.  Synthesize
-                        # one to un-stick the paint without requiring the
-                        # user to move the cursor.
-                        self.root.after(50, self._kick_planner_paint)
-                elif current == str(self.tab_plan):
-                    self.root.after(10, self._draw_queue_gantt)
-                    self.root.after(20, self._refresh_plan_tree)
-                elif current == str(self.tab_explore):
-                    # Redraw the comparison canvas (cheap — image is cached)
-                    # and kick the Cocoa Tk paint pipeline like other tabs.
-                    self.root.after(10, self._explore_redraw)
-                    self.root.after(50, self._kick_explore_paint)
-                elif current == str(self.tab_equip):
-                    # Force layout refresh for grid-based equipment panel
-                    self.root.after(10, self.refresh_inventory_tables)
-                    # Same Cocoa Tk paint-stall workaround as the Planner
-                    # tab — Entry/Treeview widgets render black until a
-                    # Motion event hits them.
-                    self.root.after(50, self._kick_equip_paint)
-                elif current == str(self.tab_settings):
-                    # Force Cocoa Tk to render the settings panel — same
-                    # blank-tab issue as other tabs on macOS.
-                    self.root.after(10, self._refresh_settings_display)
+                self.root.after(20, self._refresh_plan_tree)
+                self.root.after(30, self._refresh_visible_grid)
+            elif current == str(self.tab_explore):
+                # Redraw the comparison canvas (cheap — image is cached)
+                # and kick the Cocoa Tk paint pipeline like other tabs.
+                self.root.after(10, self._explore_redraw)
+                self.root.after(50, self._kick_explore_paint)
+            elif current == str(self.tab_equip):
+                # Force layout refresh for grid-based equipment panel
+                self.root.after(10, self.refresh_inventory_tables)
+                # Same Cocoa Tk paint-stall workaround as the Planner
+                # tab — Entry/Treeview widgets render black until a
+                # Motion event hits them.
+                self.root.after(50, self._kick_equip_paint)
+            elif current == str(self.tab_settings):
+                # Force Cocoa Tk to render the settings panel — same
+                # blank-tab issue as other tabs on macOS.
+                self.root.after(10, self._refresh_settings_display)
         except Exception:
             pass
 
@@ -9591,72 +13716,6 @@ class AstroApp:
         widgets.extend([self.cam_tree, self.scope_tree])
         self._kick_paint(widgets)
 
-    def _auto_load_first_queue_row(self):
-        """Select & fully load the appropriate queue card on Targets-tab entry.
-
-        Runs the full ``_queue_load_target`` so the Targets panel (stat
-        cards, integration plan, altitude chart) reflects the queued
-        target, not whatever the Planner was last analysing.  The
-        Planner's pre-visit search + equipment is already snapshotted
-        into ``_planner_state_backup`` by ``_on_tab_changed`` and will
-        be restored when the user tabs back.
-
-        Early-exits if the user tabbed away before the scheduled
-        ``after(20)`` callback fired.  Idempotent — if the fields are
-        already bound to the selected card, nothing happens.
-        """
-        # Bail if the user tabbed away during the after() delay
-        try:
-            if self.tab_control.select() != str(self.tab_session):
-                return
-        except Exception:
-            return
-
-        if not self._queue_entries:
-            return
-        # Pick the first card if nothing (valid) is currently selected
-        if (self._queue_card_selected is None
-                or self._queue_card_selected >= len(self._queue_entries)):
-            self._queue_card_selected = 0
-        # Skip redundant reloads (e.g. Targets → Equip → Targets)
-        if self._editing_queue_idx == self._queue_card_selected:
-            return
-
-        self._queue_load_target(None)
-        # Apply the visual selection highlight — the card may have been
-        # rebuilt without highlighting when it was first added from the
-        # Planner tab.
-        self._queue_card_update_highlight(self._queue_card_selected)
-
-    def _restore_planner_state(self, state):
-        """Restore the Planner's search + equipment dropdowns from a backup dict.
-
-        Wrapped in ``_loading_queue_row`` to suppress the Combobox
-        ``on_parameter_change`` trace, so restoring values doesn't
-        schedule a duplicate analysis (the caller schedules its own)
-        and doesn't mutate ``_editing_queue_idx``.
-        """
-        self._loading_queue_row = True
-        try:
-            self.target_search.delete(0, tk.END)
-            self.target_search.insert(0, state.get("search", ""))
-            for attr, key in (
-                ("scope_choice",     "scope"),
-                ("camera_choice",    "camera"),
-                ("bortle_choice",    "bortle"),
-                ("filter_mode",      "filter"),
-                ("reduction_factor", "reduction"),
-            ):
-                val = state.get(key, "")
-                if val:
-                    try:
-                        getattr(self, attr).set(val)
-                    except Exception:
-                        pass
-        finally:
-            self._loading_queue_row = False
-
-
     def _show_toast(self, message, duration_ms=2000):
         """Show a brief non-blocking status message near the top of the window."""
         toast = tk.Toplevel(self.root)
@@ -9681,95 +13740,155 @@ class AstroApp:
 
 
     # ═══════════════════════════════════════════════════════════════════
-    # QUEUE MANAGEMENT — add, remove, reorder, move-to-plan
+    # PLAN COMMIT — add a target straight to Tonight's Plan (no queue)
     # ═══════════════════════════════════════════════════════════════════
 
-    def _add_to_queue(self):
-        """Look up the current target and add it to the queue, computing window data in background."""
-        raw = self.target_search.get().strip().upper().replace(" ", "")
-        raw = self._normalize_catalog_key(raw)
-        if not raw:
-            messagebox.showwarning("No Target", "Enter a target name in the search box first.")
-            return
-        t = self.targets.get(raw) or self.common_names_map.get(raw)
-        if not t:
-            messagebox.showwarning("Target Not Found",
-                f"Could not find '{self.target_search.get().strip()}' in the catalog.")
-            return
-        # Block exact duplicate (same target AND same scope) — but allow the same
-        # target under a different scope so two telescopes can image it simultaneously.
-        scope_name_chk = self.scope_choice.get()
-        if any(e["target_id"] == t["id"] and e.get("scope") == scope_name_chk
-               for e in self._queue_entries):
-            messagebox.showinfo(
-                "Already Queued",
-                f"{t['id']} with scope '{scope_name_chk}' is already in the queue.\n\n"
-                "To add the same target for a second telescope, switch to that "
-                "scope in the Target Planner and add again.")
-            return
+    def _split_entry_into_plan(self, e):
+        """Split one committed target into per-filter Tonight's Plan rows.
 
-        report_text = ""
-        if self.current_target_info and self.current_target_info.get("id") == t["id"]:
-            report_text = self.results_txt.get("1.0", tk.END).strip()
+        ``e`` is a plain dict (target_id/common/ra_deg/dec_deg/scope/
+        camera/bortle/filter_mode/exp_s/win_start/win_end/start_time/
+        alloc_hrs/report_text/rotation_angle/framed_ra_deg/framed_dec_deg).
+        A color camera or Mono Lum setup becomes one plan entry; a Filter
+        Set splits into one entry per filter IN the set (its whole wheel —
+        Ha/OIII/SII/L/R/G/B or whatever it holds), each getting its own
+        slice of the total allocated hours. Per Jerry: a rig's filter
+        selection is a whole Filter Set now, not one filter at a time, so
+        "Add to Tonight" adds every filter the set contains in one click
+        (matching how LRGB already batched before Filter Sets existed).
+        This is the one place the filter-split math lives now — every
+        "commit to tonight's plan" path (a browsing-grid card's Add to
+        Tonight, the Frame dialog's Confirm Framing, and the Planner tab's
+        own Add to Targets button) funnels through
+        :meth:`_add_target_to_plan_direct` into here, instead of each
+        duplicating it (as the old queue's move-to-plan functions used to).
 
-        scope_name  = self.scope_choice.get()
-        cam_name    = self.camera_choice.get()
-        bortle_key  = self.bortle_choice.get()
-        filter_mode = self.filter_mode.get()
-        try:
-            reduction = float(self.reduction_factor.get().rstrip("×x"))
-        except ValueError:
-            reduction = 1.0
+        ``e["exp_s"]`` was computed by the caller for one blended rf — the
+        WHOLE set's :meth:`_rf_for_filter_mode` value, e.g. narrowband-
+        biased for any mixed LRGB+SHO wheel — so reusing it as-is for
+        every row gave every LRGB channel a narrowband-length exposure
+        (Jerry: "all the recommended exposure times are SHO times"). Since
+        the sky-background formula scales exposure time linearly with rf,
+        each filter's own correct exposure is that reference value
+        re-scaled by (that filter's own rf ÷ the reference rf) — so a
+        single-type set (or Mono Lum/color) is unaffected (its members'
+        rf already equals the reference), and only a genuinely mixed set
+        gets each filter its own, correctly-sized exposure.
+        """
+        cam      = self.data["cameras"].get(e["camera"], {})
+        is_color = cam.get("is_color", True)
+        fm       = e.get("filter_mode", "Mono Lum")
+        fs       = None if (is_color or fm == "Mono Lum") else self.data.get("filter_sets", {}).get(fm)
+        members  = (fs["members"] if (fs and fs.get("members"))
+                    else [{"name": "", "type": None}])
 
-        framed_ra, framed_dec = self._framed_center(t["ra_deg"], t["dec_deg"])
+        n_filters = len(members)
+        alloc_hrs = e.get("alloc_hrs") or self._get_default_alloc_hrs()
+        hrs_per_filt = alloc_hrs / max(n_filters, 1)
+        ref_rf = 1.0 if is_color else self._rf_for_filter_mode(fm)
 
-        entry = {
-            "target_id":      t["id"],
-            "common":         t.get("common", "").split(";")[0].strip(),
-            "obj_type":       t.get("obj_type", ""),
-            "ra_deg":         t["ra_deg"],
-            "dec_deg":        t["dec_deg"],
-            "v_mag":          t.get("v_mag"),
-            "surf_br":        t.get("surf_br"),
-            "win_start":      None,
-            "win_end":        None,
-            "win_hrs":        0.0,
-            "start_time":     None,
-            "peak_time":      None,
-            "peak_alt":       -90.0,
-            "transit_time":   None,
-            "f_fits":         None,
-            "report_text":    report_text,
-            "scope":          scope_name,
-            "camera":         cam_name,
-            "bortle":         bortle_key,
-            "filter_mode":    filter_mode,
-            "reduction":      reduction,
-            "exp_s":          None,
-            "computed":       False,
-            "rotation_angle": self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0)),
-            "framed_ra_deg":  framed_ra,
-            "framed_dec_deg": framed_dec,
-        }
-        # ── Short-window / no-window warning ──────────────────────────────
-        win_hrs_now = self._last_win_hrs or 0.0  # None means no window tonight
-        if win_hrs_now < 0.5:
-            if win_hrs_now == 0.0:
-                detail = f"{t['id']} has no imaging window tonight.’"
+        for member in members:
+            filt_name = member.get("name", "")
+            if fs is None or not filt_name:
+                exp_s_this = e["exp_s"]
             else:
-                win_min = int(round(win_hrs_now * 60))
-                detail  = (f"{t['id']} has an imaging window of only {win_min} min "
-                           f"tonight — less than 30 minutes.")
-            resp = messagebox.askyesno(
-                "No Imaging Window" if win_hrs_now == 0.0 else "Short Imaging Window",
-                f"{detail}\n\nAdd it to the session queue anyway?",
-                icon="warning")
-            if not resp:
-                return
-        self._queue_entries.append(entry)
-        self._editing_queue_idx = None   # detach from any previously-clicked entry
-        self._refresh_queue_tree()
-        self._show_toast(f"{t['id']} added to queue")
+                if member.get("type") == "narrowband" and fs.get("bandwidth_nm"):
+                    member_rf = 348.0 / max(float(fs["bandwidth_nm"]), 0.1)
+                else:
+                    member_rf = 3.0   # lrgb member (or a defensively-typeless one)
+                exp_s_this = e["exp_s"] * (member_rf / max(ref_rf, 0.001))
+
+            n_subs      = int(hrs_per_filt * 3600.0 / max(exp_s_this, 0.1))
+            int_filt_h  = round((n_subs * exp_s_this) / 3600.0, 2)
+            filt_label  = filt_name if n_filters > 1 else (fm if not is_color else "")
+            self._plan_entries.append({
+                "target_id":     e["target_id"],
+                "common":        e["common"],
+                "ra_deg":        e.get("ra_deg", 0.0),
+                "dec_deg":       e.get("dec_deg", 0.0),
+                "scope":         e["scope"],
+                "camera":        e["camera"],
+                "filter":        filt_label,
+                "filter_mode":   fm,
+                "bortle":        e["bortle"],
+                "exp_s":         round(exp_s_this, 1),
+                "win_start":     e.get("win_start") or "",
+                "win_end":       e.get("win_end") or "",
+                "start_time":    e.get("start_time") or e.get("win_start") or "",
+                "allocated_hrs": round(hrs_per_filt, 2),
+                "n_subs":        n_subs,
+                "total_int_hrs": int_filt_h,
+                "added":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "report_text":   e.get("report_text", ""),
+                "rotation_angle": e.get("rotation_angle", 0.0),
+                "framed_ra_deg":  e.get("framed_ra_deg"),
+                "framed_dec_deg": e.get("framed_dec_deg"),
+            })
+        return n_filters
+
+    def _add_target_to_plan_direct(self, t, scope_name, cam_name, bortle_key,
+                                    filter_mode, reduction, rotation_angle=0.0,
+                                    framed_ra_deg=None, framed_dec_deg=None,
+                                    report_text="", allow_update_framing=False):
+        """Compute a target's exposure/window in the background and commit
+        it straight to Tonight's Plan — no intermediate queue, no tab jump.
+
+        Same background-thread math ``_add_to_queue`` used to run (sub-
+        exposure recommendation + tonight's best imaging window), just
+        landing in ``_plan_entries`` via :meth:`_split_entry_into_plan`
+        the moment it's ready, instead of sitting in a queue that then
+        required a manual "Add to Plan" click on the (now retired)
+        Targets List tab.
+
+        ``allow_update_framing`` distinguishes "I just dialed in a framing
+        and want to commit it" (the Frame dialog's Confirm, and the
+        Planner tab's own Add to Tonight, both of which pass real pan/
+        rotation from interactive framing) from a plain, neutral "add to
+        tonight" click (the browsing card's ✚, which always passes
+        rotation_angle=0/framed_*=None). See the duplicate-handling below.
+        """
+        # Keyed on (target, scope, camera, filter_mode) — the same target on
+        # the same rig legitimately gets added more than once: a single
+        # mono camera's filter wheel commonly holds both an LRGB set and an
+        # SHO (narrowband) set, and each is its own "Add to Tonight" with
+        # its own filter_mode. What must never duplicate is re-adding the
+        # exact same filter set on the exact same rig (e.g. two accidental
+        # clicks, or forgetting LRGB was already added). Scope/camera alone
+        # would also wrongly block that legitimate LRGB-then-SHO sequence
+        # on one rig, so filter_mode has to be part of the key too.
+        existing = [pe for pe in self._plan_entries
+                    if pe["target_id"] == t["id"] and pe.get("scope") == scope_name
+                    and pe.get("camera") == cam_name
+                    and pe.get("filter_mode") == filter_mode]
+        if existing:
+            if allow_update_framing:
+                # The target's already in tonight's plan (e.g. quick-added
+                # via the card's ✚ with no framing yet) and you've now gone
+                # and framed it properly — update the pointing/rotation on
+                # its existing plan row(s) instead of erroring, since that's
+                # clearly the intent, not an accidental double-add. A
+                # multi-filter target (LRGB/narrowband) has one row per
+                # filter, all sharing the same pointing, so every matching
+                # row gets the update.
+                for pe in existing:
+                    pe["rotation_angle"] = rotation_angle
+                    pe["framed_ra_deg"] = framed_ra_deg
+                    pe["framed_dec_deg"] = framed_dec_deg
+                    if report_text:
+                        pe["report_text"] = report_text
+                self._mark_grid_touched(t["id"])
+                self._refresh_plan_tree()
+                self._refresh_visible_grid()
+                self._show_toast(f"{t['id']}'s framing updated")
+            else:
+                messagebox.showinfo(
+                    "Already Planned",
+                    f"{t['id']} on scope '{scope_name}' with camera '{cam_name}' "
+                    f"already has a '{filter_mode}' entry in tonight's plan.\n\n"
+                    "To add a different filter set (e.g. LRGB then SHO) for the "
+                    "same rig, change the Filter Mode and add again. To add the "
+                    "same filter set on a second rig, switch scope/camera first.")
+            return
 
         lat, lon = self._get_saved_location()
         b_data = BORTLE_FACTORS.get(bortle_key, BORTLE_FACTORS.get("4 (Rural/Suburban)", {}))
@@ -9777,288 +13896,130 @@ class AstroApp:
         def _compute():
             s = self.data["scopes"].get(scope_name, {})
             c = self.data["cameras"].get(cam_name, {})
-            exp_s_c = f_fits_c = None
+            exp_s_c = None
             if s and c:
                 native_fl = float(s.get("native_fl", 1))
                 ap        = float(s.get("aperture", 1))
                 eff_fl    = native_fl * reduction
                 eff_f     = eff_fl / max(ap, 1)
                 ps        = float(c.get("pixel_size", 1))
-                sw, sh    = float(c.get("sensor_w", 1)), float(c.get("sensor_h", 1))
-                fw = 2 * math.degrees(math.atan(sw / (2 * max(eff_fl, 1))))
-                fh = 2 * math.degrees(math.atan(sh / (2 * max(eff_fl, 1))))
                 is_color  = c.get("is_color", True)
                 rf        = 1.0 if is_color else self._rf_for_filter_mode(filter_mode)
                 sky_flux  = (((b_data.get("color" if is_color else "mono", 1.0))
                                * c.get("qe", 0.5) * ps**2) / max(eff_f**2, 1e-6)) / max(rf, 1)
                 exp_s_c   = (C_VALUE * c.get("read_noise", 1)**2) / (sky_flux + 1e-5)
-                f_fits_c  = (t.get("size_maj", 0) / 60.0 < fw and
-                             t.get("size_min", 0) / 60.0 < fh)
 
-            win_start = win_end = peak_t = transit_str = None
-            win_hrs = peak_a = 0.0
+            win_start = win_end = None
+            win_hrs = 0.0
             if lat is not None and lon is not None:
                 try:
                     _min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
-                    win_start, win_end, win_hrs, peak_t, peak_a, _ = _calc_best_imaging_window(
+                    win_start, win_end, win_hrs, _, _, _ = _calc_best_imaging_window(
                         t["ra_deg"], t["dec_deg"], lat, lon, min_alt=_min_alt)
                     win_hrs = win_hrs or 0.0
-                    peak_a  = peak_a  or 0.0
-                except Exception:
-                    pass
-                try:
-                    transit_str = _calc_transit_time(t["ra_deg"], lon)
                 except Exception:
                     pass
 
-            def _update():
-                for e in self._queue_entries:
-                    if (e["target_id"] == t["id"] and e.get("scope") == scope_name
-                            and not e["computed"]):
-                        e.update({
-                            "win_start": win_start, "win_end": win_end,
-                            "win_hrs": win_hrs, "peak_time": peak_t,
-                            "peak_alt": peak_a, "transit_time": transit_str,
-                            "f_fits": f_fits_c, "exp_s": exp_s_c, "computed": True,
-                        })
-                        # Default start_time to win_start if not already set by the user
-                        if e.get("start_time") is None:
-                            e["start_time"] = win_start
-                        # Apply default allocated hours from settings if not already user-set
-                        if not e.get("alloc_hrs"):
-                            try:
-                                default_alloc = float(self.data.get("settings", {}).get(
-                                    "default_alloc_hrs", "0"))
-                            except (ValueError, TypeError):
-                                default_alloc = 0
-                            if default_alloc > 0:
-                                e["alloc_hrs"] = round(default_alloc, 2)
-                            elif win_hrs and win_hrs > 0:
-                                e["alloc_hrs"] = round(win_hrs, 2)
-                        break
-                self._refresh_queue_tree()
-                # Note: _refresh_queue_tree() already calls _draw_queue_gantt()
-            self.root.after(0, _update)
+            def _finish():
+                if exp_s_c is None:
+                    messagebox.showwarning("Incomplete",
+                        f"{t['id']} could not be computed (missing scope/camera data).")
+                    return
+                if win_hrs < 0.5:
+                    if win_hrs == 0.0:
+                        detail = f"{t['id']} has no imaging window tonight."
+                        title  = "No Imaging Window"
+                    else:
+                        win_min = int(round(win_hrs * 60))
+                        detail  = (f"{t['id']} has an imaging window of only "
+                                   f"{win_min} min tonight — less than 30 minutes.")
+                        title   = "Short Imaging Window"
+                    if not messagebox.askyesno(title,
+                            f"{detail}\n\nAdd it to Tonight's Plan anyway?", icon="warning"):
+                        return
+
+                try:
+                    default_alloc = float(self.data.get("settings", {}).get("default_alloc_hrs", "0") or 0)
+                except (ValueError, TypeError):
+                    default_alloc = 0.0
+                alloc_hrs = (default_alloc if default_alloc > 0
+                             else (win_hrs if win_hrs > 0 else self._get_default_alloc_hrs()))
+
+                entry = {
+                    "target_id":      t["id"],
+                    "common":         t.get("common", "").split(";")[0].strip(),
+                    "ra_deg":         t["ra_deg"],
+                    "dec_deg":        t["dec_deg"],
+                    "scope":          scope_name,
+                    "camera":         cam_name,
+                    "bortle":         bortle_key,
+                    "filter_mode":    filter_mode,
+                    "exp_s":          exp_s_c,
+                    "win_start":      win_start or "",
+                    "win_end":        win_end or "",
+                    "start_time":     win_start or "",
+                    "alloc_hrs":      alloc_hrs,
+                    "report_text":    report_text,
+                    "rotation_angle": rotation_angle,
+                    "framed_ra_deg":  framed_ra_deg,
+                    "framed_dec_deg": framed_dec_deg,
+                }
+                self._split_entry_into_plan(entry)
+                self._refresh_plan_tree()
+                self._show_toast(f"{t['id']} added to Tonight's Plan")
+                # Re-render the browsing grid's cards now that the entry has
+                # actually landed in _plan_entries, so the target's card
+                # flips from "＋" to "✓" reliably. This has to happen HERE,
+                # inside the async landing point, rather than right after
+                # the call that kicked this off -- this whole add runs on a
+                # background thread and lands via this root.after(0, ...),
+                # so a rescan fired immediately after that call (the old
+                # behavior) was a race that could easily finish first and
+                # repopulate the grid from the still-stale _plan_entries,
+                # leaving the card showing "＋" even though the target was
+                # already in tonight's plan.
+                self._refresh_visible_grid()
+
+            self.root.after(0, _finish)
 
         threading.Thread(target=_compute, daemon=True).start()
 
-    def _refresh_queue_tree(self):
-        """Rebuild the queue card list from self._queue_entries, preserving selection."""
-        if not hasattr(self, "_queue_cards_inner"):
+    def _add_target_from_planner_search(self):
+        """Planner tab's own "Add to Tonight" button.
+
+        Resolves whatever's in the search box (independent of whether
+        Analyze Target has been run) and commits it straight to
+        Tonight's Plan using this tab's current equipment selection and
+        any pan/rotation already set in the FOV preview — the same
+        framing state the Frame dialog's Confirm uses.
+        """
+        raw = self.target_search.get().strip().upper().replace(" ", "")
+        raw = self._normalize_catalog_key(raw)
+        t = self.targets.get(raw) or self.common_names_map.get(raw)
+        if not t:
+            messagebox.showwarning("No Target", "Please enter a valid target to add.")
             return
 
-        # Preserve selected index
-        old_sel = self._queue_card_selected
-
-        # Clear existing cards
-        for w in self._queue_cards_inner.winfo_children():
-            w.destroy()
-        self._queue_card_widgets = []
-
-        TYPE_COLORS = {
-            "Nebula": ("#2a3520", "#8bc34a"), "Planetary Nebula": ("#2a3520", "#8bc34a"),
-            "Galaxy": ("#1e2a3a", "#64b5f6"), "Open Cluster": ("#2a2035", "#ce93d8"),
-            "Globular Cluster": ("#2a2035", "#ce93d8"),
-        }
-
-        for i, e in enumerate(self._queue_entries):
-            computing = not e["computed"]
-            is_selected = (i == old_sel)
-
-            # Card frame
-            border_col = "#38bdf8" if is_selected else "#1e2d3e"
-            card = tk.Frame(self._queue_cards_inner, bg="#131f2e",
-                            highlightthickness=1, highlightbackground=border_col)
-            card.pack(fill="x", padx=2, pady=2)
-
-            # Left accent border (via a thin frame inside the card)
-            accent_col = "#38bdf8" if is_selected else "#2e4a63"
-            tk.Frame(card, bg=accent_col, width=3).pack(side="left", fill="y")
-
-            # Content area
-            content = tk.Frame(card, bg="#131f2e")
-            content.pack(side="left", fill="both", expand=True, padx=(8, 10), pady=6)
-
-            # Top row: number circle + target info + metrics
-            top_row = tk.Frame(content, bg="#131f2e")
-            top_row.pack(fill="x")
-
-            # Numbered circle
-            circle_bg = "#38bdf8" if is_selected else "#2e4a63"
-            circle_fg = "#0e1a28" if is_selected else "#aaddff"
-            num_cv = tk.Canvas(top_row, width=28, height=28, bg="#131f2e",
-                               highlightthickness=0)
-            num_cv.pack(side="left", padx=(0, 8))
-            num_cv.create_oval(1, 1, 27, 27, fill=circle_bg, outline="")
-            num_cv.create_text(14, 14, text=str(i + 1), fill=circle_fg,
-                               font=("Helvetica", 11, "bold"))
-
-            # Target name + common name + type badge
-            name_frame = tk.Frame(top_row, bg="#131f2e")
-            name_frame.pack(side="left", fill="x", expand=True)
-
-            name_row = tk.Frame(name_frame, bg="#131f2e")
-            name_row.pack(anchor="w")
-            tk.Label(name_row, text=e["target_id"], bg="#131f2e", fg="#ffffff",
-                     font=("Helvetica", 12, "bold")).pack(side="left", padx=(0, 6))
-            if e.get("common"):
-                tk.Label(name_row, text=e["common"], bg="#131f2e", fg="#7eb8d4",
-                         font=("Helvetica", 10)).pack(side="left", padx=(0, 6))
-            # Type badge
-            obj_type = e.get("obj_type", "Other")
-            badge_bg, badge_fg = TYPE_COLORS.get(obj_type, ("#222830", "#778899"))
-            tk.Label(name_row, text=obj_type, bg=badge_bg, fg=badge_fg,
-                     font=("Helvetica", 8), padx=6, pady=1).pack(side="left")
-
-            # Second line: scope · camera
-            if e.get("scope") or e.get("camera"):
-                meta_parts = []
-                if e.get("scope"):
-                    meta_parts.append(e["scope"])
-                if e.get("camera"):
-                    meta_parts.append(e.get("camera", ""))
-                tk.Label(name_frame, text="  ·  ".join(meta_parts), bg="#131f2e",
-                         fg="#556677", font=("Helvetica", 9)).pack(anchor="w")
-
-            # Right-side metrics
-            metrics = tk.Frame(top_row, bg="#131f2e")
-            metrics.pack(side="right")
-
-            # Window time range
-            if e.get("win_start") and e.get("win_end"):
-                _dur_h = e.get("alloc_hrs") or e.get("win_hrs") or 0
-                win_color = "#4caf50" if _dur_h >= 3 else ("#f59e0b" if _dur_h >= 1 else "#ef5350")
-                tk.Label(metrics, text=f"{e['win_start']} – {e['win_end']}",
-                         bg="#131f2e", fg=win_color,
-                         font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=(0, 12))
-                tk.Label(metrics, text=f"{_dur_h:.1f}h" if _dur_h else "—",
-                         bg="#131f2e", fg="#556677",
-                         font=("Helvetica", 9)).grid(row=1, column=0, padx=(0, 12))
-            elif computing:
-                tk.Label(metrics, text="computing…", bg="#131f2e", fg="#556677",
-                         font=("Helvetica", 9, "italic")).grid(row=0, column=0, padx=(0, 12))
-            else:
-                tk.Label(metrics, text="—", bg="#131f2e", fg="#334455",
-                         font=("Helvetica", 10)).grid(row=0, column=0, padx=(0, 12))
-
-            # Transit
-            transit = e.get("transit_time") or ("…" if computing else "—")
-            tk.Label(metrics, text=transit, bg="#131f2e", fg="#ffffff",
-                     font=("Helvetica", 10)).grid(row=0, column=1, padx=(0, 8))
-            tk.Label(metrics, text="transit", bg="#131f2e", fg="#556677",
-                     font=("Helvetica", 8)).grid(row=1, column=1, padx=(0, 8))
-
-            # Peak altitude
-            if e["computed"] and e.get("peak_alt", -90) > -89:
-                peak_val = e["peak_alt"]
-                peak_col = "#4caf50" if peak_val >= 40 else ("#f59e0b" if peak_val >= 20 else "#ef5350")
-                peak_str = f"{peak_val:.0f}°"
-            else:
-                peak_col = "#556677"
-                peak_str = "…" if computing else "—"
-            tk.Label(metrics, text=peak_str, bg="#131f2e", fg=peak_col,
-                     font=("Helvetica", 10)).grid(row=0, column=2, padx=(0, 8))
-            tk.Label(metrics, text="peak", bg="#131f2e", fg="#556677",
-                     font=("Helvetica", 8)).grid(row=1, column=2, padx=(0, 8))
-
-            # Status dot
-            status_col = "#4caf50"
-            if e.get("f_fits") is False:
-                status_col = "#ef5350"
-            elif not e["computed"]:
-                status_col = "#556677"
-            elif e.get("peak_alt", 0) < 20:
-                status_col = "#f59e0b"
-            dot_cv = tk.Canvas(metrics, width=10, height=10, bg="#131f2e",
-                               highlightthickness=0)
-            dot_cv.grid(row=0, column=3, rowspan=2, padx=(0, 0), pady=4)
-            dot_cv.create_oval(1, 1, 9, 9, fill=status_col, outline="")
-
-            # Click binding — all widgets in card trigger selection
-            self._queue_card_widgets.append(card)
-            def _bind_click(widget, idx=i):
-                widget.bind("<Button-1>", lambda e, ii=idx: self._queue_card_click(ii))
-            _bind_click(card)
-            _bind_click(content)
-            _bind_click(top_row)
-            _bind_click(name_frame)
-            _bind_click(name_row)
-            _bind_click(metrics)
-            _bind_click(num_cv)
-            for child in name_row.winfo_children():
-                _bind_click(child)
-            for child in metrics.winfo_children():
-                _bind_click(child)
-
-            # Mousewheel bindings — must be applied to every descendant,
-            # otherwise the wheel stops working once cards cover the canvas.
-            self._bind_queue_mousewheel_recursive(card)
-
-        # Restore selection
-        if old_sel is not None and old_sel < len(self._queue_entries):
-            self._queue_card_selected = old_sel
-        elif self._queue_entries:
-            self._queue_card_selected = 0
-        else:
-            self._queue_card_selected = None
-
-        self._draw_queue_gantt()
-
-        # Same as _refresh_plan_tree: re-theme newly created widgets when in
-        # night mode so they don't flash with day-mode white text.
-        if self.night_mode:
-            self._apply_night_mode()
-
-    def _queue_card_click(self, idx):
-        """Handle a click on a queue card — select it and load its target."""
-        # User is committing to this queue entry — clear the Planner backup
-        # so returning to the Planner after this click pivots to the clicked
-        # target rather than restoring whatever search was active before
-        # this Targets-tab visit.
-        self._planner_state_backup = None
-
-        old = self._queue_card_selected
-        self._queue_card_selected = idx
-
-        # Update visual state of old and new cards
-        self._queue_card_update_highlight(old)
-        self._queue_card_update_highlight(idx)
-
-        # Trigger load
-        self._queue_load_target(None)
-
-    def _queue_card_update_highlight(self, idx):
-        """Update the visual highlight state of a single queue card."""
-        if idx is None or idx >= len(self._queue_card_widgets):
+        scope_name = self.scope_choice.get()
+        cam_name   = self.camera_choice.get()
+        if not scope_name or not cam_name:
+            messagebox.showwarning("Incomplete", "Please select a Scope and Camera first.")
             return
-        card = self._queue_card_widgets[idx]
-        is_selected = (idx == self._queue_card_selected)
-
-        border_col = "#38bdf8" if is_selected else "#1e2d3e"
-        accent_col = "#38bdf8" if is_selected else "#2e4a63"
-        circle_bg = "#38bdf8" if is_selected else "#2e4a63"
-        circle_fg = "#0e1a28" if is_selected else "#aaddff"
 
         try:
-            card.configure(highlightbackground=border_col)
-            # Update accent line (first child)
-            children = card.winfo_children()
-            if children:
-                children[0].configure(bg=accent_col)
-            # Update number circle (find the Canvas in content > top_row)
-            content = children[1] if len(children) > 1 else None
-            if content:
-                top_row = content.winfo_children()[0] if content.winfo_children() else None
-                if top_row:
-                    for w in top_row.winfo_children():
-                        if isinstance(w, tk.Canvas) and w.winfo_width() <= 30:
-                            w.delete("all")
-                            w.create_oval(1, 1, 27, 27, fill=circle_bg, outline="")
-                            w.create_text(14, 14, text=str(idx + 1), fill=circle_fg,
-                                          font=("Helvetica", 11, "bold"))
-                            break
-        except Exception:
-            pass
+            reduction = float(self.reduction_factor.get().rstrip("×x"))
+        except ValueError:
+            reduction = 1.0
+
+        framed_ra, framed_dec = self._framed_center(t["ra_deg"], t["dec_deg"])
+        rotation_angle = self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0) or 0.0)
+
+        self._add_target_to_plan_direct(
+            t, scope_name, cam_name, self.bortle_choice.get(),
+            self.filter_mode.get(), reduction,
+            rotation_angle=rotation_angle,
+            framed_ra_deg=framed_ra, framed_dec_deg=framed_dec,
+            report_text="", allow_update_framing=True)
 
     def _parse_h(self, s):
         """Parse 'HH:MM' string to fractional hours float, or None on failure."""
@@ -10088,15 +14049,30 @@ class AstroApp:
             self._gantt_note_lbl.config(text="")
 
     def _draw_queue_gantt(self):
-        """Draw the schedule timeline on the Targets List tab.
+        """Draw tonight's plan as a draggable schedule timeline.
 
-        When Tonight's Plan has entries, shows those as draggable bars with
-        altitude curves so start times can be set by dragging.
-        Falls back to showing queue imaging-window bars when the plan is empty.
+        Lives in the Plan tab now (a full-width collapsible strip below
+        both panes — see setup_plan_tab), not the retired Targets List
+        tab, and draws from ``_plan_entries`` instead of the old queue:
+        drag a bar to change that target's start time directly on the
+        committed plan, rather than arranging candidates before a
+        separate "move to plan" step.
+
+        One row per rig (target_id + scope) rather than one row per
+        ``_plan_entries`` row (i.e. per filter) — filters on the same rig
+        always shoot sequentially, so a separate slider per filter just
+        showed identical/overlapping bars for no reason. Each row's bar
+        spans the combined allocated hours of every filter on that rig,
+        and dragging it moves every one of those filter rows together
+        (see ``_gantt_drag``). Bar color matches the rig's accent color
+        from the plan card list (``_get_rig_accent_color``) instead of a
+        separate fixed palette, so a rig looks the same in both places.
         """
         if not hasattr(self, "queue_gantt"):
             return
         canvas = self.queue_gantt
+        if not canvas.winfo_ismapped():
+            return   # strip is collapsed — nothing to draw
         canvas.update_idletasks()
         cw = canvas.winfo_width()
         ch = canvas.winfo_height() or 200
@@ -10117,10 +14093,9 @@ class AstroApp:
         fg_dim   = "#880000" if nm else "#aabbcc"    # matches altitude chart fg_dim
         fg_now   = "#aa0000" if nm else "#ccaa00"    # matches altitude chart fg_label
 
-        # ── Mode: always queue entries ────────────────────────────────────
-        if not self._queue_entries:
+        if not self._plan_entries:
             canvas.create_text(cw // 2, ch // 2,
-                text="Add targets to the queue to see the imaging window timeline",
+                text="Add targets to Tonight's Plan to see the schedule timeline",
                 fill=fg_dim, font=("Helvetica", 11))
             return
 
@@ -10193,9 +14168,10 @@ class AstroApp:
             h += 1
         canvas.create_line(lm, tm + ph, cw - rm, tm + ph, fill=fg_dim)
 
-        # ── Draw rows (always queue entries) ──────────────────────────────
-        COLORS  = ["#1D9E75", "#378ADD", "#7F77DD", "#D85A30",
-                   "#BA7517", "#D4537E", "#639922"]
+        # ── Group plan entries by rig (target_id + scope) ─────────────────
+        # Filters on the same rig shoot sequentially, so they share one row
+        # and one draggable bar spanning their combined allocated hours,
+        # instead of one (identical, overlapping) bar per filter.
         MAX_ALT = 90.0
 
         def _dim(hex_col, factor=0.25):
@@ -10205,14 +14181,45 @@ class AstroApp:
             b = int(int(hex_col[5:7], 16) * factor + 0x10 * (1 - factor))
             return f"#{r:02x}{g:02x}{b:02x}"
 
-        entries  = self._queue_entries
-        max_rows = min(len(entries), 8)
+        groups = []
+        group_idx_by_key = {}
+        for member_idx, e in enumerate(self._plan_entries):
+            # Camera is part of the grouping key — two cameras can share a
+            # scope on the same target (e.g. LRGB on one camera, SHO on
+            # another), and each needs its own Gantt bar, not one shared
+            # between two unrelated imaging trains.
+            key = (e["target_id"], e.get("scope", ""), e.get("camera", ""))
+            gi = group_idx_by_key.get(key)
+            if gi is None:
+                gi = len(groups)
+                group_idx_by_key[key] = gi
+                groups.append({
+                    "target_id":     e["target_id"],
+                    "scope":         e.get("scope", ""),
+                    "camera":        e.get("camera", ""),
+                    "ra_deg":        e.get("ra_deg", 0.0),
+                    "dec_deg":       e.get("dec_deg", 0.0),
+                    "win_start":     e.get("win_start") or "",
+                    "win_end":       e.get("win_end") or "",
+                    "start_time":    e.get("start_time") or e.get("win_start") or "",
+                    "total_alloc_h": 0.0,
+                    "member_idxs":   [],
+                })
+            g = groups[gi]
+            g["total_alloc_h"] += e.get("allocated_hrs") or 0.0
+            g["member_idxs"].append(member_idx)
+
+        # Saved for _gantt_drag, which needs to move every filter row on a
+        # rig together when its bar is dragged.
+        self._gantt_groups = groups
+
+        max_rows = min(len(groups), 8)
         row_h    = ph / max(max_rows, 1)
-        self._gantt_row_info   = []   # (y_top, y_bot, entry_idx, alloc_x1, alloc_x2, start_h_norm)
+        self._gantt_row_info   = []   # (y_top, y_bot, group_idx, alloc_x1, alloc_x2, start_h_norm)
         self._gantt_drag_bounds = {}
 
-        for i, e in enumerate(entries[:max_rows]):
-            color    = COLORS[i % len(COLORS)]
+        for i, g in enumerate(groups[:max_rows]):
+            color    = self._get_rig_accent_color(g["scope"], g["camera"])
             dim_col  = _dim(color)
             y_top    = tm + i * row_h + 1
             y_bot    = tm + (i + 1) * row_h - 1
@@ -10222,27 +14229,26 @@ class AstroApp:
             is_drag  = (i == self._gantt_drag_idx)
 
             # Target label — always include scope so users can tell apart entries at a glance.
-            scope_abbr = (e.get("scope") or "")
+            scope_abbr = (g.get("scope") or "")
             if scope_abbr:
-                row_label  = f"{e['target_id']}\n{scope_abbr[:12]}"
+                row_label  = f"{g['target_id']}\n{scope_abbr[:12]}"
                 label_font = ("Helvetica", 8, "bold")
             else:
-                row_label  = e["target_id"]
+                row_label  = g["target_id"]
                 label_font = ("Helvetica", 10, "bold")
             canvas.create_text(lm - 4, y_mid, text=row_label,
                                fill=fg_main, font=label_font, anchor="e")
 
-            if not e["computed"] or not e.get("win_start"):
+            if not g.get("win_start"):
                 canvas.create_rectangle(lm, y_top, cw - rm, y_bot,
                                         fill="#111820", outline=fg_dim, dash=(3, 3))
-                msg = "computing…" if not e["computed"] else "not visible tonight"
                 canvas.create_text((lm + cw - rm) // 2, y_mid,
-                                   text=msg, fill=fg_dim, font=("Helvetica", 9))
+                                   text="not visible tonight", fill=fg_dim, font=("Helvetica", 9))
                 self._gantt_row_info.append((y_top, y_bot, i, lm, lm, dark_start_h))
                 continue
 
-            ws = self._parse_h(e.get("win_start"))
-            we = self._parse_h(e.get("win_end"))
+            ws = self._parse_h(g.get("win_start"))
+            we = self._parse_h(g.get("win_end"))
             if ws is None or we is None:
                 canvas.create_text((lm + cw - rm) // 2, y_mid,
                                    text="not visible tonight", fill=fg_dim, font=("Helvetica", 9))
@@ -10264,8 +14270,8 @@ class AstroApp:
                                         fill=dim_col, outline="")
 
             # ── Altitude curve over the whole available window ─────────────
-            ra_deg  = e.get("ra_deg", 0)
-            dec_deg = e.get("dec_deg", 0)
+            ra_deg  = g.get("ra_deg", 0)
+            dec_deg = g.get("dec_deg", 0)
             N_ALT   = 50
             alt_pts = []
             for k in range(N_ALT + 1):
@@ -10289,31 +14295,45 @@ class AstroApp:
                 canvas.create_line(*[c for pt in seg for c in pt],
                                    fill=color, width=1, dash=(3, 3))
 
-            # ── Foreground: draggable allocated bar ────────────────────────
-            start_str = e.get("start_time") or e.get("win_start") or ""
+            # ── Foreground: draggable allocated bar (whole rig, all filters) ──
+            start_str = g.get("start_time") or g.get("win_start") or ""
             start_h   = self._parse_h(start_str)
             if start_h is None:
                 start_h = ws if ws is not None else dark_start_h
             if start_h < ax_start - 0.01:
                 start_h += 24.0
 
-            alloc_h = e.get("alloc_hrs") or e.get("win_hrs") or 1.0
+            alloc_h = g.get("total_alloc_h") or 1.0
 
             # Clip bar so it never extends past the imaging window end (we).
-            # If the bar would overflow, reduce alloc_hrs and notify the user.
-            # If less than 30 min remain, show a message and skip the bar.
+            # If the bar would overflow, scale every filter row on this rig
+            # down proportionally (recomputing n_subs/total_int_hrs to
+            # match, since those are what the plan card actually displays)
+            # and notify the user. If less than 30 min remain, show a
+            # message and skip the bar.
             effective_h = min(start_h + alloc_h, we) - start_h
             if effective_h < 0.5:
                 canvas.create_text((lm + cw - rm) // 2, y_mid,
-                    text=f"{e['target_id']}: less than 30 min in imaging window",
+                    text=f"{g['target_id']}: less than 30 min in imaging window",
                     fill=fg_dim, font=("Helvetica", 9))
                 self._gantt_row_info.append((y_top, y_bot, i, lm, lm, dark_start_h))
                 self._gantt_drag_bounds[i] = (ws, we)
                 continue
             if effective_h < alloc_h:
-                e["alloc_hrs"] = round(effective_h, 2)
-                alloc_h        = effective_h
-                self.root.after(0, lambda tid=e["target_id"], ah=round(effective_h, 2):
+                scale = (effective_h / alloc_h) if alloc_h > 0 else 0.0
+                for member_idx in g["member_idxs"]:
+                    if member_idx >= len(self._plan_entries):
+                        continue
+                    me = self._plan_entries[member_idx]
+                    new_h = round((me.get("allocated_hrs") or 0.0) * scale, 2)
+                    me["allocated_hrs"] = new_h
+                    exp_s = me.get("exp_s") or 1.0
+                    new_subs = int(round(new_h * 3600.0 / exp_s))
+                    me["n_subs"] = new_subs
+                    me["total_int_hrs"] = round((new_subs * exp_s) / 3600.0, 2)
+                g["total_alloc_h"] = effective_h
+                alloc_h = effective_h
+                self.root.after(0, lambda tid=g["target_id"], ah=round(effective_h, 2):
                     self._gantt_show_note(
                         f"⚠  {tid}: allocated hours reduced to {ah:.2f}h"
                         f" to fit the imaging window"))
@@ -10355,9 +14375,9 @@ class AstroApp:
                 # When the same target is queued twice (two telescopes), include
                 # a short scope name so bars are distinguishable at a glance.
                 if x_al_e - x_al_s > 50:
-                    scope_s = (e.get("scope") or "")[:8]
-                    bar_label = (f"{e['target_id']} ({scope_s})" if scope_s
-                                 else e["target_id"])
+                    scope_s = (g.get("scope") or "")[:8]
+                    bar_label = (f"{g['target_id']} ({scope_s})" if scope_s
+                                 else g["target_id"])
                     canvas.create_text((x_al_s + x_al_e) / 2, y_mid,
                                        text=bar_label, fill="#ffffff",
                                        font=("Helvetica", 9, "bold"))
@@ -10373,8 +14393,12 @@ class AstroApp:
                 canvas.create_line(x_al_s, y_top + 3, x_al_s, y_bot - 3,
                                    fill=fg_main, width=2)
 
-            # Transit tick inside available-window bar
-            tr = self._parse_h(e.get("transit_time"))
+            # Transit tick inside available-window bar (plan entries don't
+            # store transit_time, so compute it on the fly)
+            try:
+                tr = self._parse_h(_calc_transit_time(g["ra_deg"], lon))
+            except Exception:
+                tr = None
             if tr is not None:
                 if tr < ax_start - 0.01:
                     tr += 24.0
@@ -10398,10 +14422,14 @@ class AstroApp:
     # ── Gantt drag interactions ───────────────────────────────────────────────
 
     def _gantt_hit(self, x, y):
-        """Return (entry_idx, start_h_norm) if (x,y) hits a draggable alloc bar."""
-        for y_top, y_bot, entry_idx, bar_x1, bar_x2, start_h_norm in self._gantt_row_info:
+        """Return (group_idx, start_h_norm) if (x,y) hits a draggable alloc bar.
+
+        group_idx indexes ``self._gantt_groups`` (one entry per rig), not
+        ``self._plan_entries`` directly — see ``_draw_queue_gantt``.
+        """
+        for y_top, y_bot, group_idx, bar_x1, bar_x2, start_h_norm in self._gantt_row_info:
             if y_top <= y <= y_bot and bar_x1 - 12 <= x <= bar_x2 + 12:
-                return entry_idx, start_h_norm
+                return group_idx, start_h_norm
         return None, None
 
     def _gantt_press(self, event):
@@ -10413,7 +14441,12 @@ class AstroApp:
             self._gantt_drag_start_h0 = start_h
 
     def _gantt_drag(self, event):
-        """Update the plan entry's start_time while the user drags a Gantt bar."""
+        """Update every filter row on the dragged rig's start_time together.
+
+        The Gantt now draws one bar per rig (target_id + scope), so a drag
+        moves every ``_plan_entries`` row that rig's group covers, not just
+        one — otherwise filters on the same rig would drift apart.
+        """
         if self._gantt_drag_idx is None or not self._gantt_pw:
             return
         dx    = event.x - self._gantt_drag_x0
@@ -10421,18 +14454,19 @@ class AstroApp:
         new_h = self._gantt_drag_start_h0 + dh
 
         idx = self._gantt_drag_idx
-        if idx >= len(self._queue_entries):
+        groups = getattr(self, "_gantt_groups", [])
+        if idx >= len(groups):
             return
-        e = self._queue_entries[idx]
+        g = groups[idx]
 
         # Clamp within the available window
-        ws = self._parse_h(e.get("win_start"))
-        we = self._parse_h(e.get("win_end"))
+        ws = self._parse_h(g.get("win_start"))
+        we = self._parse_h(g.get("win_end"))
         if ws is not None and ws < self._gantt_ax_start - 0.01:
             ws += 24.0
         if we is not None and we < ws:
             we += 24.0
-        alloc_h = e.get("alloc_hrs") or e.get("win_hrs") or 1.0
+        alloc_h = g.get("total_alloc_h") or 1.0
         # Use stored per-row bounds so drag respects the imaging window
         bounds = getattr(self, "_gantt_drag_bounds", {}).get(idx)
         if bounds:
@@ -10446,7 +14480,10 @@ class AstroApp:
 
         h_int = int(new_h) % 24
         m_int = int(round((new_h % 1) * 60)) % 60
-        e["start_time"] = f"{h_int:02d}:{m_int:02d}"
+        new_start = f"{h_int:02d}:{m_int:02d}"
+        for member_idx in g.get("member_idxs", []):
+            if member_idx < len(self._plan_entries):
+                self._plan_entries[member_idx]["start_time"] = new_start
         self._draw_queue_gantt()
 
     def _gantt_release(self, event):
@@ -10455,386 +14492,14 @@ class AstroApp:
             self._gantt_drag_idx      = None
             self._gantt_drag_x0       = None
             self._gantt_drag_start_h0 = None
+            # Plan cards show start_time too — refresh once, on release,
+            # rather than on every drag motion tick.
+            self._refresh_plan_tree()
 
     def _gantt_motion(self, event):
         """Show a move cursor when hovering over a draggable Gantt bar."""
         idx, _ = self._gantt_hit(event.x, event.y)
         self.queue_gantt.config(cursor="fleur" if idx is not None else "")
-
-    def _queue_selected_index(self):
-        """Return the index of the selected queue card, or None."""
-        idx = getattr(self, "_queue_card_selected", None)
-        if idx is not None and 0 <= idx < len(self._queue_entries):
-            return idx
-        return None
-
-    def _queue_move_up(self):
-        """Swap the selected queue entry one position earlier."""
-        idx = self._queue_selected_index()
-        if idx is None or idx == 0:
-            return
-        self._queue_entries[idx - 1], self._queue_entries[idx] = \
-            self._queue_entries[idx], self._queue_entries[idx - 1]
-        self._queue_card_selected = idx - 1
-        self._refresh_queue_tree()
-
-    def _queue_move_down(self):
-        """Swap the selected queue entry one position later."""
-        idx = self._queue_selected_index()
-        if idx is None or idx >= len(self._queue_entries) - 1:
-            return
-        self._queue_entries[idx], self._queue_entries[idx + 1] = \
-            self._queue_entries[idx + 1], self._queue_entries[idx]
-        self._queue_card_selected = idx + 1
-        self._refresh_queue_tree()
-
-    def _queue_remove(self):
-        """Remove the selected entry from the queue."""
-        idx = self._queue_selected_index()
-        if idx is None:
-            return
-        del self._queue_entries[idx]
-        # Adjust selection
-        if self._queue_entries:
-            self._queue_card_selected = min(idx, len(self._queue_entries) - 1)
-        else:
-            self._queue_card_selected = None
-        self._refresh_queue_tree()
-
-    def _queue_clear(self):
-        """Clear all entries from the queue after confirmation."""
-        if not self._queue_entries:
-            return
-        if messagebox.askyesno("Clear Queue", "Remove all targets from the queue?"):
-            self._queue_entries.clear()
-            self._queue_card_selected = None
-            self._refresh_queue_tree()
-
-    def _queue_suggest_order(self):
-        """Sort the queue by each target's transit time (earliest tonight first)."""
-        if not self._queue_entries:
-            return
-
-        def _sort_key(e):
-            t_str = e.get("transit_time")
-            if not t_str:
-                return 99.0
-            try:
-                p = t_str.split(":")
-                h = float(p[0]) + float(p[1]) / 60.0
-                # Treat pre-noon times as next-day (add 24) so sort is chronological from evening
-                if h < 12.0:
-                    h += 24.0
-                return h
-            except Exception:
-                return 99.0
-
-        self._queue_entries.sort(key=_sort_key)
-        self._refresh_queue_tree()
-
-    def _queue_move_all_to_plan(self):
-        """Move all computed queue entries into Tonight's Plan."""
-        if not self._queue_entries:
-            messagebox.showwarning("Empty Queue", "The target queue is empty.")
-            return
-        not_ready = [e for e in self._queue_entries if not e["computed"]]
-        if not_ready:
-            resp = messagebox.askyesno(
-                "Some Targets Still Computing",
-                f"{len(not_ready)} target(s) are still computing.\n"
-                "Move only the ready targets now?")
-            if not resp:
-                return
-
-        # ── No/short-window check for all entries ──────────────────────
-        short = [e for e in self._queue_entries
-                 if e["computed"] and (e.get("win_hrs") or 0.0) < 0.5]
-        if short:
-            names    = ", ".join(e["target_id"] for e in short)
-            def _win_desc(e):
-                wh = e.get("win_hrs") or 0.0
-                return f"  • {e['target_id']}: no window" if wh == 0.0 \
-                       else f"  • {e['target_id']}: {int(round(wh*60))} min"
-            win_strs = "\n".join(_win_desc(e) for e in short)
-            resp = messagebox.askyesnocancel(
-                "No or Short Imaging Windows",
-                f"The following target(s) have no imaging window or under 30 minutes:\n\n"
-                f"{win_strs}\n\n"
-                f"Yes — add all targets (including short-window ones)\n"
-                f"No — skip short-window targets, add the rest\n"
-                f"Cancel — cancel the operation",
-                icon="warning")
-            if resp is None:   # Cancel
-                return
-            skip_short = (resp is False)  # No = skip those entries
-        else:
-            skip_short = False
-
-        added = 0
-        for e in self._queue_entries:
-            if not e["computed"] or e["exp_s"] is None:
-                continue
-            if skip_short and (e.get("win_hrs") or 0.0) < 0.5:
-                continue
-            t = (self.targets.get(e["target_id"].replace(" ", "")) or
-                 self.common_names_map.get(e["target_id"].replace(" ", "")))
-            if not t:
-                continue
-
-            cam      = self.data["cameras"].get(e["camera"], {})
-            is_color = cam.get("is_color", True)
-            fm       = e.get("filter_mode", "Mono Lum")
-            nf       = self.data.get("nina_filters", {})
-            if is_color:
-                filters = [""]
-            elif fm == "LRGB":
-                filters = nf.get("lrgb") or ["L", "R", "G", "B"]
-            elif "NB" in fm or "Narrowband" in fm:
-                filters = nf.get("narrowband") or ["Ha", "O3", "S2"]
-            else:
-                filters = [""]
-
-            n_filters      = len(filters)
-            # Prefer user-set alloc_hrs over the computed window length
-            alloc_hrs      = e.get("alloc_hrs") or e.get("win_hrs") or self._get_default_alloc_hrs()
-            total_subs_all = int(alloc_hrs * 3600.0 / e["exp_s"])
-            subs_per_filt  = total_subs_all // max(n_filters, 1)
-            int_per_filt_h = round((subs_per_filt * e["exp_s"]) / 3600.0, 2)
-
-            for filt_name in filters:
-                filt_label = filt_name if n_filters > 1 else (fm if not is_color else "")
-                self._plan_entries.append({
-                    "target_id":     e["target_id"],
-                    "common":        e["common"],
-                    "ra_deg":        e.get("ra_deg", 0.0),
-                    "dec_deg":       e.get("dec_deg", 0.0),
-                    "scope":         e["scope"],
-                    "camera":        e["camera"],
-                    "filter":        filt_label,
-                    "bortle":        e["bortle"],
-                    "exp_s":         round(e["exp_s"], 1),
-                    "win_start":     e.get("win_start") or "",
-                    "win_end":       e.get("win_end") or "",
-                    "start_time":    e.get("start_time") or e.get("win_start") or "",
-                    "allocated_hrs": round(alloc_hrs / max(n_filters, 1), 2),
-                    "n_subs":        subs_per_filt,
-                    "total_int_hrs": int_per_filt_h,
-                    "added":         datetime.now().strftime("%Y-%m-%d %H:%M"),
-                    "report_text":   e.get("report_text", ""),
-                    "rotation_angle": e.get("rotation_angle", 0.0),
-                    "framed_ra_deg":  e.get("framed_ra_deg"),
-                    "framed_dec_deg": e.get("framed_dec_deg"),
-                })
-            added += 1
-
-        if added:
-            self._refresh_plan_tree()
-            messagebox.showinfo("Moved to Plan",
-                f"{added} target(s) added to Tonight's Plan.")
-        else:
-            messagebox.showwarning("Nothing Added",
-                "No computed targets were found to add.")
-
-    def _queue_move_selected_to_plan(self):
-        """Move the currently selected queue entry to Tonight's Plan."""
-        idx = self._queue_selected_index()
-        if idx is None:
-            messagebox.showwarning("No Selection", "Select a target in the queue first.")
-            return
-        e = self._queue_entries[idx]
-        if not e["computed"]:
-            messagebox.showwarning("Still Computing",
-                f"{e['target_id']} is still computing its imaging window. Please wait a moment.")
-            return
-        if e["exp_s"] is None:
-            messagebox.showwarning("Incomplete",
-                f"{e['target_id']} could not be computed (missing scope/camera data).")
-            return
-
-        # ── Short/no-window warning ──────────────────────────────────────
-        win_hrs_e = e.get("win_hrs") or 0.0
-        if win_hrs_e < 0.5:
-            if win_hrs_e == 0.0:
-                detail = f"{e['target_id']} has no imaging window tonight."
-                title  = "No Imaging Window"
-            else:
-                win_min = int(round(win_hrs_e * 60))
-                detail  = (f"{e['target_id']} has an imaging window of only "
-                           f"{win_min} min tonight — less than 30 minutes.")
-                title   = "Short Imaging Window"
-            resp = messagebox.askyesnocancel(
-                title,
-                f"{detail}\n\n"
-                f"Yes — add to Tonight's Plan anyway\n"
-                f"No — skip this target\n"
-                f"Cancel — cancel the operation",
-                icon="warning")
-            if resp is None:   # Cancel
-                return
-            if resp is False:  # No — skip
-                return
-            # Yes — fall through and add
-
-        t = (self.targets.get(e["target_id"].replace(" ", "")) or
-             self.common_names_map.get(e["target_id"].replace(" ", "")))
-        if not t:
-            messagebox.showwarning("Target Not Found",
-                f"Could not find '{e['target_id']}' in the catalog.")
-            return
-
-        cam      = self.data["cameras"].get(e["camera"], {})
-        is_color = cam.get("is_color", True)
-        fm       = e.get("filter_mode", "Mono Lum")
-        nf       = self.data.get("nina_filters", {})
-        if is_color:
-            filters = [""]
-        elif fm == "LRGB":
-            filters = nf.get("lrgb") or ["L", "R", "G", "B"]
-        elif "NB" in fm or "Narrowband" in fm:
-            filters = nf.get("narrowband") or ["Ha", "O3", "S2"]
-        else:
-            filters = [""]
-
-        n_filters      = len(filters)
-        alloc_hrs      = e.get("alloc_hrs") or e.get("win_hrs") or self._get_default_alloc_hrs()
-        total_subs_all = int(alloc_hrs * 3600.0 / e["exp_s"])
-        subs_per_filt  = total_subs_all // max(n_filters, 1)
-        int_per_filt_h = round((subs_per_filt * e["exp_s"]) / 3600.0, 2)
-
-        for filt_name in filters:
-            filt_label = filt_name if n_filters > 1 else (fm if not is_color else "")
-            self._plan_entries.append({
-                "target_id":     e["target_id"],
-                "common":        e["common"],
-                "ra_deg":        e.get("ra_deg", 0.0),
-                "dec_deg":       e.get("dec_deg", 0.0),
-                "scope":         e["scope"],
-                "camera":        e["camera"],
-                "filter":        filt_label,
-                "bortle":        e["bortle"],
-                "exp_s":         round(e["exp_s"], 1),
-                "win_start":     e.get("win_start") or "",
-                "win_end":       e.get("win_end") or "",
-                "start_time":    e.get("start_time") or e.get("win_start") or "",
-                "allocated_hrs": round(alloc_hrs / max(n_filters, 1), 2),
-                "n_subs":        subs_per_filt,
-                "total_int_hrs": int_per_filt_h,
-                "added":         datetime.now().strftime("%Y-%m-%d %H:%M"),
-                "report_text":   e.get("report_text", ""),
-                "rotation_angle": e.get("rotation_angle", 0.0),
-                "framed_ra_deg":  e.get("framed_ra_deg"),
-                "framed_dec_deg": e.get("framed_dec_deg"),
-            })
-
-        self._refresh_plan_tree()
-        self._show_toast(f"{e['target_id']} added to Tonight's Plan")
-
-    def _queue_load_target(self, event):
-        """Click on a queue card: populate Current Target Analysis fields for inline editing."""
-        idx = getattr(self, "_queue_card_selected", None)
-        if idx is None or idx < 0 or idx >= len(self._queue_entries):
-            return
-        e = self._queue_entries[idx]
-
-        # Remember which entry we're editing so the commit button can write back
-        self._editing_queue_idx = idx
-
-        # Populate fields — guard flag prevents the trace callbacks on session_hours_var
-        # and manual_exp_var from calling _commit_queue_edit with stale values mid-load.
-        # Also prevents on_parameter_change from firing analyze_framing for each dropdown.
-        self._loading_queue_row = True
-        try:
-            hrs = e.get("alloc_hrs") or e.get("win_hrs") or self._get_default_alloc_hrs()
-            self.session_hours_var.set(f"{hrs:.1f}")
-
-            if e.get("exp_s"):
-                self.manual_exp_var.set(f"{e['exp_s']:.1f}")
-            else:
-                self.manual_exp_var.set("")
-
-            # Restore the equipment dropdowns to match this entry's stored settings.
-            # This ensures analyze_framing runs with the correct scope/camera/filter,
-            # not whatever happens to be selected in the Planner dropdowns.
-            if e.get("scope") and e["scope"] in self.scope_dropdown.cget("values"):
-                self.scope_choice.set(e["scope"])
-            if e.get("camera") and e["camera"] in self.camera_dropdown.cget("values"):
-                self.camera_choice.set(e["camera"])
-            if e.get("bortle") and e["bortle"] in self.bortle_dropdown.cget("values"):
-                self.bortle_choice.set(e["bortle"])
-            if e.get("filter_mode") and e["filter_mode"] in self.filter_dropdown.cget("values"):
-                self.filter_mode.set(e["filter_mode"])
-            if e.get("reduction") is not None:
-                red_str = e["reduction"]
-                # Stored as float — convert back to "1.0×" format
-                if isinstance(red_str, (int, float)):
-                    red_str = f"{red_str:.2f}".rstrip('0').rstrip('.') + "×"
-                if red_str in self.reduction_entry.cget("values"):
-                    self.reduction_factor.set(red_str)
-        finally:
-            self._loading_queue_row = False
-
-        # Enable the analysis fields for editing
-        self._session_entry.configure(state="normal")
-        self._manual_exp_entry.configure(state="normal")
-
-        # Load target into search and trigger analysis so stat cards update
-        self.target_search.delete(0, tk.END)
-        self.target_search.insert(0, e["target_id"])
-        # Only switch tabs if not already on the Session tab
-        try:
-            if self.tab_control.select() != str(self.tab_session):
-                self.tab_control.select(self.tab_session)
-        except Exception:
-            pass
-
-        self._mark_analysis_dirty()
-
-
-    def _commit_queue_edit(self, silent=False):
-        """Write the current allocated hours and sub-exposure back to the active queue entry."""
-        if self._loading_queue_row:
-            return  # fields are mid-population — don't commit stale values
-        # Only commit when actually on the Session tab — prevents equipment changes
-        # on the Planner tab from overwriting a queue entry's stored values.
-        try:
-            if self.tab_control.select() != str(self.tab_session):
-                return
-        except Exception:
-            pass
-        idx = self._editing_queue_idx
-        if idx is None or idx >= len(self._queue_entries):
-            return
-        e = self._queue_entries[idx]
-
-        try:
-            hrs = float(self.session_hours_var.get())
-            if hrs <= 0:
-                raise ValueError
-        except ValueError:
-            if not silent:
-                messagebox.showerror("Invalid", "Allocated hours must be a positive number.")
-            return
-
-        manual = self.manual_exp_var.get().strip()
-        if manual:
-            try:
-                exp = float(manual)
-                if exp <= 0:
-                    raise ValueError
-            except ValueError:
-                if not silent:
-                    messagebox.showerror("Invalid", "Sub-exposure must be a positive number.")
-                return
-            e["exp_s"] = round(exp, 1)
-        elif self._last_exp_s:
-            e["exp_s"] = round(self._last_exp_s, 1)
-
-        e["alloc_hrs"] = round(hrs, 2)
-
-        self._refresh_queue_tree()
-        if not silent:
-            self._show_toast(f"{e['target_id']} queue entry updated")
-
 
     def _plan_load_target(self, event):
         """Double-click in Tonight's Plan: edit allocated hours and/or sub-exposure for that row."""
@@ -10848,7 +14513,19 @@ class AstroApp:
         dlg = tk.Toplevel(self.root)
         dlg.title(f"Edit — {e['target_id']}")
         dlg.resizable(False, False)
+        # transient() + an explicit grab_release() before destroy() (see
+        # _close() below) — every other modal dialog in this file sets
+        # transient(), this one didn't, and skipping it is a known way for
+        # a Toplevel's grab to end up in a bad state once a *second* modal
+        # (the sync-across-filters messagebox below) is opened and closed
+        # on top of it. That's the likely cause of the app becoming
+        # unresponsive after a second edit-dialog round-trip.
+        dlg.transient(self.root)
         dlg.grab_set()
+
+        def _close():
+            dlg.grab_release()
+            dlg.destroy()
 
         ttk.Label(dlg, text=f"{e['target_id']}",
                   font=("Helvetica", 12, "bold")).grid(row=0, column=0, columnspan=2,
@@ -10876,52 +14553,123 @@ class AstroApp:
         st_entry.grid(row=4, column=1, padx=(0, 16), pady=6, sticky="w")
         ToolTip(st_entry, "Or drag the bar in the Schedule Timeline\nto set this visually.")
 
-        ttk.Label(dlg, text="Position angle (°):").grid(row=5, column=0, padx=(16, 8), pady=6, sticky="e")
-        rot_var = tk.StringVar(value=f"{e.get('rotation_angle', 0.0):.1f}")
-        rot_entry = ttk.Entry(dlg, textvariable=rot_var, width=10)
-        rot_entry.grid(row=5, column=1, padx=(0, 16), pady=6, sticky="w")
-        ToolTip(rot_entry, "Camera rotation / position angle (degrees).\nUsed when exporting to NINA as PositionAngle.\nCaptures the FOV rotation set in the Target Planner.")
+        # Position angle used to have its own editable field here, but it's
+        # captured by framing (Target Planner) already and isn't something
+        # meant to be hand-typed per plan entry — removed per Jerry's request.
+        # (Whatever rotation_angle the entry already has, from framing, is
+        # left untouched — _apply() below no longer writes to it.)
 
         def _apply():
             try:
-                new_hrs = float(hrs_var.get())
-                new_exp = float(exp_var.get())
-                if new_hrs <= 0 or new_exp <= 0:
-                    raise ValueError
-            except ValueError:
-                messagebox.showerror("Invalid", "Both values must be positive numbers.", parent=dlg)
-                return
-            # Validate start time if provided
-            new_st = st_var.get().strip()
-            if new_st:
                 try:
-                    parts = new_st.split(":")
-                    if len(parts) != 2 or not (0 <= int(parts[0]) <= 23) or not (0 <= int(parts[1]) <= 59):
+                    new_hrs = float(hrs_var.get())
+                    new_exp = float(exp_var.get())
+                    if new_hrs <= 0 or new_exp <= 0:
                         raise ValueError
-                    new_st = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
-                except (ValueError, IndexError):
-                    messagebox.showerror("Invalid", "Start time must be HH:MM (e.g. 21:30).", parent=dlg)
+                except ValueError:
+                    messagebox.showerror("Invalid", "Both values must be positive numbers.", parent=dlg)
                     return
-            new_subs  = int(new_hrs * 3600.0 / new_exp)
-            new_int_h = round((new_subs * new_exp) / 3600.0, 2)
-            e["allocated_hrs"] = round(new_hrs, 2)
-            e["exp_s"]         = round(new_exp, 1)
-            e["n_subs"]        = new_subs
-            e["total_int_hrs"] = new_int_h
-            e["start_time"]    = new_st
-            try:
-                e["rotation_angle"] = float(rot_var.get())
-            except ValueError:
-                e["rotation_angle"] = 0.0
-            dlg.destroy()
-            self._refresh_plan_tree()
+                # Validate start time if provided
+                new_st = st_var.get().strip()
+                if new_st:
+                    try:
+                        parts = new_st.split(":")
+                        if len(parts) != 2 or not (0 <= int(parts[0]) <= 23) or not (0 <= int(parts[1]) <= 59):
+                            raise ValueError
+                        new_st = f"{int(parts[0]):02d}:{int(parts[1]):02d}"
+                    except (ValueError, IndexError):
+                        messagebox.showerror("Invalid", "Start time must be HH:MM (e.g. 21:30).", parent=dlg)
+                        return
+                new_subs  = int(new_hrs * 3600.0 / new_exp)
+                new_int_h = round((new_subs * new_exp) / 3600.0, 2)
+                old_exp   = e.get("exp_s")
+                old_alloc = e.get("allocated_hrs")
+                new_exp_r   = round(new_exp, 1)
+                new_hrs_r   = round(new_hrs, 2)
+                exp_changed   = old_exp is None or abs(new_exp_r - round(float(old_exp), 1)) > 1e-9
+                alloc_changed = old_alloc is None or abs(new_hrs_r - round(float(old_alloc), 2)) > 1e-9
+                e["allocated_hrs"] = new_hrs_r
+                e["exp_s"]         = new_exp_r
+                e["n_subs"]        = new_subs
+                e["total_int_hrs"] = new_int_h
+                e["start_time"]    = new_st
+
+                # LRGB/narrowband targets split into one plan entry per
+                # filter (see _split_entry_into_plan) — allocated time and
+                # sub-exposure length are each normally kept the same
+                # across every filter WITHIN ONE FILTER SET, so offer to
+                # sync whichever one just changed rather than leaving the
+                # other filters on their old values. Restricted to
+                # siblings sharing this entry's filter_mode: a rig can
+                # carry more than one filter set now (e.g. an LRGB set and
+                # a separate SHO set on the same mono camera), and editing
+                # an LRGB filter should never offer to also touch the SHO
+                # filters (or vice versa) — they're different sessions with
+                # their own timing even though they're on the same rig.
+                fm = e.get("filter_mode")
+
+                if alloc_changed:
+                    siblings = [s for s in self._plan_entries
+                                if s is not e and s["target_id"] == e["target_id"]
+                                and s.get("scope", "") == e.get("scope", "")
+                                and s.get("camera", "") == e.get("camera", "")
+                                and s.get("filter_mode") == fm
+                                and round(float(s.get("allocated_hrs", 0.0) or 0.0), 2) != new_hrs_r]
+                    if siblings and messagebox.askyesno(
+                            "Match Allocated Time Across Filters",
+                            f"Apply {new_hrs_r:.2f}h allocated time to the other "
+                            f"{len(siblings)} filter(s) on {e['target_id']} too?\n\n"
+                            f"Each filter keeps its own sub-exposure length — only "
+                            f"the allocated hours (and the sub count/integration "
+                            f"time it implies) changes.",
+                            parent=dlg):
+                        for s in siblings:
+                            s["allocated_hrs"] = new_hrs_r
+                            s_exp = float(s.get("exp_s", 0.0) or 0.0) or new_exp_r
+                            s_subs = int(new_hrs_r * 3600.0 / s_exp)
+                            s["n_subs"] = s_subs
+                            s["total_int_hrs"] = round((s_subs * s_exp) / 3600.0, 2)
+
+                if exp_changed:
+                    siblings = [s for s in self._plan_entries
+                                if s is not e and s["target_id"] == e["target_id"]
+                                and s.get("scope", "") == e.get("scope", "")
+                                and s.get("camera", "") == e.get("camera", "")
+                                and s.get("filter_mode") == fm
+                                and round(float(s.get("exp_s", 0.0) or 0.0), 1) != new_exp_r]
+                    if siblings and messagebox.askyesno(
+                            "Match Sub-Exposure Across Filters",
+                            f"Apply {new_exp_r:.1f}s sub-exposures to the other "
+                            f"{len(siblings)} filter(s) on {e['target_id']} too?\n\n"
+                            f"Each filter keeps its own allocated hours — only "
+                            f"the sub-exposure length changes.",
+                            parent=dlg):
+                        for s in siblings:
+                            s["exp_s"] = new_exp_r
+                            s_subs = int((s.get("allocated_hrs", 0.0) or 0.0) * 3600.0 / new_exp_r)
+                            s["n_subs"] = s_subs
+                            s["total_int_hrs"] = round((s_subs * new_exp_r) / 3600.0, 2)
+
+                _close()
+                self._refresh_plan_tree()
+            except Exception as exc:
+                # Never let an unhandled exception unwind out of a Tk
+                # callback while this dialog's grab (and the sync
+                # messagebox's nested grab) are still being torn down —
+                # surface it instead of leaving the dialog half-closed.
+                try:
+                    _close()
+                except Exception:
+                    pass
+                messagebox.showerror("Update Failed",
+                    f"Could not apply the change.\n\nDetail: {exc}")
 
         btn_row = ttk.Frame(dlg)
-        btn_row.grid(row=5, column=0, columnspan=2, padx=16, pady=(4, 14))
+        btn_row.grid(row=5, column=0, columnspan=2, padx=16, pady=(10, 14))
         ttk.Button(btn_row, text="OK", command=_apply).pack(side="left", padx=(0, 8))
-        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side="left")
+        ttk.Button(btn_row, text="Cancel", command=_close).pack(side="left")
         dlg.bind("<Return>", lambda ev: _apply())
-        dlg.bind("<Escape>", lambda ev: dlg.destroy())
+        dlg.bind("<Escape>", lambda ev: _close())
         self._theme_popup(dlg)
 
     # ═══════════════════════════════════════════════════════════════════
@@ -10941,6 +14689,14 @@ class AstroApp:
         Respects self.catalog_filter — targets whose `catalogs` set has no
         overlap with the user's enabled catalogs are excluded from results.
 
+        When ``entry`` is the Plan tab's search box, also respects that
+        tab's own Type dropdown (``self._grid_type_var`` — Galaxy, Nebula,
+        etc.), so the suggestion popup matches what the browsing grid below
+        it would show for the same object type. That dropdown has no
+        meaning for the other search entries this popup is reused for (the
+        legacy Planner search, the Explore tab's search), so it's only
+        applied for the Plan tab's own box.
+
         ``entry`` / ``on_select`` generalise the popup for other search
         fields (the Explore tab reuses it); both default to the Planner's
         search entry and select handler.
@@ -10955,6 +14711,12 @@ class AstroApp:
 
         enabled = {c for c, on in self.catalog_filter.items() if on}
 
+        grid_obj_type = None
+        if entry is getattr(self, "plan_search", None) and hasattr(self, "_grid_type_var"):
+            grid_obj_type = self._grid_type_var.get()
+            if grid_obj_type == "All Types":
+                grid_obj_type = None
+
         matches = []
         for name in self.searchable_names:
             if typed in name.upper().replace(" ", ""):
@@ -10968,6 +14730,10 @@ class AstroApp:
                     # everything except Messier, only Messier entries show.
                     t_cats = t.get("catalogs") or {"Other"}
                     if not (t_cats & enabled):
+                        continue
+                    # Plan tab's Type dropdown, when set to something other
+                    # than "All Types" — same field the grid itself filters on.
+                    if grid_obj_type and t.get("obj_type") != grid_obj_type:
                         continue
                     display = f"{t['id']}  —  {t['common'].split(';')[0].strip()}" if t['common'] else t['id']
                     matches.append((display, t))
@@ -11097,209 +14863,12 @@ class AstroApp:
         self._suggestion_popup = None
 
     # ─────────────────────────────────────────────────────────────────────
-    # CATALOG FILTER POPUP
+    # CATALOG FILTER — state + persistence only. The checkbox UI itself now
+    # lives inside the Plan tab's consolidated "⚙ Filters" popover (see
+    # _show_unified_filters_popup) rather than a standalone popup of its
+    # own — this section used to also own that popup's build/show/close
+    # functions before the "Option C" consolidation folded them in there.
     # ─────────────────────────────────────────────────────────────────────
-    def _update_catalog_filter_btn_label(self):
-        """Refresh the catalog filter button's label to reflect current state.
-
-        Shows just the funnel icon "▽" when every catalog is enabled,
-        and "▽•" (with a small dot indicator) when any catalog is filtered
-        out. Stays compact and unobtrusive next to the search entry.
-        """
-        if not hasattr(self, "_catalog_filter_btn"):
-            return
-        total = len(self.catalog_filter) if self.catalog_filter else 6
-        on = sum(1 for v in (self.catalog_filter or {}).values() if v)
-        if on == total:
-            self._catalog_filter_btn.config(text="▽")
-        else:
-            self._catalog_filter_btn.config(text="▽•")
-
-    def _toggle_catalog_filter_popup(self):
-        """Show or hide the catalog filter checkbox popup."""
-        if self._catalog_filter_popup and self._catalog_filter_popup.winfo_exists():
-            self._catalog_filter_popup.destroy()
-            self._catalog_filter_popup = None
-            return
-        self._show_catalog_filter_popup()
-
-    def _show_catalog_filter_popup(self):
-        """Show the catalog filter checkbox popup beneath the filter button.
-
-        Five checkboxes (NGC / IC / Messier / Caldwell / Sharpless / Other),
-        each with the live entry count for that catalog. Toggling immediately
-        re-runs the suggestion popup, persists the choice to disk, and
-        updates the button label.
-
-        Dismissal: click anywhere outside the popup, click the filter
-        button again, or press Escape.
-
-        Implementation note: we use an embedded tk.Frame placed with .place()
-        instead of a Toplevel + wm_overrideredirect. On macOS, two
-        overrideredirect Toplevels (this popup and the filter button's
-        tooltip) fight over z-order in non-fullscreen mode, causing the
-        popup to disappear when the mouse moves toward it. An embedded
-        Frame is just a normal widget inside the main window so none of
-        the Toplevel window-server quirks apply.
-        """
-        # Close any prior instance
-        if self._catalog_filter_popup and self._catalog_filter_popup.winfo_exists():
-            self._close_catalog_filter_popup()
-
-        # Embedded Frame, parented to root so it can overlay any tab content
-        # ── Pick the right palette for the current theme ─────────────────
-        # Hardcoded colors here (rather than the DAY_*/NIGHT_* module
-        # constants) because the popup uses several intermediate shades
-        # that aren't named in the global palette.
-        nm = getattr(self, "night_mode", False)
-        bg_panel    = "#2a0000" if nm else "#1e2d3e"   # popup body + rows
-        bg_active   = "#330000" if nm else "#263545"   # checkbox hover/active
-        border_col  = "#882222" if nm else "#2e4a63"   # popup outline
-        fg_primary  = "#cc0000" if nm else "#cbd9e5"   # checkbox text
-        fg_dim      = "#882222" if nm else "#6a8aa8"   # header, links, counts
-        fg_muted    = "#552222" if nm else "#445566"   # center dot separator
-
-        popup = tk.Frame(self.root, bg=bg_panel,
-                          highlightthickness=1, highlightbackground=border_col)
-        self._catalog_filter_popup = popup
-
-        # Position via place() using absolute coords *relative to root*.
-        # rootx/rooty are screen coords; subtract root's own screen origin
-        # to get coords within the root window.
-        self.root.update_idletasks()
-        self._catalog_filter_btn.update_idletasks()
-        btn_x = self._catalog_filter_btn.winfo_rootx() - self.root.winfo_rootx()
-        btn_y = self._catalog_filter_btn.winfo_rooty() - self.root.winfo_rooty()
-        btn_h = self._catalog_filter_btn.winfo_height()
-        popup.place(x=btn_x, y=btn_y + btn_h + 2, width=220, height=245)
-        popup.lift()  # ensure it overlays sibling widgets
-
-        # Header row: section label on the left, "All" / "None" quick-action
-        # mini-buttons on the right. The mini-buttons are styled as small
-        # underlined labels (link aesthetic) rather than ttk.Buttons so they
-        # don't dominate the popup chrome.
-        header = tk.Frame(popup, bg=bg_panel)
-        header.pack(fill="x", padx=10, pady=(8, 4))
-
-        tk.Label(header, text="LIMIT SEARCH TO",
-                 bg=bg_panel, fg=fg_dim,
-                 font=("Helvetica", 8, "bold")).pack(side="left")
-
-        # 'None' on far right; 'All' just left of it. Hover brightens to
-        # signal interactivity (color flip handled in _bind_link_hover).
-        none_lbl = tk.Label(header, text="None",
-                             bg=bg_panel, fg=fg_dim,
-                             font=("Helvetica", 8, "underline"),
-                             cursor="hand2")
-        none_lbl.pack(side="right")
-        none_lbl.bind("<Button-1>", lambda e: self._set_all_catalog_filters(False))
-        self._bind_link_hover(none_lbl, normal=fg_dim, hover=fg_primary)
-
-        tk.Label(header, text="·", bg=bg_panel, fg=fg_muted,
-                 font=("Helvetica", 8)).pack(side="right", padx=5)
-
-        all_lbl = tk.Label(header, text="All",
-                            bg=bg_panel, fg=fg_dim,
-                            font=("Helvetica", 8, "underline"),
-                            cursor="hand2")
-        all_lbl.pack(side="right")
-        all_lbl.bind("<Button-1>", lambda e: self._set_all_catalog_filters(True))
-        self._bind_link_hover(all_lbl, normal=fg_dim, hover=fg_primary)
-
-        # Pre-compute live counts so users see catalog sizes alongside the toggle
-        counts = self._count_targets_by_catalog()
-
-        cat_order = ["NGC", "IC", "Messier", "Caldwell", "Sharpless", "Other"]
-        self._catalog_filter_vars = {}
-        for cat in cat_order:
-            row = tk.Frame(popup, bg=bg_panel, cursor="hand2")
-            row.pack(fill="x", padx=4, pady=1)
-
-            var = tk.BooleanVar(value=self.catalog_filter.get(cat, True))
-            self._catalog_filter_vars[cat] = var
-
-            # Native Checkbutton with theme-aware styling
-            cb = tk.Checkbutton(
-                row, text=cat, variable=var,
-                bg=bg_panel, fg=fg_primary, selectcolor=bg_panel,
-                activebackground=bg_active, activeforeground=fg_primary,
-                font=("Helvetica", 11), anchor="w", padx=4,
-                command=lambda c=cat: self._on_catalog_filter_change(c))
-            cb.pack(side="left", padx=(4, 0))
-
-            count = counts.get(cat, 0)
-            count_lbl = tk.Label(row, text=f"{count:,}",
-                                  bg=bg_panel, fg=fg_dim,
-                                  font=("Helvetica", 9))
-            count_lbl.pack(side="right", padx=(0, 10))
-
-        # ── Dismissal: click outside the popup ───────────────────────────
-        # Bind on root with add="+" so any existing handlers still fire.
-        # The handler checks whether the click landed inside the popup or
-        # on the filter button itself; if not, it closes.
-        self._popup_click_binding = self.root.bind(
-            "<Button-1>", self._maybe_close_catalog_filter_popup, add="+")
-
-        # Escape closes too (keyboard users). Frames don't capture keyboard
-        # focus the way Toplevels do, so bind on root with the same guard
-        # pattern — the binding gets removed when the popup is dismissed.
-        self._popup_escape_binding = self.root.bind(
-            "<Escape>", lambda e: self._close_catalog_filter_popup(), add="+")
-
-    def _maybe_close_catalog_filter_popup(self, event):
-        """Close the filter popup if the click landed outside its bounds.
-
-        Bound to root <Button-1>. Tkinter dispatches the click to the most
-        specific widget first (e.g. a checkbox inside the popup, which
-        toggles itself), and the event then propagates up to root. By the
-        time this handler runs the checkbox interaction is already done,
-        so we just need to decide whether to dismiss.
-        """
-        popup = self._catalog_filter_popup
-        if not popup or not popup.winfo_exists():
-            return
-
-        # Was the click inside the popup? Then keep it open.
-        px = popup.winfo_rootx()
-        py = popup.winfo_rooty()
-        pw = popup.winfo_width()
-        ph = popup.winfo_height()
-        if px <= event.x_root <= px + pw and py <= event.y_root <= py + ph:
-            return
-
-        # Was the click on the filter button itself? Let _toggle_catalog_filter_popup
-        # handle it — that path also closes us. Avoid a double-close race.
-        if hasattr(self, "_catalog_filter_btn"):
-            btn = self._catalog_filter_btn
-            bx = btn.winfo_rootx()
-            by = btn.winfo_rooty()
-            bw = btn.winfo_width()
-            bh = btn.winfo_height()
-            if bx <= event.x_root <= bx + bw and by <= event.y_root <= by + bh:
-                return
-
-        self._close_catalog_filter_popup()
-
-    def _close_catalog_filter_popup(self):
-        """Tear down the filter popup and remove its root-level bindings."""
-        # Remove the root click handler we installed when the popup opened
-        if getattr(self, "_popup_click_binding", None):
-            try:
-                self.root.unbind("<Button-1>", self._popup_click_binding)
-            except (tk.TclError, AttributeError):
-                pass
-            self._popup_click_binding = None
-        # And the Escape handler
-        if getattr(self, "_popup_escape_binding", None):
-            try:
-                self.root.unbind("<Escape>", self._popup_escape_binding)
-            except (tk.TclError, AttributeError):
-                pass
-            self._popup_escape_binding = None
-        if self._catalog_filter_popup and self._catalog_filter_popup.winfo_exists():
-            self._catalog_filter_popup.destroy()
-        self._catalog_filter_popup = None
-
     def _on_catalog_filter_change(self, catalog):
         """User toggled a catalog checkbox — persist + re-run suggestions."""
         if hasattr(self, "_catalog_filter_vars") and catalog in self._catalog_filter_vars:
@@ -11310,18 +14879,23 @@ class AstroApp:
             self.save_data()
         except Exception:
             pass
-        # Refresh button label and the suggestion popup
-        self._update_catalog_filter_btn_label()
+        # Refresh button label and whichever search box has a live suggestion
+        # popup open right now.
+        self._update_unified_filters_btn_label()
         if self.target_search.get().strip():
             self._update_floating_suggestions()
+        if hasattr(self, "plan_search") and self.plan_search.get().strip():
+            self._update_floating_suggestions(entry=self.plan_search,
+                                               on_select=self._plan_select_suggestion)
+        self._refresh_visible_grid()
 
     def _set_all_catalog_filters(self, value):
         """Set every catalog filter to value (True for All, False for None).
 
-        Backs the "All" / "None" mini-buttons in the filter popup header.
-        Updates both the live BooleanVars (so the checkboxes redraw) and
-        self.catalog_filter, then runs the same persist + refresh path as
-        a single-checkbox toggle.
+        Backs the "All" / "None" mini-buttons in the filter popup's
+        Catalogs section. Updates both the live BooleanVars (so the
+        checkboxes redraw) and self.catalog_filter, then runs the same
+        persist + refresh path as a single-checkbox toggle.
         """
         for cat in self.catalog_filter:
             self.catalog_filter[cat] = value
@@ -11335,9 +14909,13 @@ class AstroApp:
             self.save_data()
         except Exception:
             pass
-        self._update_catalog_filter_btn_label()
+        self._update_unified_filters_btn_label()
         if self.target_search.get().strip():
             self._update_floating_suggestions()
+        if hasattr(self, "plan_search") and self.plan_search.get().strip():
+            self._update_floating_suggestions(entry=self.plan_search,
+                                               on_select=self._plan_select_suggestion)
+        self._refresh_visible_grid()
 
     def _bind_link_hover(self, label_widget,
                           normal="#6a8aa8", hover="#cbd9e5"):
@@ -11502,11 +15080,29 @@ class AstroApp:
         for n in sorted(self.data["scopes"].keys()):
             v = self.data["scopes"][n]
             self.scope_tree.insert("", "end", values=(n, v.get("aperture", 0), v.get("native_fl", 0), f"f/{v.get('native_f_ratio', 0):.1f}"))
+        # Rig Library panel's ★ marker can go stale if the active rig changed
+        # via the Plan tab's equipment drawer/chip (which updates the chip
+        # label but not this panel) — resync it whenever this tab redraws.
+        if hasattr(self, "_equip_rig_refresh"):
+            self._equip_rig_refresh(preserve_name=self.data.get("settings", {}).get("active_rig", ""))
+        # Filter Library panel — same resync-on-redraw reasoning as the Rig
+        # Library line above (e.g. a NINA import can add filters while this
+        # tab isn't the active one).
+        if hasattr(self, "_equip_filter_refresh"):
+            self._equip_filter_refresh()
 
     def refresh_dropdowns(self):
         """Repopulate the scope/camera/filter Combobox values and restore last-session choices."""
         self.scope_dropdown['values'] = sorted(list(self.data["scopes"].keys()))
         self.camera_dropdown['values'] = sorted(list(self.data["cameras"].keys()))
+
+        # Equipment drawer (Phase 3) has its own scope/camera comboboxes
+        # bound to the same StringVars — keep their option lists in sync
+        # too, same pattern as the Explore tab dropdowns just below.
+        if getattr(self, "_drawer_scope_dd", None) is not None and self._drawer_scope_dd.winfo_exists():
+            self._drawer_scope_dd['values'] = sorted(list(self.data["scopes"].keys()))
+        if getattr(self, "_drawer_camera_dd", None) is not None and self._drawer_camera_dd.winfo_exists():
+            self._drawer_camera_dd['values'] = sorted(list(self.data["cameras"].keys()))
 
         # Explore tab shares the same inventory — keep its dropdowns in sync
         # and seed sensible defaults from the last session when unset.
@@ -11527,48 +15123,77 @@ class AstroApp:
                 else:
                     self.explore_camera_var.set("")
 
-        # Rebuild filter dropdown — start with the permanent entries, then inject
-        # any imported narrowband bandwidth that isn't already in the list
-        _base_filter_values = ["Mono Lum", "LRGB",
-                               "NB (3nm)", "NB (7nm)", "NB (12nm)"]
-        nf = self.data.get("nina_filters", {})
-        bw = nf.get("bandwidth_nm")
-        if bw is not None:
-            try:
-                bw_int = int(float(bw)) if float(bw) == int(float(bw)) else float(bw)
-                nb_key = f"NB ({bw_int}nm)"
-                if nb_key not in _base_filter_values:
-                    _base_filter_values.append(nb_key)
-            except (TypeError, ValueError):
-                pass
-        self.filter_dropdown["values"] = _base_filter_values
+        # Rebuild filter dropdown from the Filter Library (self.data["filter_sets"])
+        # — Mono Lum plus every user-managed Filter Set name.
+        _filter_choices = self._filter_mode_choices()
+        self.filter_dropdown["values"] = _filter_choices
+        if hasattr(self, "explore_filter_dropdown"):
+            self.explore_filter_dropdown["values"] = _filter_choices
+        # Equipment tab's inline Filter Library panel mirrors the same data
+        if hasattr(self, "_equip_filter_refresh"):
+            self._equip_filter_refresh()
 
-        # Restore last session if values are still valid
-        sess = self.data.get("session", {})
-        if sess.get("scope") in self.data["scopes"]:
-            self.scope_choice.set(sess["scope"])
-        if sess.get("camera") in self.data["cameras"]:
-            self.camera_choice.set(sess["camera"])
-        if sess.get("bortle") in BORTLE_FACTORS:
-            self.bortle_choice.set(sess["bortle"])
-        if sess.get("reduction"):
-            saved_red = sess["reduction"]
-            # Migrate old plain-numeric saves (e.g. "1.0") to the new "×" format
-            if not saved_red.endswith("×"):
-                try:
-                    val = float(saved_red)
-                    _red_map = {0.63: "0.63×", 0.67: "0.67×", 0.70: "0.70×", 0.75: "0.75×",
-                                0.80: "0.80×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×",
-                                2.5: "2.5×", 3.0: "3.0×"}
-                    saved_red = _red_map.get(round(val, 2), "1.0×")
-                except ValueError:
-                    saved_red = "1.0×"
-            self.reduction_factor.set(saved_red)
-        if sess.get("target"):
-            self.target_search.delete(0, tk.END)
-            self.target_search.insert(0, sess["target"])
-        if sess.get("filter_mode") in self.filter_dropdown["values"]:
-            self.filter_mode.set(sess["filter_mode"])
+        # Restore equipment chips -- ONCE, on the first call at startup.
+        #
+        # Two sources exist: the named "active rig" (settings.active_rig,
+        # kept up to date whenever a saved rig is picked from the rig
+        # dropdown) and a legacy per-field "session" snapshot that used to
+        # be written by the old Planner tab's analyze step. That tab is
+        # retired from navigation and its analysis path never runs anymore,
+        # so "session" is frozen wherever it last was and no longer reflects
+        # the rig actually last used -- it's kept only as a fallback for
+        # installs that predate the rig-preset feature. Preferring
+        # active_rig here is what makes the chips (and therefore the rig
+        # dropdown's name-vs-"Custom…" indicator) agree at startup.
+        #
+        # refresh_dropdowns() also runs mid-session, any time equipment is
+        # added or edited (via save_data()) -- restoring again there would
+        # overwrite whatever rig/chips the user has active *right now* with
+        # this stale snapshot, so the whole block is guarded to run only once.
+        if not self._equipment_chips_restored:
+            sess = self.data.get("session", {})
+            active_name = self.data.get("settings", {}).get("active_rig", "")
+            active_rig = self._find_rig(active_name) if active_name else None
+
+            if active_rig and active_rig.get("scope") in self.data["scopes"]:
+                self.scope_choice.set(active_rig["scope"])
+            elif sess.get("scope") in self.data["scopes"]:
+                self.scope_choice.set(sess["scope"])
+
+            if active_rig and active_rig.get("camera") in self.data["cameras"]:
+                self.camera_choice.set(active_rig["camera"])
+            elif sess.get("camera") in self.data["cameras"]:
+                self.camera_choice.set(sess["camera"])
+
+            # Bortle isn't part of a rig anymore (it's a decoupled, global
+            # "sky conditions" setting) — restore it from session state only.
+            if sess.get("bortle") in BORTLE_FACTORS:
+                self.bortle_choice.set(sess["bortle"])
+
+            saved_red = (active_rig or {}).get("reduction") or sess.get("reduction")
+            if saved_red:
+                # Migrate old plain-numeric saves (e.g. "1.0") to the new "×" format
+                if not saved_red.endswith("×"):
+                    try:
+                        val = float(saved_red)
+                        _red_map = {0.63: "0.63×", 0.67: "0.67×", 0.70: "0.70×", 0.75: "0.75×",
+                                    0.80: "0.80×", 1.0: "1.0×", 1.5: "1.5×", 2.0: "2.0×",
+                                    2.5: "2.5×", 3.0: "3.0×"}
+                        saved_red = _red_map.get(round(val, 2), "1.0×")
+                    except ValueError:
+                        saved_red = "1.0×"
+                self.reduction_factor.set(saved_red)
+
+            if sess.get("target"):
+                self.target_search.delete(0, tk.END)
+                self.target_search.insert(0, sess["target"])
+
+            saved_fm = (active_rig or {}).get("filter") or sess.get("filter_mode")
+            if saved_fm in self.filter_dropdown["values"]:
+                self.filter_mode.set(saved_fm)
+
+            self._equipment_chips_restored = True
+
         self._refresh_rig_dropdown()
         self._refresh_plan_tree()
 
