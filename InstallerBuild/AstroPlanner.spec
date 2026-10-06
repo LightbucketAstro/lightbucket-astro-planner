@@ -9,7 +9,7 @@ Project layout assumed:
         logo.png                      <- runtime header logo
         logo.ico                      <- Windows window/app icon
         logo.icns                     <- macOS .app bundle icon
-        skymap/                       <- interactive sky-map assets  (NEW)
+        skymap/                       <- interactive sky-map assets (build fails if missing)
             skymap.html, skymap.js, vendor/, data/
         InstallerBuild/
             AstroPlanner.spec    <- THIS FILE
@@ -18,12 +18,16 @@ Project layout assumed:
 Build command (run from inside InstallerBuild/):
     pyinstaller AstroPlanner.spec --clean --noconfirm
 
+The app version (macOS bundle version below) is read from __version__ in
+AstroPlanner.py, so bumping that one line is all a release needs.
+
 The build environment must have pywebview installed:
     pip install pywebview
 On Windows that also pulls pythonnet / clr_loader (the WebView2 bridge);
 on macOS it uses the built-in WKWebView via pyobjc.
 """
 
+import re
 import sys
 from pathlib import Path
 from PyInstaller.utils.hooks import collect_all
@@ -37,6 +41,17 @@ LOGO_ICO    = PROJECT_DIR / "logo.ico"
 LOGO_ICNS   = PROJECT_DIR / "logo.icns"
 SHARPLESS_CSV = PROJECT_DIR / "sharpless_catalog.csv"
 SKYMAP_DIR  = PROJECT_DIR / "skymap"
+
+# ---- App version ------------------------------------------------------------
+# Single source of truth: __version__ in AstroPlanner.py (also shown in the
+# title bar and used by the update checker).  Read as text — the script is
+# not imported, so building needs none of its runtime dependencies here.
+_m = re.search(r"^__version__\s*=\s*[\"']([^\"']+)[\"']",
+               Path(SCRIPT).read_text(encoding="utf-8"), re.MULTILINE)
+if not _m:
+    raise SystemExit("\n[AstroPlanner.spec] Couldn't find __version__ in " + SCRIPT + "\n")
+APP_VERSION = _m.group(1)
+print(f"[AstroPlanner.spec] Building Lightbucket Astro Planner {APP_VERSION}")
 
 # ---- Data files bundled inside the frozen app -----------------------------
 # logo.png is loaded at runtime via _resource_path() and must always be
@@ -100,7 +115,42 @@ excludes = ["PyQt5", "PyQt6", "PySide2", "PySide6", "gi", "cefpython3"]
 # Bundle skymap/ (skymap.html, skymap.js, vendor/, data/) under "skymap" so
 # the app's _resource_path("skymap") resolves it at runtime; it is served over
 # localhost to the embedded (or fallback browser) viewer.
-skymap_tree = Tree(str(SKYMAP_DIR), prefix="skymap") if SKYMAP_DIR.exists() else []
+#
+# The sky map is a shipped feature, so a missing or incomplete skymap/ folder
+# stops the build here rather than producing a release that only fails at
+# runtime with "Sky Map Assets Missing".  data/ holds the bundled Lean tier
+# (Extended/Full are downloaded at runtime into the user data dir).
+SKYMAP_REQUIRED = [
+    "skymap.html",
+    "skymap.js",
+    "vendor/d3.min.js",
+    "vendor/d3.geo.projection.min.js",
+    "vendor/celestial.min.js",
+    "data/stars.6.json",
+    "data/messier.json",
+    "data/starnames.json",
+    "data/dsonames.json",
+    "data/constellations.json",
+    "data/constellations.lines.json",
+    "data/constellations.bounds.json",
+    "data/mw.json",
+]
+_missing = [f for f in SKYMAP_REQUIRED if not (SKYMAP_DIR / f).is_file()]
+if _missing:
+    raise SystemExit(
+        "\n[AstroPlanner.spec] Sky-map assets missing under "
+        + str(SKYMAP_DIR) + ":\n    " + "\n    ".join(_missing)
+        + "\nRestore them before building (see the layout at the top of this file).\n")
+
+# Keep OS/editor litter and scratch files out of the release — the Tree
+# otherwise copies everything in the folder.  Patterns match file and
+# directory names at any depth.
+SKYMAP_EXCLUDES = [
+    ".DS_Store", "Thumbs.db", "desktop.ini",     # OS metadata
+    "*.bak", "*.orig", "*.tmp", "*.swp", "*~",    # editor / backup copies
+    ".git", "__pycache__", "*.map",               # VCS, caches, source maps
+]
+skymap_tree = Tree(str(SKYMAP_DIR), prefix="skymap", excludes=SKYMAP_EXCLUDES)
 
 # Choose the executable icon for the current platform.
 if sys.platform == "win32" and LOGO_ICO.exists():
@@ -172,8 +222,8 @@ if sys.platform == "darwin":
         info_plist={
             "CFBundleName":              "Lightbucket Astro Planner",
             "CFBundleDisplayName":       "Lightbucket Astro Planner",
-            "CFBundleShortVersionString": "2.0.0",
-            "CFBundleVersion":           "2.0.0",
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion":           APP_VERSION,
             "NSHighResolutionCapable":   True,
         },
     )

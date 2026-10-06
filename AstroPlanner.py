@@ -13,9 +13,9 @@ Module-level astronomy helpers :
     Julian date, alt/az, moon phase & position, twilight, transit, and
     the nightly imaging-window scan.
 AstroApp (Tk class) :
-    Sidebar UI — Target Planner, Tonight's Plan, Explore, Manage
-    Equipment, Settings — plus day/night theming, DSS image thumbnail
-    with FOV overlay, and catalog search. The Plan tab merges target
+    Sidebar UI — Explore, Tonight's Plan, Manage Equipment, Settings —
+    plus day/night theming, the modal Frame dialog (DSS image with FOV
+    overlay + altitude chart), and catalog search. The Plan tab merges target
     browsing with tonight's committed plan and a collapsible schedule-
     timeline strip (the retired Targets List tab's Gantt/reorder tools,
     reattached to the committed plan).
@@ -51,7 +51,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "2.0.0"
+__version__ = "2.1.0"
 
 # ── Update checking (GitHub Releases) ──────────────────────────────────────
 # The app is distributed solely through GitHub Releases, so the public,
@@ -246,11 +246,6 @@ def _utc_offset_hours():
     real_now = datetime.now()
     now_utc  = datetime.now(timezone.utc).replace(tzinfo=None)
     return (real_now - now_utc).total_seconds() / 3600.0
-
-
-def _jd_to_local_hours(jd, utc_offset_h):
-    """Convert a Julian Date to local fractional hours (0–24)."""
-    return (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
 
 
 def _jd_local_noon():
@@ -477,6 +472,10 @@ NGC_TYPE_CATEGORIES = {
     "Ast": "Asterism", "Star": "Star", "D*": "Star",
 }
 
+# Focal reducer / Barlow factors offered everywhere a rig is edited.
+REDUCTION_CHOICES = ["0.63×", "0.67×", "0.70×", "0.75×", "0.80×",
+                     "1.0×", "1.5×", "2.0×", "2.5×", "3.0×"]
+
 OBJECT_TYPE_FILTERS = ["All Types", "Galaxy", "Nebula", "Planetary Nebula", "Open Cluster", "Globular Cluster"]
 
 # Hard cap on how many target cards the Plan tab's browsing grid ever builds
@@ -700,18 +699,6 @@ def _calc_moon_phase():
     days_to_full = (SYNODIC_PERIOD * 0.5 - age) % SYNODIC_PERIOD
 
     return name, illum_pct, emoji, round(age, 1), round(days_to_new, 1), round(days_to_full, 1)
-
-
-def _angular_sep_deg(ra1_deg, dec1_deg, ra2_deg, dec2_deg):
-    """Return the angular separation in degrees between two sky positions
-    (spherical law of cosines — same formula as ``_calc_moon_separation``,
-    kept as its own function since it's used for display purposes only:
-    showing how far a confirmed FOV pan moved off the catalog centre)."""
-    ra1, dec1 = math.radians(ra1_deg), math.radians(dec1_deg)
-    ra2, dec2 = math.radians(ra2_deg), math.radians(dec2_deg)
-    cos_d = (math.sin(dec1) * math.sin(dec2)
-             + math.cos(dec1) * math.cos(dec2) * math.cos(ra1 - ra2))
-    return math.degrees(math.acos(max(-1.0, min(1.0, cos_d))))
 
 
 def _calc_moon_separation(target_ra_deg, target_dec_deg):
@@ -1173,11 +1160,11 @@ class AstroApp:
     Instantiated once at startup from ``__main__``.
 
     Tabs (in display order via sidebar)
-        Target Planner   — analyse a single object: FOV, exposure, window
+        Explore          — compare rigs side by side over one target
         Tonight's Plan   — browsing grid + tonight's committed plan,
                             with a collapsible Gantt schedule strip
-                            (drag-to-reschedule, reorder tools) + exports
-        Explore          — compare targets side by side
+                            (drag-to-reschedule, reorder tools) + exports;
+                            targets are framed in the modal Frame dialog
         Manage Equipment — cameras, telescopes, reducers
         Settings         — observer location, preferences, catalog, NINA
     """
@@ -1257,14 +1244,12 @@ class AstroApp:
         self.common_names_map = {}
         self.searchable_names = []
         self.current_target_info = None  
-        self.auto_update_enabled = _saved_settings.get("auto_update", False)
 
         # ── Update-checker state ─────────────────────────────────────────
-        # NOTE: deliberately NOT reusing the `auto_update` key above — that
-        # one controls "re-run the analysis when equipment chips change" and
-        # has nothing to do with software updates.  Separate key, separate
-        # meaning.  Defaults to on; users who dislike any network call can
-        # turn it off in Settings.
+        # Software-update check (GitHub Releases). Its own settings key,
+        # deliberately NOT the retired `auto_update` key (which used to mean
+        # "re-run the analysis on equipment change"). Defaults to on; users
+        # who dislike any network call can turn it off in Settings.
         self.check_updates_enabled = _saved_settings.get("check_for_updates", True)
         self._update_banner   = None   # tk.Frame when the banner is showing
         self._update_info     = None   # dict of the latest release, once fetched
@@ -1285,30 +1270,48 @@ class AstroApp:
             self.catalog_filter.setdefault(_cat, True)
         self._unified_filters_popup = None   # Plan tab's consolidated Filters popup (Option C)
 
-        # State shared between analyze_framing and the integration planner
-        self._last_exp_s    = None   # most recent recommended sub-exposure (seconds)
-        self._last_win_hrs  = None   # most recent dark imaging window length (hours)
+        # Tonight's imaging window for the analyzed target — drawn as the
+        # start/end markers on the Frame dialog's altitude chart.
         self._last_win_start = None  # imaging window start string (local HH:MM)
         self._last_win_end   = None  # imaging window end string (local HH:MM)
-        self._last_sky_flux = None   # sky flux value — used for noise regime note
 
         # Tonight's Plan — list of dicts, one per planned target
         self._plan_entries: list = []
 
-        # Dirty-flag system for deferred analysis.  Instead of calling
-        # analyze_framing immediately (which can be flushed by macOS Tk's
-        # update_idletasks into a re-entrant cascade), callers set the dirty
-        # flag via _mark_analysis_dirty().  The actual analysis is then
-        # scheduled via after() only when the Planner tab is visible.
-        self._analysis_dirty = False
-        self._analysis_after_id = None   # tracks a pending after() so we don't stack them
-        self._grid_rig_refresh_after_id = None   # ditto, for _schedule_grid_rig_refresh
+        self._grid_rig_refresh_after_id = None   # debounce id for _schedule_grid_rig_refresh
 
         # Equipment chips (scope/camera/reduction/filter) are restored from
         # the last-used rig, and Bortle from last session state (it isn't
         # part of a rig), exactly once, on the first refresh_dropdowns()
         # call at startup -- see that method for why this must not repeat.
         self._equipment_chips_restored = False
+
+        # Option lists for the equipment pickers, owned by the app rather
+        # than read back out of any one Combobox. The equipment drawer, rig
+        # chips and rig-apply logic all read these; refresh_dropdowns() and
+        # _refresh_rig_dropdown() keep them current. (Stage 1 of retiring
+        # the hidden Planner tab — its combos are still fed for now, but
+        # nothing reads options back from them anymore.)
+        self._scope_names    = []
+        self._camera_names   = []
+        self._filter_choices = []
+        self._rig_names      = []
+
+        # The target the shared analysis path (analyze_framing → Frame
+        # dialog chart/FOV, session save) works on. Used to be whatever text
+        # sat in the hidden Planner tab's search box; now a plain value the
+        # app owns (Stage 2 of retiring that tab). Set via
+        # _set_active_target(); read by _analyze_framing_impl.
+        self.active_target_id = ""
+
+        # The Frame dialog's widgets, while it is open; None otherwise.
+        # The framing/chart drawing code draws into these (Stage 3 of
+        # retiring the hidden Planner tab — they used to fall back to that
+        # tab's never-shown copies). See _frame_view_open/_chart_view_open.
+        self.preview_canvas = None
+        self.alt_canvas     = None
+        self._rot_label     = None
+        self._zoom_label    = None
 
         # Plan Gantt drag state
         self._gantt_drag_idx      = None   # plan entry index being dragged
@@ -1321,14 +1324,6 @@ class AstroApp:
         self._gantt_lm            = 74     # left margin pixels
         self._gantt_pw            = 0      # plot width pixels
         self._sidebar_switching   = False  # True while sidebar is initiating a tab switch
-
-        # Headless analysis state — show_integration_plan/_analyze_framing_impl
-        # (shared backbone functions also used by the Frame dialog) read/write
-        # these StringVars and this Label. They used to be created as a side
-        # effect of setup_session_tab building the (now-retired) Targets
-        # List tab's "Current Target Analysis" stat cards; created here
-        # instead so those functions keep working with nothing visible.
-        self._init_headless_analysis_vars()
 
         self.setup_header()
 
@@ -1344,21 +1339,10 @@ class AstroApp:
         # Notebook — hide built-in tab bar, controlled from sidebar
         self.tab_control = ttk.Notebook(self._main_frame)
         self.tab_equip = ttk.Frame(self.tab_control)
-        self.tab_planner = ttk.Frame(self.tab_control)
         self.tab_plan    = ttk.Frame(self.tab_control)
         self.tab_explore = ttk.Frame(self.tab_control)
         self.tab_settings = ttk.Frame(self.tab_control)
 
-        # tab_planner is deliberately never added here — the Planner tab is
-        # retired from navigation (Explore + the Plan tab's cards/Frame
-        # dialog now cover everything it did), but setup_planner_tab() still
-        # runs and builds it below: self.scope_choice/camera_choice/
-        # bortle_choice/filter_mode/reduction_factor, self.target_search,
-        # self.results_txt, self.preview_canvas, self.alt_canvas, and the
-        # saved-rig machinery are all still live global state that the Frame
-        # dialog, the Plan tab's cards, and NINA export read/write — moving
-        # all of that off this tab's widgets is real future work, not a
-        # same-session refactor, so the tab is hidden rather than torn out.
         self.tab_control.add(self.tab_explore, text='Explore')
         self.tab_control.add(self.tab_plan,    text="Tonight's Plan")
         self.tab_control.add(self.tab_equip,   text='Manage Equipment')
@@ -1369,7 +1353,7 @@ class AstroApp:
         self._build_sidebar()
 
         self.setup_input_tab()
-        self.setup_planner_tab()
+        self._init_frame_and_equipment_state()
         self.setup_plan_tab()
         self.setup_explore_tab()
         self.setup_settings_tab()
@@ -1387,8 +1371,8 @@ class AstroApp:
         self.root.after(350, self._snapshot_original_colors)
         self.root.after(360, self._snapshot_original_styles)
         # Route to Equip tab if inventory is empty — sidesteps a macOS Cocoa
-        # Tk paint stall that keeps the Planner black on first launch, and
-        # lands the user exactly where they need to be to add equipment.
+        # Tk paint stall on an empty-state tab at first launch, and lands
+        # the user exactly where they need to be to add equipment.
         # Scheduled before show_welcome_message so the dialog appears on
         # top of the Equip tab.
         self.root.after(450, self._route_to_equip_if_empty)
@@ -1547,8 +1531,7 @@ class AstroApp:
 
         # Tab mapping: (label, tab_frame, icon_name)
         # Explore is first — and therefore the tab selected at startup by
-        # the _sidebar_select(0) call below — now that the Planner tab is
-        # retired from navigation (see the tab_control.add(...) calls above).
+        # the _sidebar_select(0) call below.
         self._sidebar_tabs = [
             ("Explore",  self.tab_explore, "compass"),
             ("Tonight's\nPlan",  self.tab_plan,    "moon"),
@@ -1890,14 +1873,6 @@ class AstroApp:
                     pass
 
         self.load_target_catalog()
-
-        # The catalog is now available.  If a previous session was restored by
-        # refresh_dropdowns() (which ran before the catalog existed), the
-        # initial analysis would have failed silently because self.targets was
-        # empty.  Mark dirty and schedule so the planner populates on startup.
-        sess = self.data.get("session", {})
-        if sess.get("target") and sess.get("scope") and sess.get("camera"):
-            self._mark_analysis_dirty()
 
     # Current gear-file schema version.  Bump this and add a new migration
     # step in _migrate_data whenever the shape of astro_gear.json changes.
@@ -2385,8 +2360,6 @@ class AstroApp:
         """
         self.refresh_twilight_header()
         self.refresh_moon_header()
-        if self.auto_update_enabled:
-            self._mark_analysis_dirty()
         self._refresh_visible_grid()
 
     def refresh_twilight_header(self):
@@ -2599,14 +2572,6 @@ class AstroApp:
         self.root.option_add("*TCombobox*Listbox.selectBackground", SEL_BG)
         self.root.option_add("*TCombobox*Listbox.selectForeground", FG)
 
-        # Plain tk widgets on the tabs (not covered by ttk styles)
-        try:
-            self.suggestion_list.configure(bg=FIELD_BG, fg=FG,
-                                           selectbackground=SEL_BG, selectforeground=FG)
-        except Exception:
-            pass  # suggestion_list may be hidden
-        self.results_txt.configure(bg=FIELD_BG, fg=FG, insertbackground=FG)
-
     def _snapshot_original_colors(self):
         """Walk the full widget tree and store every tk widget's original colours.
         Called once at startup (after dynamic labels have rendered) so day-mode
@@ -2758,7 +2723,8 @@ class AstroApp:
                 cls = widget.__class__.__name__
                 try:
                     if cls in ("Frame", "Toplevel"):
-                        widget.configure(bg=bg)
+                        rig_col = getattr(widget, "_lb_rig_accent", None)
+                        widget.configure(bg=self._night_rig_accent(rig_col) if rig_col else bg)
                     elif cls == "Label":
                         try:
                             widget.configure(bg=bg, fg=fg)
@@ -2808,18 +2774,6 @@ class AstroApp:
                     _recolor(child)
 
             _recolor(self.root)
-            self.search_hint_label.configure(foreground="#cc0000")
-            self._queue_btn.configure(bg="#1a0000")
-            self._draw_queue_btn("#2a0000", "#cc4400", "#cc4400")
-
-            # Rig preset buttons — explicit overrides because the _recolor
-            # walker's Label branch applies generic bg/fg but we want the
-            # richer red "button-like" palette matching _queue_btn.
-            try:
-                self.rig_save_btn.configure(bg="#2a0000", fg="#cc4400")
-                self.rig_manage_btn.configure(bg="#2a0000", fg="#cc4400")
-            except Exception:
-                pass
 
             # Sidebar night mode
             try:
@@ -2833,18 +2787,19 @@ class AstroApp:
             except Exception:
                 pass
 
-            # Chips bar night mode
-            try:
-                for w in (self._equip_summary_label,):
-                    w.configure(bg="#1a0000", fg="#cc0000")
-            except Exception:
-                pass
-
             # Explore legend cards — dynamic widgets, rebuilt night-aware so
             # they get the deliberate red palette instead of the walker's
             # generic recolor (which flattens their bg/fg distinctions).
             try:
                 self._explore_refresh_cards()
+            except Exception:
+                pass
+            try:
+                self._explore_redraw()   # sky image follows night mode
+            except Exception:
+                pass
+            try:
+                self._draw_queue_gantt()   # timeline bars follow night mode
             except Exception:
                 pass
             # Explore's report panel — same situation: rebuild so its chip
@@ -2901,35 +2856,9 @@ class AstroApp:
                     btn.configure(bg="#2a3f55", fg="#ffffff")
                 except Exception:
                     pass
+            # Text-widget tag colours back to day palette — the night-mode
+            # walker re-tags Explore's report generically on the way in.
             try:
-                self._queue_btn.configure(bg="#1e2d3e")
-                self._draw_queue_btn("#1e3a5f", "#7eb8d4", "#7eb8d4")
-            except Exception:
-                pass
-
-            # Restore rig preset buttons to day-mode colours
-            try:
-                self.rig_save_btn.configure(bg="#1e2d3e", fg="#7eb8d4")
-                self.rig_manage_btn.configure(bg="#1e2d3e", fg="#7eb8d4")
-            except Exception:
-                pass
-
-            # Text-widget tag colours back to day palette
-            try:
-                self.results_txt.tag_configure("optimal",   foreground="#4caf50", font=("Helvetica", 11, "bold"))
-                self.results_txt.tag_configure("warning",   foreground="#ef5350", font=("Helvetica", 11, "bold"))
-                self.results_txt.tag_configure("highlight", foreground="#38bdf8", font=("Helvetica", 11, "bold"))
-                self.results_txt.tag_configure("header",    foreground="#ffffff", font=("Helvetica", 13, "bold"))
-                self.results_txt.tag_configure("sec_framing",  foreground="#38bdf8", font=("Helvetica", 10, "bold"))
-                self.results_txt.tag_configure("sec_exposure", foreground="#f59e0b", font=("Helvetica", 10, "bold"))
-                self.results_txt.tag_configure("sec_window",   foreground="#4caf50", font=("Helvetica", 10, "bold"))
-                self.results_txt.tag_configure("sec_moon",     foreground="#ef5350", font=("Helvetica", 10, "bold"))
-                self.results_txt.tag_configure("dim",          foreground="#778899", font=("Helvetica", 11))
-                self.results_txt.tag_configure("amber",        foreground="#f59e0b", font=("Helvetica", 11, "bold"))
-                # Explore's report panel uses the identical tag set — restore
-                # it the same way (the night-mode walker re-tags it generically
-                # on the way in, but day-mode restore only special-cases
-                # results_txt by name, so this one needs its own copy).
                 self._explore_report_txt.tag_configure("optimal",   foreground="#4caf50", font=("Helvetica", 11, "bold"))
                 self._explore_report_txt.tag_configure("warning",   foreground="#ef5350", font=("Helvetica", 11, "bold"))
                 self._explore_report_txt.tag_configure("highlight", foreground="#38bdf8", font=("Helvetica", 11, "bold"))
@@ -2942,7 +2871,6 @@ class AstroApp:
                 self._explore_report_txt.tag_configure("amber",        foreground="#f59e0b", font=("Helvetica", 11, "bold"))
             except Exception:
                 pass
-            self.search_hint_label.configure(foreground="#ffffff")
 
             # Sidebar day mode
             try:
@@ -2953,12 +2881,6 @@ class AstroApp:
                     cv.configure(bg="#131f2e")
                     frame.configure(bg="#131f2e")
                 self._sidebar_draw_all()
-            except Exception:
-                pass
-
-            # Chips bar day mode
-            try:
-                self._equip_summary_label.configure(bg="#131f2e", fg="#556677")
             except Exception:
                 pass
 
@@ -2988,6 +2910,10 @@ class AstroApp:
             # queue/plan cards above: rebuild so they return to day colours.
             try:
                 self._explore_refresh_cards()
+            except Exception:
+                pass
+            try:
+                self._explore_redraw()   # sky image follows night mode
             except Exception:
                 pass
             try:
@@ -3273,293 +3199,34 @@ class AstroApp:
         self._bind_equip_mousewheel(self._equip_canvas)
         self._bind_equip_mousewheel_recursive(outer)
 
-    def setup_planner_tab(self):
-        """Build the Target Planner tab — equipment chips, target search, FOV preview, results."""
-        # ── Equipment chips bar ───────────────────────────────────────────
-        ctrl_frame = tk.Frame(self.tab_planner, bg="#131f2e")
-        ctrl_frame.pack(padx=0, pady=0, fill="x")
-        
+    def _init_frame_and_equipment_state(self):
+        """Create the app-wide equipment selection and Frame-view state.
+
+        The equipment StringVars (scope/camera/filter/reduction/rig), their
+        change traces, and the framing/DSS state all used to be created as
+        a side effect of building the hidden Planner tab. That tab is gone
+        (Stage 5); this creates the same state with no widgets attached.
+        The equipment drawer, rig chip, plan cards, Frame dialog and NINA
+        export all read these.
+        """
         self.scope_choice, self.camera_choice = tk.StringVar(), tk.StringVar()
-        # self.bortle_choice/bortle_dropdown are created in setup_header (it
-        # now lives in the header, under the twilight readout, rather than
-        # as a chip here — see setup_header) so it reads as a global "sky
-        # conditions" setting rather than a per-tab equipment control.
         self.filter_mode = tk.StringVar(value="Mono Lum")
         self.reduction_factor = tk.StringVar(value="1.0×")
+        self.rig_choice = tk.StringVar()   # active rig name, or "Custom…"
 
         for var in [self.scope_choice, self.camera_choice, self.filter_mode, self.reduction_factor]:
             var.trace_add('write', self.on_parameter_change)
         # Bortle (sky brightness) isn't equipment — it's an environmental
         # fact, not part of a rig — so it gets its own handler instead of
-        # riding on_parameter_change's rig-comparison logic, and that
-        # handler always forces a fresh recompute rather than only when
-        # "auto update" is on (see _on_bortle_changed).
+        # riding on_parameter_change's rig-comparison logic (see
+        # _on_bortle_changed). bortle_choice itself lives in the header.
         self.bortle_choice.trace_add('write', self._on_bortle_changed)
-
-        chips_row = tk.Frame(ctrl_frame, bg="#131f2e")
-        chips_row.pack(fill="x", padx=16, pady=8)
-
-        # ── Rig preset chip (selects populate all equipment chips below) ────
-        rig_label = tk.Label(chips_row, text="RIG", bg="#131f2e",
-                             fg="#cc8833", font=("Helvetica", 9, "bold"))
-        rig_label.pack(side="left", padx=(0, 6))
-
-        self.rig_choice = tk.StringVar()
-        self.rig_dropdown = ttk.Combobox(chips_row, textvariable=self.rig_choice,
-                                          state="readonly", width=16)
-        self.rig_dropdown.pack(side="left", padx=(0, 4))
-        self.rig_dropdown.bind("<<ComboboxSelected>>", self._on_rig_selected)
-        ToolTip(self.rig_dropdown, "Select a saved rig to apply its equipment\n"
-                                   "snapshot to the chips. Individual chips\n"
-                                   "remain editable — tweaks show as 'Custom…'.")
-
-        self.rig_save_btn = tk.Label(chips_row, text="☆",
-                                      bg="#1e2d3e", fg="#7eb8d4",
-                                      font=("Helvetica", 11, "bold"),
-                                      width=2, cursor="hand2",
-                                      relief="flat", borderwidth=1,
-                                      padx=4, pady=2)
-        self.rig_save_btn.pack(side="left", padx=(0, 2))
-        # Hover feedback — swap bg/fg to the "hover" shade
-        def _rs_enter(e, _w=self.rig_save_btn):
-            _w.configure(bg="#2a0000" if self.night_mode else "#2a5280",
-                         fg="#ff6633" if self.night_mode else "#aaddff")
-        def _rs_leave(e, _w=self.rig_save_btn):
-            _w.configure(bg="#2a0000" if self.night_mode else "#1e2d3e",
-                         fg="#cc4400" if self.night_mode else "#7eb8d4")
-        self.rig_save_btn.bind("<Enter>",    _rs_enter)
-        self.rig_save_btn.bind("<Leave>",    _rs_leave)
-        self.rig_save_btn.bind("<Button-1>", lambda e: self._open_save_rig_dialog())
-        ToolTip(self.rig_save_btn, "Save the current equipment combination\nas a named rig preset")
-
-        self.rig_manage_btn = tk.Label(chips_row, text="⚙",
-                                        bg="#1e2d3e", fg="#7eb8d4",
-                                        font=("Helvetica", 11, "bold"),
-                                        width=2, cursor="hand2",
-                                        relief="flat", borderwidth=1,
-                                        padx=4, pady=2)
-        self.rig_manage_btn.pack(side="left", padx=(0, 10))
-        def _rm_enter(e, _w=self.rig_manage_btn):
-            _w.configure(bg="#2a0000" if self.night_mode else "#2a5280",
-                         fg="#ff6633" if self.night_mode else "#aaddff")
-        def _rm_leave(e, _w=self.rig_manage_btn):
-            _w.configure(bg="#2a0000" if self.night_mode else "#1e2d3e",
-                         fg="#cc4400" if self.night_mode else "#7eb8d4")
-        self.rig_manage_btn.bind("<Enter>",    _rm_enter)
-        self.rig_manage_btn.bind("<Leave>",    _rm_leave)
-        self.rig_manage_btn.bind("<Button-1>", lambda e: self._open_manage_rigs_dialog())
-        ToolTip(self.rig_manage_btn, "Manage saved rigs — rename, update, or delete")
-
-        # Vertical divider separating rig preset from individual equipment chips
-        tk.Frame(chips_row, bg="#2a3642", width=1, height=22).pack(side="left", fill="y", padx=(0, 12))
-
-        # Scope chip
-        self.scope_dropdown = ttk.Combobox(chips_row, textvariable=self.scope_choice,
-                                            state="readonly", width=16)
-        self.scope_dropdown.pack(side="left", padx=(0, 6))
-
-        # Reducer chip
-        _reduction_values = ["0.63×", "0.67×", "0.70×", "0.75×", "0.80×", "1.0×", "1.5×", "2.0×", "2.5×", "3.0×"]
-        self.reduction_entry = ttk.Combobox(chips_row, textvariable=self.reduction_factor,
-                                            values=_reduction_values, state="readonly", width=6)
-        self.reduction_entry.pack(side="left", padx=(0, 6))
-
-        # Camera chip
-        self.camera_dropdown = ttk.Combobox(chips_row, textvariable=self.camera_choice,
-                                             state="readonly", width=18)
-        self.camera_dropdown.pack(side="left", padx=(0, 6))
-
-        # Filter chip (visibility toggled by camera type)
-        self.filter_label = ttk.Label(chips_row, text="")  # hidden placeholder
-        # Values come from self.data["filter_sets"] (the Filter Library on
-        # the Equipment tab) via refresh_dropdowns() — not hardcoded here,
-        # same as the scope/camera dropdowns just above.
-        self.filter_dropdown = ttk.Combobox(chips_row, textvariable=self.filter_mode,
-                                             state="readonly", width=12)
+        # Mono cameras show a Filter row in the equipment drawer.
         self.camera_choice.trace_add('write', self.toggle_filter_visibility)
 
-        # Right-side info summary
-        self._equip_summary_label = tk.Label(chips_row, text="", bg="#131f2e",
-                                              fg="#556677", font=("Helvetica", 9))
-        self._equip_summary_label.pack(side="right", padx=(10, 0))
-
-        # Kept so the Phase-3 equipment drawer can borrow these same chip
-        # widgets (scope/reducer/camera/filter) and hand them back
-        # here when it closes, instead of creating a second, StringVar-
-        # duplicated set of controls.
-        self._equip_chips_row = chips_row
-
-        # Bottom separator for equipment bar
-        tk.Frame(ctrl_frame, bg="#1e2d3e", height=1).pack(fill="x")
-
-        # ── Target Selection area (no LabelFrame border) ─────────────────
-        search_frame = ttk.Frame(self.tab_planner)
-        search_frame.pack(padx=20, pady=5, fill="both", expand=True)
-
-        left_box = ttk.Frame(search_frame); left_box.pack(side="left", padx=(0, 10), pady=6, fill="both", expand=True)
-        self.search_hint_label = ttk.Label(left_box, text="Search by catalog ID (M42, NGC 224) or name (Orion Nebula)",
-                  font=("Helvetica", 10), foreground="#778899")
-        self.search_hint_label.pack(anchor="w", pady=(0, 4))
-
-        search_row = ttk.Frame(left_box)
-        search_row.pack(anchor="w", fill="x")
-
-        # ── Canvas-based pill button (tk.Label can't do rounded corners) ──
-        # Horizontal pill: star + label inline, aligns with entry-field height.
-        # Width includes a comfortable margin for wider Windows Helvetica rendering.
-        _QB_W, _QB_H, _QB_R = 150, 32, 16   # width, height, corner radius (pill: r = h/2)
-        _QB_BG      = "#1e3a5f"
-        _QB_BORDER  = "#7eb8d4"
-        _QB_FG      = "#7eb8d4"
-        _QB_BG_HOV  = "#2a5280"
-        _QB_BOR_HOV = "#aaddff"
-        _QB_FG_HOV  = "#aaddff"
-
-        def _draw_queue_btn(bg, border, fg):
-            self._queue_btn.delete("all")
-            r = _QB_R
-            w, h = _QB_W, _QB_H
-            # Pill fill: two semicircle pieslices + middle rectangle (no outlines)
-            self._queue_btn.create_arc(0, 0, 2*r, h, start=90, extent=180,
-                                       style="pieslice", fill=bg, outline="")
-            self._queue_btn.create_arc(w-2*r-1, 0, w-1, h, start=270, extent=180,
-                                       style="pieslice", fill=bg, outline="")
-            self._queue_btn.create_rectangle(r, 0, w-r, h, fill=bg, outline="")
-            # Pill border: two semicircle arcs + top/bottom connecting lines
-            self._queue_btn.create_arc(0, 0, 2*r-1, h-1, start=90, extent=180,
-                                       style="arc", outline=border)
-            self._queue_btn.create_arc(w-2*r, 0, w-1, h-1, start=270, extent=180,
-                                       style="arc", outline=border)
-            self._queue_btn.create_line(r, 0,     w-1-r, 0,     fill=border)
-            self._queue_btn.create_line(r, h-1,   w-1-r, h-1,   fill=border)
-            # Star + label inline, horizontally arranged
-            self._queue_btn.create_text(16, h//2, text="☆",
-                                        fill=fg, font=("Helvetica", 13, "bold"), anchor="center")
-            self._queue_btn.create_text(30, h//2, text="Add to Tonight",
-                                        fill=fg, font=("Helvetica", 11, "bold"), anchor="w")
-
-        self._queue_btn = tk.Canvas(search_row, width=_QB_W, height=_QB_H,
-                                    bg="#1e2d3e", highlightthickness=0, cursor="hand2")
-        self._queue_btn.pack(side="right")
-        _draw_queue_btn(_QB_BG, _QB_BORDER, _QB_FG)
-
-        def _qb_enter(e):
-            _draw_queue_btn(_QB_BG_HOV, _QB_BOR_HOV, _QB_FG_HOV)
-        def _qb_leave(e):
-            if self.night_mode:
-                _draw_queue_btn("#2a0000", "#cc4400", "#cc4400")
-            else:
-                _draw_queue_btn(_QB_BG, _QB_BORDER, _QB_FG)
-        def _qb_click(e):
-            self._add_target_from_planner_search()
-        def _qb_release(e):
-            _qb_leave(e)
-
-        self._queue_btn.bind("<Enter>",           _qb_enter)
-        self._queue_btn.bind("<Leave>",           _qb_leave)
-        self._queue_btn.bind("<Button-1>",        _qb_click)
-        self._queue_btn.bind("<ButtonRelease-1>", _qb_release)
-        self._draw_queue_btn = _draw_queue_btn   # store for night-mode redraws
-        ToolTip(self._queue_btn, "Add this target straight to Tonight's Plan,\nusing this tab's current equipment and\nany pan/rotation you've set in the FOV preview.")
-
-        # ── Full-width search entry ──────────────────────────────────────
-        self.target_search = ttk.Entry(search_row, width=50, font=("Helvetica", 12))
-        self.target_search.pack(side="left", fill="x", expand=True, padx=(0, 4))
-
-        # Catalog filter button lives on the Plan tab now, next to
-        # self.plan_search (see setup_plan_tab) — it's shared, global filter
-        # state (self.catalog_filter) that _update_floating_suggestions
-        # already applies no matter which search box is calling it, so only
-        # the button itself needed to move.
-
-        # ── Floating suggestion popup (replaces fixed Listbox) ───────────
+        # Floating catalog-suggestion popup shared by the Plan and Explore
+        # search boxes.
         self._suggestion_popup = None
-        self.suggestion_list = tk.Listbox(left_box, height=0, width=0)  # hidden — kept for API compat
-        self.target_search.bind("<KeyRelease>", self._on_search_key)
-        self.target_search.bind("<Return>", lambda e: (self._hide_suggestions(), self.analyze_framing()))
-        self.target_search.bind("<Escape>", lambda e: self._hide_suggestions())
-        self.target_search.bind("<FocusOut>", lambda e: self.root.after(150, self._hide_suggestions))
-
-        # ── Action button row ─────────────────────────────────────────────
-        btn_frame = ttk.Frame(left_box)
-        btn_frame.pack(anchor="w", pady=(6, 2))
-        analyze_btn = ttk.Button(btn_frame, text="Analyze Target", command=self.analyze_framing)
-        analyze_btn.pack(side="left", padx=(0, 4))
-        ToolTip(analyze_btn, "Calculate FOV, image scale, recommended\nexposure, and tonight's imaging window\nfor the selected target and equipment")
-        visible_btn = ttk.Button(btn_frame, text="🌙 Visible Tonight", command=self.show_visible_tonight)
-        visible_btn.pack(side="left", padx=(0, 4))
-        ToolTip(visible_btn, "Search the full catalog for objects\nvisible tonight from your location,\nfiltered by type, altitude, and season")
-        # "Show Sky Map" has moved to the Explore tab (above its FOV image) —
-        # see _explore_open_sky_map / setup_explore_tab.
-
-        results_frame = ttk.Frame(left_box)
-        results_frame.pack(anchor="w", fill="both", expand=True, pady=(6, 0))
-        self.results_txt = tk.Text(results_frame, font=("Helvetica", 11), wrap="word",
-                                    width=40, height=14, padx=10, pady=8,
-                                    relief="flat", borderwidth=0)
-        results_sb = ttk.Scrollbar(results_frame, orient="vertical", command=self.results_txt.yview)
-        self.results_txt.configure(yscrollcommand=results_sb.set)
-        self.results_txt.pack(side="left", fill="both", expand=True)
-        results_sb.pack(side="right", fill="y")
-        self.results_txt.tag_configure("optimal",   foreground="#4caf50", font=("Helvetica", 11, "bold"))
-        self.results_txt.tag_configure("warning",   foreground="#ef5350", font=("Helvetica", 11, "bold"))
-        self.results_txt.tag_configure("highlight", foreground="#38bdf8", font=("Helvetica", 11, "bold"))
-        self.results_txt.tag_configure("header",    foreground="#ffffff", font=("Helvetica", 13, "bold"))
-        # Section header tags — color-coded
-        self.results_txt.tag_configure("sec_framing",  foreground="#38bdf8", font=("Helvetica", 10, "bold"))
-        self.results_txt.tag_configure("sec_exposure", foreground="#f59e0b", font=("Helvetica", 10, "bold"))
-        self.results_txt.tag_configure("sec_window",   foreground="#4caf50", font=("Helvetica", 10, "bold"))
-        self.results_txt.tag_configure("sec_moon",     foreground="#ef5350", font=("Helvetica", 10, "bold"))
-        self.results_txt.tag_configure("dim",          foreground="#778899", font=("Helvetica", 11))
-        self.results_txt.tag_configure("amber",        foreground="#f59e0b", font=("Helvetica", 11, "bold"))
-
-
-        # ── Compact FOV preview (right side) ─────────────────────────────
-        fov_box = ttk.Frame(search_frame)
-        fov_box.pack(side="right", padx=0, pady=6)
-        ttk.Label(fov_box, text="FOV Preview", font=("Helvetica", 9, "bold"),
-                  foreground="#7eb8d4").pack(anchor="w")
-        ttk.Label(fov_box, text="drag to pan · corners to rotate",
-                  font=("Helvetica", 8), foreground="#556677").pack(anchor="w")
-        self.preview_canvas = tk.Canvas(fov_box, width=240, height=240, bg="black",
-                                         highlightthickness=1, highlightbackground="#2e4a63")
-        self.preview_canvas.pack(pady=(3, 0))
-        self.preview_canvas.create_text(120, 120, text="No target loaded", fill="gray", font=("Helvetica", 9))
-
-        # Controls row — compact single-line bar
-        ctrl_row = tk.Frame(fov_box, bg="#131f2e")
-        ctrl_row.pack(fill="x", pady=(3, 0))
-        tk.Label(ctrl_row, text="Rot:", bg="#131f2e", fg="#778899",
-                 font=("Helvetica", 9)).pack(side="left", padx=(6, 2))
-        self._rot_label = tk.Label(ctrl_row, text=f"{self._screen_to_sky_pa(0.0):.1f}°", bg="#131f2e", fg="#ffffff",
-                                    font=("Helvetica", 9), width=5)
-        self._rot_label.pack(side="left")
-        tk.Label(ctrl_row, text="|", bg="#131f2e", fg="#2e4a63",
-                 font=("Helvetica", 9)).pack(side="left", padx=4)
-        reset_btn = ttk.Button(ctrl_row, text="⌖ Reset", width=6, command=self._reset_fov_framing)
-        reset_btn.pack(side="left", padx=2)
-        ToolTip(reset_btn, "Reset the FOV overlay to centred\nwith no rotation")
-        tk.Label(ctrl_row, text="|", bg="#131f2e", fg="#2e4a63",
-                 font=("Helvetica", 9)).pack(side="left", padx=4)
-        tk.Label(ctrl_row, text="Zoom:", bg="#131f2e", fg="#778899",
-                 font=("Helvetica", 9)).pack(side="left", padx=(0, 2))
-        ttk.Button(ctrl_row, text="−", width=2,
-                   command=lambda: self._apply_zoom(1 / 1.25)).pack(side="left", padx=1)
-        self._zoom_label = tk.Label(ctrl_row, text="1.0×", bg="#131f2e", fg="#ffffff",
-                                     font=("Helvetica", 9), width=4)
-        self._zoom_label.pack(side="left")
-        ttk.Button(ctrl_row, text="+", width=2,
-                   command=lambda: self._apply_zoom(1.25)).pack(side="left", padx=1)
-        ToolTip(self._zoom_label, "Scroll wheel on the image to zoom,\nor use + / − buttons")
-
-        # Mouse bindings — smart start decides pan vs rotate
-        self.preview_canvas.bind("<ButtonPress-1>",  self._fov_mouse_down)
-        self.preview_canvas.bind("<B1-Motion>",      self._fov_mouse_drag)
-        self.preview_canvas.bind("<ButtonRelease-1>",self._fov_mouse_up)
-        self.preview_canvas.bind("<Motion>",         self._fov_mouse_hover)
-        self.preview_canvas.bind("<MouseWheel>",     self._fov_mousewheel)   # Windows / macOS
-        self.preview_canvas.bind("<Button-4>",       self._fov_mousewheel)   # Linux scroll up
-        self.preview_canvas.bind("<Button-5>",       self._fov_mousewheel)   # Linux scroll down
 
         # FOV transform state
         self._fov_photo = None
@@ -3601,46 +3268,59 @@ class AstroApp:
                                            # call, never against a stale image left over
                                            # from an earlier call for a different rig/FOV
 
-        # ── Bottom: altitude chart (compact inline strip) ─────────────────
-        self.alt_canvas = tk.Canvas(self.tab_planner, height=168, bg="#050810",
-                                    highlightthickness=1, highlightbackground="#2e4a63")
-        self.alt_canvas.pack(padx=20, pady=(0, 8), fill="x")
-        self.alt_canvas.create_text(400, 84, text="Altitude chart — analyze a target to populate",
-                                    fill="#334455", font=("Helvetica", 10), justify="center")
-
-        # Moon bar hover state
+        # Altitude-chart moon-bar hover state (Frame dialog chart)
         self._moon_bar_hits = []   # list of (x_pixel, tooltip_text)
         self._chart_tip_win = None
-        self.alt_canvas.bind("<Motion>",  self._alt_canvas_motion)
-        self.alt_canvas.bind("<Leave>",   self._alt_canvas_leave)
 
-    def _init_headless_analysis_vars(self):
-        """Headless state for show_integration_plan/_analyze_framing_impl.
+    # Edge of the Frame dialog's square FOV canvas, px. Also the size the
+    # framing math assumes when no dialog is open.
+    _FRAME_FOV_PX = 340
 
-        These StringVars (and one Label) used to live on the Targets List
-        tab's "Current Target Analysis" card. That tab is retired now —
-        per Jerry, the Gantt timeline and reorder tools moved to the Plan
-        tab, but the stat cards themselves were fine to drop — yet the
-        Frame dialog still runs analyze_framing, which still calls these
-        shared functions and expects them to exist. So they're created
-        here with no visible widget: values get computed and stored, just
-        never displayed.
-        """
-        self.session_hours_var    = tk.StringVar(value="4.0")
-        self.manual_exp_var       = tk.StringVar(value="")
-        self.overhead_per_sub_var = tk.StringVar(value="5")
-        self._plan_target_var     = tk.StringVar(value="")
-        self._plan_subs_var       = tk.StringVar(value="—")
-        self._plan_total_var      = tk.StringVar(value="—")
-        self._plan_snr_var        = tk.StringVar(value="—")
-        self._plan_overhead_var   = tk.StringVar(value="—")
-        self._plan_noise_var      = tk.StringVar(value="")
-        self.session_hours_var.trace_add("write", lambda *_: self.show_integration_plan(silent=True))
-        self.manual_exp_var.trace_add("write", lambda *_: self.show_integration_plan(silent=True))
-        self.overhead_per_sub_var.trace_add("write", lambda *_: self.show_integration_plan(silent=True))
-        # A real Label — some code paths call .config(text=...) on it —
-        # parented to root but never packed, so it never becomes visible.
-        self._recommended_exp_label = ttk.Label(self.root, text="")
+    @staticmethod
+    def _widget_alive(w):
+        """True if ``w`` is a widget that still exists on screen."""
+        if w is None:
+            return False
+        try:
+            return bool(w.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def _frame_view_open(self):
+        """True while the Frame dialog's FOV canvas exists to draw into."""
+        return self._widget_alive(self.preview_canvas)
+
+    def _chart_view_open(self):
+        """True while the Frame dialog's altitude chart exists to draw into."""
+        return self._widget_alive(self.alt_canvas)
+
+    def _set_frame_label(self, which, text):
+        """Update the Frame dialog's rotation ("rot") or zoom ("zoom")
+        readout, if the dialog is open."""
+        lbl = self._rot_label if which == "rot" else self._zoom_label
+        if self._widget_alive(lbl):
+            lbl.config(text=text)
+
+    @staticmethod
+    def _night_sky_image(img, brightness=0.45):
+        """Return ``img`` as a dim, red-only picture for night mode.
+
+        A DSS cutout is mostly near-black sky, but stars, nebulae and the
+        bright cores of galaxies come through as near-white — enough to
+        spoil dark adaptation on a dark-site laptop. Converting to
+        luminance, scaling it down, and putting it all in the red channel
+        keeps the structure readable for framing while emitting only dim
+        red light, matching the rest of the night palette."""
+        lum = img.convert("L").point(lambda v: int(v * brightness))
+        zero = Image.new("L", lum.size, 0)
+        return Image.merge("RGB", (lum, zero, zero))
+
+    def _set_active_target(self, target_id):
+        """Make ``target_id`` the target the shared analysis path works on
+        (see self.active_target_id). Accepts a catalog id, an alias like
+        "M52", or a common name — resolution happens in
+        _analyze_framing_impl, same as when this came from a search box."""
+        self.active_target_id = (target_id or "").strip()
 
     # ═══════════════════════════════════════════════════════════════════
     # TARGET CARD — new browsing-grid card (pill / sparkline / moon line /
@@ -3672,6 +3352,7 @@ class AstroApp:
         "Globular Cluster": ("GC",   "#818cf8"),
         "Asterism":         ("AST",  "#94a3b8"),
         "Star":             ("STAR", "#94a3b8"),
+        "Field":            ("FLD",  "#f2c14e"),   # custom sky point from the sky map
     }
     _TYPE_CHIP_DEFAULT = ("OTH", "#667788")
 
@@ -3840,11 +3521,10 @@ class AstroApp:
         ``_reset_fov_framing`` handlers completely unchanged. Those methods
         all read/write shared instance attributes (``self.preview_canvas``,
         ``self.alt_canvas``, ``self._rot_label``, ``self._zoom_label``)
-        rather than taking widgets as parameters, so this dialog just points
+        rather than taking widgets as parameters, so this dialog points
         those attributes at its own widgets for as long as it's open and
-        restores the Planner tab's originals when it closes — the Planner
-        tab's own FOV/chart widgets are untouched and keep working as a
-        fallback until Phase 5 retires that tab.
+        clears them (None) when it closes. With nothing to draw into, the
+        drawing code skips — see _frame_view_open/_chart_view_open.
         """
         key = target_id.replace(" ", "").upper()
         t = self.targets.get(key) or self.common_names_map.get(key)
@@ -3861,8 +3541,7 @@ class AstroApp:
                 "Choose a scope and camera (via the rig chip) before framing a target.")
             return
 
-        self.target_search.delete(0, tk.END)
-        self.target_search.insert(0, target_id)
+        self._set_active_target(target_id)
 
         dlg = tk.Toplevel(self.root)
         dlg.title(f"Frame — {t['id']}")
@@ -3882,14 +3561,18 @@ class AstroApp:
         chart_canvas = tk.Canvas(dlg, width=400, height=190, bg="#050810",
                                   highlightthickness=1, highlightbackground="#2e4a63")
         chart_canvas.pack(padx=16, pady=(8, 14))
+        # Hover: crosshair + time/altitude readout (and moon rise/set times
+        # near those markers) — see _alt_canvas_motion.
+        chart_canvas.bind("<Motion>", self._alt_canvas_motion)
+        chart_canvas.bind("<Leave>",  self._alt_canvas_leave)
 
         # ── FOV framing box — reuses _draw_fov_overlay / pan-rotate-zoom verbatim ──
-        fov_canvas = tk.Canvas(dlg, width=340, height=340, bg="black",
+        fov_canvas = tk.Canvas(dlg, width=self._FRAME_FOV_PX, height=self._FRAME_FOV_PX, bg="black",
                                 highlightthickness=1, highlightbackground="#2e4a63")
         fov_canvas.pack()
         fov_canvas.create_text(170, 170, text="Loading…", fill="gray", font=("Helvetica", 9))
         tk.Label(dlg, text="drag to pan · corners to rotate", bg="#0d1620",
-                 fg="#556677", font=("Helvetica", 8)).pack(pady=(2, 0))
+                 fg="#9fb3c8", font=("Helvetica", 10)).pack(pady=(4, 0))
 
         ctrl_row = tk.Frame(dlg, bg="#0d1620")
         ctrl_row.pack(pady=(6, 4))
@@ -3921,20 +3604,19 @@ class AstroApp:
         fov_canvas.bind("<Button-5>",        self._fov_mousewheel)
 
         # ── Point the shared FOV/chart attributes at this dialog's widgets ──
-        _orig_preview_canvas = self.preview_canvas
-        _orig_alt_canvas     = self.alt_canvas
-        _orig_rot_label      = self._rot_label
-        _orig_zoom_label     = self._zoom_label
         self.preview_canvas  = fov_canvas
         self.alt_canvas      = chart_canvas
         self._rot_label      = rot_label
         self._zoom_label     = zoom_label
 
         def _restore_originals():
-            self.preview_canvas = _orig_preview_canvas
-            self.alt_canvas     = _orig_alt_canvas
-            self._rot_label     = _orig_rot_label
-            self._zoom_label    = _orig_zoom_label
+            # Release the dialog's widgets: with no Frame view open, the
+            # shared drawing code has nothing to draw into and skips.
+            self._cancel_fov_wait_tick()
+            self.preview_canvas = None
+            self.alt_canvas     = None
+            self._rot_label     = None
+            self._zoom_label    = None
 
         def _on_cancel():
             _restore_originals()
@@ -3992,7 +3674,9 @@ class AstroApp:
 
         # Give the dialog a moment to map before running analysis (matches
         # the defer pattern used elsewhere before this dialog existed).
-        self.root.after(50, self.analyze_framing)
+        # restore_saved_framing: open on the plan's framing for this target
+        # even if its DSS image is still cached (see _analyze_framing_impl).
+        self.root.after(50, lambda: self.analyze_framing(restore_saved_framing=True))
 
     def _add_target_to_tonight(self, target_id):
         """Add a card's target straight to Tonight's Plan — no framing
@@ -4035,8 +3719,8 @@ class AstroApp:
 
     def _refresh_visible_grid(self):
         """(Re)scan the catalog for tonight's visible targets and rebuild
-        the browsing grid. Runs the scan in a background thread — same
-        pattern as show_visible_tonight — so the UI doesn't freeze."""
+        the browsing grid. Runs the scan in a background thread so the UI
+        doesn't freeze."""
         if getattr(self, "_grid_scan_running", False):
             return
         if not hasattr(self, "_grid_inner"):
@@ -4174,7 +3858,13 @@ class AstroApp:
                 if tid in by_id:
                     pinned.append(by_id[tid])
                 elif dark_range is not None:
-                    t = self.targets.get(tid) or self.common_names_map.get(tid)
+                    # Catalog targets are keyed by their own id, but custom
+                    # ones (sky-map fields like "Field J2114+4713", or
+                    # "LBN 302") by the compact upper-case key — try both,
+                    # or a custom target never shows up here to re-frame.
+                    ckey = tid.replace(" ", "").upper()
+                    t = (self.targets.get(tid) or self.common_names_map.get(tid)
+                         or self.targets.get(ckey) or self.common_names_map.get(ckey))
                     if not t:
                         continue
                     max_alt, rise_label = _alt_rise_tonight(
@@ -4198,6 +3888,15 @@ class AstroApp:
             card = self._build_target_card(self._grid_inner, t, max_alt, rise_label)
             r, c = divmod(idx, cols)
             card.grid(row=r + row_offset, column=c, sticky="nsew", padx=6, pady=4)
+
+        # Fresh cards are built with day colours. The grid fills in
+        # asynchronously (after its background scan), so it lands AFTER
+        # anything else re-themed the tab — e.g. switching back to Tonight's
+        # Plan re-applied night mode for the plan rail, then this scan
+        # finished and repainted the grid in day colours. Re-apply here, the
+        # same way _refresh_plan_tree does for its cards.
+        if getattr(self, "night_mode", False):
+            self._apply_night_mode()
 
         return len(ordered), len(pinned), len(pinned) + len(others)
 
@@ -4321,10 +4020,8 @@ class AstroApp:
         self._plan_search_show_placeholder()
 
         # ── Extra filters (Min Altitude / Max Magnitude / Seasonal) ─────
-        # Pulled over from the old "Visible Tonight" popup — same override
-        # semantics: seeded from the saved settings default but not written
-        # back to it, kept in-memory for this session only (matching how
-        # show_visible_tonight's own min-altitude field already behaves).
+        # Seeded from the saved settings default but not written back to
+        # it — kept in-memory for this session only.
         self._grid_touched         = {}   # target_id -> True, insertion-order = touch order (see _mark_grid_touched)
         self._grid_type_var        = tk.StringVar(value="All Types")
         self._grid_min_alt_var     = tk.StringVar(
@@ -4836,7 +4533,7 @@ class AstroApp:
             return chip
 
         active_rig = self.rig_choice.get()
-        for name in self.rig_dropdown.cget("values"):
+        for name in self._rig_names:
             is_active = (name == active_rig)
             chip = _place_chip(name,
                                 bg=("#0f2233" if is_active else "#1a2836"),
@@ -4863,9 +4560,9 @@ class AstroApp:
             dd.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
             return dd
 
-        self._drawer_scope_dd  = _row("Scope",   self.scope_dropdown.cget("values"),  self.scope_choice)
-        self._drawer_reduc_dd  = _row("Reducer", self.reduction_entry.cget("values"), self.reduction_factor)
-        self._drawer_camera_dd = _row("Camera",  self.camera_dropdown.cget("values"), self.camera_choice)
+        self._drawer_scope_dd  = _row("Scope",   self._scope_names,  self.scope_choice)
+        self._drawer_reduc_dd  = _row("Reducer", REDUCTION_CHOICES,  self.reduction_factor)
+        self._drawer_camera_dd = _row("Camera",  self._camera_names, self.camera_choice)
 
         # Filter row/combobox — built here but shown only for mono cameras;
         # toggle_filter_visibility (already trace-bound to camera_choice)
@@ -4876,7 +4573,7 @@ class AstroApp:
                  side="left", padx=(8, 4), pady=6)
         self._drawer_filter_dd = ttk.Combobox(
             self._drawer_filter_row, textvariable=self.filter_mode,
-            values=self.filter_dropdown.cget("values"), state="readonly")
+            values=self._filter_choices, state="readonly")
         self._drawer_filter_dd.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=4)
         self.toggle_filter_visibility()
 
@@ -5098,18 +4795,38 @@ class AstroApp:
         tree_frame.pack(fill="both", expand=True)
 
     def _make_icon_button(self, parent, icon, command, tooltip_text,
-                          base_fg="#7eb8d4", hover_fg="#ffffff"):
+                          base_fg="#e6eef6", hover_fg="#ffffff"):
         """Build one icon-only "button" (a plain Label with a click binding
-        and a hover brighten) for the Plan tab's action toolbar and similar
+        and a hover pill) for the Plan tab's action toolbar and similar
         icon rows. Returns the Label so callers can restyle it further if
-        needed."""
-        bg = ttk.Style().lookup("TFrame", "background") or "#1e2d3e"
+        needed.
+
+        Frameless: near-white icon on the panel colour, with a soft pill
+        behind it on hover. The background is the app's panel colour
+        (DAY_TAB_BG), NOT a ttk style lookup — this row is built before
+        _setup_day_styles runs, so a lookup returned the native theme's
+        light background on Windows (white buttons). Hover follows night
+        mode, since the night recolour walker sets these labels' resting
+        colours but not their hover ones."""
+        bg = DAY_TAB_BG
         lbl = tk.Label(parent, text=icon, bg=bg, fg=base_fg,
-                      font=("Helvetica", 13), cursor="hand2", padx=7, pady=3)
+                       font=("Helvetica", 15), cursor="hand2", padx=7, pady=2)
         lbl.pack(side="left", padx=(0, 2))
         lbl.bind("<Button-1>", lambda e: command())
-        lbl.bind("<Enter>", lambda e: lbl.config(fg=hover_fg))
-        lbl.bind("<Leave>", lambda e: lbl.config(fg=base_fg))
+
+        def _enter(e):
+            if getattr(self, "night_mode", False):
+                lbl.config(bg="#3a0000", fg="#ff5555")
+            else:
+                lbl.config(bg="#2e4a63", fg=hover_fg)
+
+        def _leave(e):
+            if getattr(self, "night_mode", False):
+                lbl.config(bg="#1a0000", fg="#cc0000")
+            else:
+                lbl.config(bg=bg, fg=base_fg)
+        lbl.bind("<Enter>", _enter)
+        lbl.bind("<Leave>", _leave)
         ToolTip(lbl, tooltip_text)
         return lbl
 
@@ -5348,13 +5065,6 @@ class AstroApp:
         self._settings_min_alt_label = ttk.Label(pref_grid,
             text=f"{self._settings_min_alt.get()}°", width=5, anchor="w")
         self._settings_min_alt_label.grid(row=3, column=2, padx=4, pady=4, sticky="w")
-
-        # Auto-update toggle
-        self._settings_auto_update = tk.BooleanVar(
-            value=self.data.get("settings", {}).get("auto_update", False))
-        ttk.Checkbutton(pref_grid, text="Auto-update analysis on equipment change",
-                         variable=self._settings_auto_update).grid(
-            row=4, column=0, columnspan=3, padx=4, pady=4, sticky="w")
 
         # Save preferences button
         ttk.Button(pref_card, text="Save Preferences",
@@ -5861,7 +5571,7 @@ class AstroApp:
         self.data["settings"]["default_bortle"] = self._settings_default_bortle.get()
         self.data["settings"]["default_alloc_hrs"] = self._settings_default_alloc_hrs.get()
         self.data["settings"]["min_alt"] = self._settings_min_alt.get()
-        self.data["settings"]["auto_update"] = self._settings_auto_update.get()
+        self.data["settings"].pop("auto_update", None)   # retired setting
         self.data["settings"]["c_value"] = C_VALUE
         if hasattr(self, "_settings_check_updates"):
             self.data["settings"]["check_for_updates"] = self._settings_check_updates.get()
@@ -5870,10 +5580,6 @@ class AstroApp:
         # Apply default bortle to the active Bortle choice
         if self._settings_default_bortle.get() in BORTLE_FACTORS:
             self.bortle_choice.set(self._settings_default_bortle.get())
-
-        # Apply auto-update setting
-        if self._settings_auto_update.get():
-            self.auto_update_enabled = True
 
         self.save_data()
         messagebox.showinfo("Saved", "Preferences saved successfully.")
@@ -6021,6 +5727,11 @@ class AstroApp:
     # ═══════════════════════════════════════════════════════════════════
     # TONIGHT'S PLAN — card rendering, selection, totals
     # ═══════════════════════════════════════════════════════════════════
+
+    def _night_rig_accent(self, color):
+        """A rig accent colour for night mode: same hue (so plan cards still
+        match their timeline bars) at reduced brightness."""
+        return self._dim_hex(color, 0.6)
 
     def _get_rig_accent_color(self, scope, camera):
         """Return a stable accent color for a scope+camera pairing.
@@ -6186,8 +5897,14 @@ class AstroApp:
             grip.bind("<ButtonRelease-1>", self._plan_drag_end)
             ToolTip(grip, "Drag to reorder.")
 
-            # Left accent
-            tk.Frame(card, bg=accent_col, width=3).pack(side="left", fill="y")
+            # Left accent — tagged with its rig colour so the night-mode
+            # recolour walker keeps it (dimmed) instead of painting it the
+            # background colour like every other plain Frame.
+            acc = tk.Frame(card, width=3,
+                           bg=self._night_rig_accent(accent_col)
+                           if getattr(self, "night_mode", False) else accent_col)
+            acc._lb_rig_accent = accent_col
+            acc.pack(side="left", fill="y")
 
             content = tk.Frame(card, bg="#131f2e")
             content.pack(side="left", fill="both", expand=True, padx=(8, 10), pady=5)
@@ -6254,7 +5971,7 @@ class AstroApp:
             equip_parts = [p for p in [e.get("scope", ""), e.get("camera", "")] if p]
             if equip_parts:
                 tk.Label(info, text="  ·  ".join(equip_parts), bg="#131f2e",
-                         fg="#445566", font=("Helvetica", 9), justify="left",
+                         fg=self._CARD_MUTED, font=("Helvetica", 9), justify="left",
                          wraplength=equip_wraplen).pack(anchor="w", fill="x")
 
             # Metrics — own row below the name, indented slightly rather
@@ -6274,37 +5991,37 @@ class AstroApp:
             win_col = "#4caf50" if _alloc >= 2 else ("#f59e0b" if _alloc >= 0.5 else "#556677")
             tk.Label(metrics, text=win_str, bg="#131f2e", fg=win_col,
                      font=("Helvetica", 10, "bold")).grid(row=0, column=0, padx=(0, 9))
-            tk.Label(metrics, text="window", bg="#131f2e", fg="#445566",
+            tk.Label(metrics, text="window", bg="#131f2e", fg=self._CARD_MUTED,
                      font=("Helvetica", 8)).grid(row=1, column=0, padx=(0, 9))
 
             # Start
             tk.Label(metrics, text=start_str, bg="#131f2e", fg="#ffffff",
                      font=("Helvetica", 10)).grid(row=0, column=1, padx=(0, 8))
-            tk.Label(metrics, text="start", bg="#131f2e", fg="#445566",
+            tk.Label(metrics, text="start", bg="#131f2e", fg=self._CARD_MUTED,
                      font=("Helvetica", 8)).grid(row=1, column=1, padx=(0, 8))
 
             # Sub-exp
             tk.Label(metrics, text=f"{e['exp_s']}s", bg="#131f2e", fg="#f59e0b",
                      font=("Helvetica", 10)).grid(row=0, column=2, padx=(0, 8))
-            tk.Label(metrics, text="sub", bg="#131f2e", fg="#445566",
+            tk.Label(metrics, text="sub", bg="#131f2e", fg=self._CARD_MUTED,
                      font=("Helvetica", 8)).grid(row=1, column=2, padx=(0, 8))
 
             # Alloc
             tk.Label(metrics, text=f"{e['allocated_hrs']}h", bg="#131f2e", fg="#ffffff",
                      font=("Helvetica", 10), width=4).grid(row=0, column=3, padx=(0, 6))
-            tk.Label(metrics, text="alloc", bg="#131f2e", fg="#445566",
+            tk.Label(metrics, text="alloc", bg="#131f2e", fg=self._CARD_MUTED,
                      font=("Helvetica", 8)).grid(row=1, column=3, padx=(0, 6))
 
             # Subs
             tk.Label(metrics, text=str(e["n_subs"]), bg="#131f2e", fg="#ffffff",
                      font=("Helvetica", 10), width=3).grid(row=0, column=4, padx=(0, 6))
-            tk.Label(metrics, text="subs", bg="#131f2e", fg="#445566",
+            tk.Label(metrics, text="subs", bg="#131f2e", fg=self._CARD_MUTED,
                      font=("Helvetica", 8)).grid(row=1, column=4, padx=(0, 6))
 
             # Integration time
             tk.Label(metrics, text=f"{e['total_int_hrs']:.2f}h", bg="#131f2e", fg="#38bdf8",
                      font=("Helvetica", 10, "bold"), width=5).grid(row=0, column=5, padx=(0, 0))
-            tk.Label(metrics, text="integ", bg="#131f2e", fg="#445566",
+            tk.Label(metrics, text="integ", bg="#131f2e", fg=self._CARD_MUTED,
                      font=("Helvetica", 8)).grid(row=1, column=5, padx=(0, 0))
 
             self._plan_card_widgets.append(card)
@@ -7326,6 +7043,7 @@ class AstroApp:
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self._plan_entries = self._migrate_session(data)
+            self._register_plan_customs()     # custom sky-map targets aren't in the catalog
             # Pin every loaded target to the top of the browsing grid too —
             # same as a manually-added target (see _mark_grid_touched) —
             # so re-finding one of them right after loading never requires
@@ -7430,6 +7148,8 @@ class AstroApp:
     def _alt_canvas_motion(self, event):
         """Crosshair + tooltip showing time & altitude at the hovered chart position."""
         meta = getattr(self, "_chart_meta", None)
+        if not self._chart_view_open():
+            return
 
         # Remove previous crosshair and on-canvas tooltip
         self.alt_canvas.delete("_crosshair")
@@ -7495,8 +7215,9 @@ class AstroApp:
 
     def _alt_canvas_leave(self, event=None):
         """Hide the chart crosshair and on-canvas tooltip."""
-        self.alt_canvas.delete("_crosshair")
-        self.alt_canvas.delete("_chtip")
+        if self._chart_view_open():
+            self.alt_canvas.delete("_crosshair")
+            self.alt_canvas.delete("_chtip")
         if self._chart_tip_win:
             self._chart_tip_win.destroy()
             self._chart_tip_win = None
@@ -7531,9 +7252,8 @@ class AstroApp:
                                require_min_alt=True, progress_cb=None):
         """Scan the catalog, optionally gated on visibility above ``min_alt``.
 
-        Shared by the "Visible Tonight" popup (``show_visible_tonight``) and
-        the target-card browsing grid, so both compute visibility identically
-        instead of duplicating the catalog scan.
+        Used by the Tonight's Plan browsing grid (and for any target pinned
+        there that the current scan didn't include).
 
         Also respects ``self.catalog_filter`` (the NGC/IC/Messier/Caldwell/
         Sharpless/Other toggle set edited via the ▽ button next to the Plan
@@ -7645,453 +7365,8 @@ class AstroApp:
         results.sort(key=lambda x: x[1], reverse=True)
         return results, fallback_note
 
-    def show_visible_tonight(self):
-        """Open the 'Visible Tonight' popup — scans the catalog for objects above min altitude."""
-        popup = tk.Toplevel(self.root)
-        popup.title("🌙 Visible Tonight")
-        popup.geometry("740x620")
-        popup.resizable(True, True)
-
-        # --- Location frame ---
-        loc_frame = ttk.LabelFrame(popup, text="Observer Location")
-        loc_frame.pack(fill="x", padx=12, pady=8)
-
-        saved_lat, saved_lon = self._get_saved_location()
-
-        ttk.Label(loc_frame, text="Location:").grid(row=0, column=0, padx=5, pady=(6,2), sticky="e")
-        loc_prof_var = tk.StringVar(value=self.data.get("active_location", ""))
-        self._vt_loc_combo = ttk.Combobox(loc_frame, textvariable=loc_prof_var,
-                                          state="readonly", width=20,
-                                          values=self._location_names())
-        self._vt_loc_combo.grid(row=0, column=1, columnspan=3, padx=5, pady=(6,2), sticky="w")
-        ToolTip(self._vt_loc_combo, "Switch saved observing sites — re-runs the search.\n"
-                                    "Manage sites in Settings → Observer Location.")
-
-        ttk.Label(loc_frame, text="Latitude:").grid(row=1, column=0, padx=5, pady=2, sticky="e")
-        lat_var = tk.StringVar(value=str(saved_lat) if saved_lat is not None else "")
-        lat_entry = ttk.Entry(loc_frame, textvariable=lat_var, width=12)
-        lat_entry.grid(row=1, column=1, padx=5, pady=2)
-
-        ttk.Label(loc_frame, text="Longitude:").grid(row=1, column=2, padx=5, pady=2, sticky="e")
-        lon_var = tk.StringVar(value=str(saved_lon) if saved_lon is not None else "")
-        lon_entry = ttk.Entry(loc_frame, textvariable=lon_var, width=12)
-        lon_entry.grid(row=1, column=3, padx=5, pady=2)
-
-        ttk.Button(loc_frame, text="Auto-detect", command=lambda: do_autodetect()).grid(
-            row=1, column=4, padx=(10,5), pady=2)
-
-        def _on_vt_loc_selected(event=None):
-            name = loc_prof_var.get()
-            p = self._find_location(name)
-            if not p:
-                return
-            lat_var.set(f"{float(p['lat']):.4f}")
-            lon_var.set(f"{float(p['lon']):.4f}")
-            self._apply_location(name)
-            _run_search()
-        self._vt_loc_combo.bind("<<ComboboxSelected>>", _on_vt_loc_selected)
-
-        # Status row — pre-allocated so the dialog never shifts when text appears
-        loc_status = ttk.Label(loc_frame, text="", width=30)
-        loc_status.grid(row=2, column=0, columnspan=5, padx=8, pady=(0,6), sticky="w")
-
-        def do_autodetect():
-            loc_status.config(text="  Detecting…", foreground="orange")
-            popup.update_idletasks()
-            lat, lon = self._autodetect_location()
-            if lat is not None:
-                lat_var.set(f"{lat:.4f}")
-                lon_var.set(f"{lon:.4f}")
-                loc_status.config(text="  ✅ Auto-detected", foreground="green")
-            else:
-                loc_status.config(text="  ❌ Failed — enter manually", foreground="red")
-
-        # Tracking flag so auto-rerun can guard against concurrent searches
-        _search_running = [False]
-        # Track the last lat/lon/alt that was actually searched, to detect manual edits
-        _last_searched_loc = [None, None]
-        _last_searched_alt = [None]
-
-        def _auto_detect_then_run():
-            loc_status.config(text="  Detecting…", foreground="orange")
-            popup.update_idletasks()
-            lat, lon = self._autodetect_location()
-            if lat is not None:
-                lat_var.set(f"{lat:.4f}")
-                lon_var.set(f"{lon:.4f}")
-                loc_status.config(text="  ✅ Auto-detected", foreground="green")
-            else:
-                loc_status.config(text="  ❌ Failed — enter manually", foreground="red")
-            popup.after(100, _run_search)
-
-        def _on_location_focusout(event):
-            """Prompt user to confirm re-search if lat/lon changed since last search."""
-            new_lat = lat_var.get().strip()
-            new_lon = lon_var.get().strip()
-            if [new_lat, new_lon] == _last_searched_loc:
-                return  # nothing changed
-            if _last_searched_loc[0] is None:
-                return  # first run not done yet, auto-run will handle it
-            if _search_running[0]:
-                return
-            if messagebox.askyesno(
-                    "Location changed",
-                    f"Location has changed to ({new_lat}, {new_lon}).\nRe-run the search with the new coordinates?",
-                    parent=popup):
-                _run_search()
-
-        lat_entry.bind("<FocusOut>", _on_location_focusout)
-        lon_entry.bind("<FocusOut>", _on_location_focusout)
-        lat_entry.bind("<Return>", _on_location_focusout)
-        lon_entry.bind("<Return>", _on_location_focusout)
-
-        if saved_lat is not None:
-            _initial_autorun = True
-        else:
-            _initial_autorun = False
-
-        # --- Filter frame ---
-        filt_frame = ttk.LabelFrame(popup, text="Filters")
-        filt_frame.pack(fill="x", padx=12, pady=4)
-
-        ttk.Label(filt_frame, text="Min. Altitude:").grid(row=0, column=0, padx=5, pady=4, sticky="e")
-        # Seed the filter's min-altitude from the saved settings value so it
-        # matches what the rest of the app uses (horizon line on the altitude
-        # chart, imaging-window calculation, etc.).
-        _saved_min_alt = int(self.data.get("settings", {}).get("min_alt", 20))
-        min_alt_var = tk.StringVar(value=str(_saved_min_alt))
-        min_alt_entry = ttk.Entry(filt_frame, textvariable=min_alt_var, width=6)
-        min_alt_entry.grid(row=0, column=1, padx=5)
-        ttk.Label(filt_frame, text="°  above horizon").grid(row=0, column=2, sticky="w")
-
-        def _on_alt_focusout(event):
-            """Prompt user to confirm re-search if min altitude changed since last search."""
-            new_alt = min_alt_var.get().strip()
-            if new_alt == _last_searched_alt[0]:
-                return
-            if _last_searched_alt[0] is None:
-                return
-            if _search_running[0]:
-                return
-            if messagebox.askyesno(
-                    "Altitude changed",
-                    f"Minimum altitude changed to {new_alt}°.\nRe-run the search?",
-                    parent=popup):
-                _run_search()
-
-        min_alt_entry.bind("<FocusOut>", _on_alt_focusout)
-        min_alt_entry.bind("<Return>", _on_alt_focusout)
-
-        ttk.Label(filt_frame, text="Object Type:").grid(row=0, column=3, padx=10, sticky="e")
-        type_var = tk.StringVar(value="All Types")
-        type_combo = ttk.Combobox(filt_frame, textvariable=type_var, values=OBJECT_TYPE_FILTERS,
-                                  state="readonly", width=18)
-        type_combo.grid(row=0, column=4, padx=5)
-
-        # --- Magnitude filter row ---
-        ttk.Label(filt_frame, text="Max magnitude:").grid(row=1, column=0, padx=5, pady=4, sticky="e")
-        mag_limit_var = tk.StringVar(value="")
-        mag_limit_entry = ttk.Entry(filt_frame, textvariable=mag_limit_var, width=6)
-        mag_limit_entry.grid(row=1, column=1, padx=5)
-        ToolTip(mag_limit_entry, "Leave blank to show all magnitudes.\nBrighter objects have lower numbers (e.g. 9.0).\nFainter objects have higher numbers (e.g. 14.0).")
-
-        use_surf_br_var = tk.BooleanVar(value=False)
-        surf_br_chk = ttk.Checkbutton(filt_frame, text="Use surface brightness",
-                                      variable=use_surf_br_var)
-        surf_br_chk.grid(row=1, column=2, columnspan=2, padx=10, sticky="w")
-        ToolTip(surf_br_chk, "V-mag: visual magnitude of the whole object.\n"
-                              "Surface brightness: mag/arcmin\u00b2 \u2014 more useful\n"
-                              "for extended objects like galaxies and nebulae.")
-
-        mag_hint_var = tk.StringVar(value="V-mag — brighter objects have lower numbers (e.g. 9.0)")
-        mag_hint_label = ttk.Label(filt_frame, textvariable=mag_hint_var,
-                                   font=("Helvetica", 8), foreground="gray")
-        mag_hint_label.grid(row=2, column=0, columnspan=5, padx=5, pady=(0, 4), sticky="w")
-
-        def _on_surf_br_toggle():
-            mag_limit_var.set("")
-            if use_surf_br_var.get():
-                mag_hint_var.set("Surface brightness (mag/arcmin\u00b2) \u2014 higher = fainter (e.g. 22.5)")
-            else:
-                mag_hint_var.set("V-mag \u2014 brighter objects have lower numbers (e.g. 9.0)")
-            if not _search_running[0]:
-                _run_search()
-
-        use_surf_br_var.trace_add("write", lambda *_: _on_surf_br_toggle())
-
-        # --- Seasonal checkbox ---
-        chk_row = ttk.Frame(popup)
-        chk_row.pack(pady=(4, 0))
-        season_var = tk.BooleanVar(value=True)
-        ttk.Checkbutton(chk_row, text="Seasonal targets only", variable=season_var).pack()
-
-        # --- Results frame ---
-        res_frame = ttk.Frame(popup)
-        res_frame.pack(fill="both", expand=True, padx=12, pady=4)
-
-        cols = ("Name", "Common Name", "Type", "Max Alt", "Rise", "Mag", "Size")
-        tree = ttk.Treeview(res_frame, columns=cols, show="headings", height=16)
-        tree.heading("Name", text="Name")
-        tree.heading("Common Name", text="Common Name")
-        tree.heading("Type", text="Type")
-        tree.heading("Max Alt", text="Max Alt °")
-        tree.heading("Rise", text="Rise")
-        tree.heading("Mag", text="Mag")
-        tree.heading("Size", text="Size (′)")
-        tree.column("Name", width=90)
-        tree.column("Common Name", width=150)
-        tree.column("Type", width=110)
-        tree.column("Max Alt", width=70, anchor="center")
-        tree.column("Rise", width=70, anchor="center")
-        tree.column("Mag", width=55, anchor="center")
-        tree.column("Size", width=70, anchor="center")
-
-        vsb = ttk.Scrollbar(res_frame, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
-        tree.pack(side="left", fill="both", expand=True)
-        vsb.pack(side="right", fill="y")
-
-        # ── Click-to-sort on column headers (single click; toggles asc/desc) ──
-        _sort_state = {"col": "Max Alt", "desc": True}
-
-        def _natural_key(s):
-            parts = re.split(r'(\d+)', s or "")
-            return [int(p) if p.isdigit() else p.lower() for p in parts]
-
-        def _col_key(col, val):
-            if col == "Max Alt":
-                try:
-                    return float(val.rstrip("°"))
-                except ValueError:
-                    return -999.0
-            if col == "Rise":
-                if val == "up":
-                    return -1.0                  # observable from dusk -> earliest
-                if val in ("—", ""):
-                    return 1e9                   # never rises while dark -> last
-                try:
-                    hh, mm = val.split(":")
-                    mins = int(hh) * 60 + int(mm)
-                    if mins < 12 * 60:           # after-midnight times come later
-                        mins += 24 * 60
-                    return float(mins)
-                except ValueError:
-                    return 1e9
-            if col == "Mag":
-                try:
-                    return float(val)
-                except ValueError:
-                    return 1e9                   # unknown magnitude -> last
-            if col == "Size":
-                try:
-                    return float(val.split("×")[0].strip())
-                except (ValueError, IndexError):
-                    return -1.0
-            return _natural_key(val)             # Name / Common Name / Type
-
-        def _update_sort_indicators():
-            mag_label = "SB" if use_surf_br_var.get() else "Mag"
-            base = {"Name": "Name", "Common Name": "Common Name", "Type": "Type",
-                    "Max Alt": "Max Alt °", "Rise": "Rise",
-                    "Mag": mag_label, "Size": "Size (′)"}
-            arrow = " ▼" if _sort_state["desc"] else " ▲"
-            for c, txt in base.items():
-                tree.heading(c, text=txt + (arrow if c == _sort_state["col"] else ""))
-
-        def _apply_sort():
-            col = _sort_state["col"]
-            rows = [(_col_key(col, tree.set(iid, col)), iid)
-                    for iid in tree.get_children("")]
-            rows.sort(key=lambda r: r[0], reverse=_sort_state["desc"])
-            for idx, (_, iid) in enumerate(rows):
-                tree.move(iid, "", idx)
-            _update_sort_indicators()
-
-        def _sort_by(col):
-            if _sort_state["col"] == col:
-                _sort_state["desc"] = not _sort_state["desc"]
-            else:
-                _sort_state["col"] = col
-                _sort_state["desc"] = False      # new column defaults to ascending
-            _apply_sort()
-
-        for _c in cols:
-            tree.heading(_c, command=lambda cc=_c: _sort_by(cc))
-
-        prog_label = ttk.Label(popup, text="")
-        prog_label.pack()
-
-        def _run_search():
-            if _search_running[0]:
-                return
-            _search_running[0] = True
-            tree.delete(*tree.get_children())
-            prog_label.config(text="")
-            try:
-                lat = float(lat_var.get())
-                lon = float(lon_var.get())
-            except ValueError:
-                messagebox.showwarning("Location needed",
-                    "Please enter valid latitude and longitude.", parent=popup)
-                _search_running[0] = False
-                return
-
-            # Save location directly — avoid save_data() which calls refresh_dropdowns()
-            # and triggers on_parameter_change traces that queue analyze_framing callbacks.
-            # Those callbacks would be flushed by update_idletasks() below, causing a
-            # re-entrant _run_search call that clears the tree mid-search.
-            self.data["location"] = {"lat": lat, "lon": lon}
-            self._persist_data()
-            self.refresh_twilight_header()
-            self.refresh_moon_header()
-
-            try:
-                min_alt = float(min_alt_var.get())
-            except ValueError:
-                min_alt = 20.0
-
-            type_filter = type_var.get()
-            seasonal_only = season_var.get()
-            mag_limit_str = mag_limit_var.get().strip()
-            try:
-                mag_limit = float(mag_limit_str)
-            except ValueError:
-                mag_limit = None   # no magnitude filter
-            use_surf_br = use_surf_br_var.get()
-
-            # Build candidate list
-            month = _planning_local_noon().month
-            if month in [12, 1, 2]:
-                season = "Winter"
-            elif month in [3, 4, 5]:
-                season = "Spring"
-            elif month in [6, 7, 8]:
-                season = "Summer"
-            else:
-                season = "Autumn"
-
-            if seasonal_only:
-                seasonal_ids = set()
-                for sid in SEASONAL_TARGETS[season]:
-                    key = sid.replace(" ", "").upper()
-                    t = self.targets.get(key) or self.common_names_map.get(key)
-                    if t:
-                        seasonal_ids.add(t["id"])
-                candidates = [t for t in self.targets.values() if t["id"] in seasonal_ids]
-                # deduplicate by id
-                seen = set(); unique = []
-                for t in candidates:
-                    if t["id"] not in seen:
-                        seen.add(t["id"]); unique.append(t)
-                candidates = unique
-            else:
-                # Use all targets with known RA/Dec and reasonable size
-                seen = set(); candidates = []
-                for t in self.targets.values():
-                    if t["id"] not in seen and t.get("ra_deg", 0) != 0 and t.get("size_maj", 0) > 0:
-                        seen.add(t["id"]); candidates.append(t)
-
-            # Apply type filter
-            fallback_note = ""
-            if type_filter != "All Types":
-                filtered = [t for t in candidates if t.get("obj_type") == type_filter]
-                # If seasonal mode + type filter yields nothing (e.g. Spring has no nebulae),
-                # fall back to the full catalog for that type so results are never silently empty.
-                if not filtered and seasonal_only:
-                    seen = set()
-                    filtered = []
-                    for t in self.targets.values():
-                        if t["id"] not in seen and t.get("obj_type") == type_filter:
-                            seen.add(t["id"])
-                            filtered.append(t)
-                    fallback_note = f"ℹ️ No {type_filter} in seasonal list — searched full catalog.  "
-                else:
-                    fallback_note = ""
-                candidates = filtered
-
-            if not candidates:
-                prog_label.config(text="No candidates matched your filters.", foreground="red")
-                _search_running[0] = False
-                return
-            prog_label.config(text=f"Checking {len(candidates)} objects…", foreground="orange")
-
-            def _compute():
-                def _report_progress(i, total):
-                    popup.after(0, lambda v=i: prog_label.config(
-                        text=f"Checking {v}/{total}…", foreground="orange"))
-
-                # Re-filters candidates (cheap — dict iteration over the
-                # catalog) before repeating the same expensive per-candidate
-                # altitude scan the "No candidates matched" check above already
-                # sized; fallback_note is recomputed identically to the outer
-                # one from the same inputs, so the outer copy (used in _show
-                # below) is kept and this one is discarded.
-                results, _fallback_note = self._scan_visible_targets(
-                    lat, lon, min_alt=min_alt, obj_type=type_filter,
-                    mag_limit=mag_limit, use_surf_br=use_surf_br,
-                    seasonal_only=seasonal_only, progress_cb=_report_progress)
-
-                def _show():
-                    tree.delete(*tree.get_children())
-                    mag_col_label = "SB" if use_surf_br else "Mag"
-                    tree.heading("Mag", text=mag_col_label)
-                    for t, alt, rise_label in results:
-                        common = t["common"].split(";")[0].strip() if t["common"] else ""
-                        size = f"{t['size_maj']:.1f} × {t['size_min']:.1f}" if t["size_maj"] else "—"
-                        mag_val = t.get("surf_br") if use_surf_br else t.get("v_mag")
-                        mag_str = f"{mag_val:.1f}" if mag_val is not None else "—"
-                        rise_str = rise_label if rise_label else "—"
-                        tree.insert("", "end", values=(
-                            t["id"], common, t.get("obj_type", ""),
-                            f"{alt:.0f}°", rise_str, mag_str, size))
-                    _apply_sort()
-                    prog_label.config(
-                        text=f"{fallback_note}Found {len(results)} visible target{'s' if len(results) != 1 else ''} tonight.",
-                        foreground="green")
-                    _search_running[0] = False
-                    _last_searched_loc[0] = lat_var.get().strip()
-                    _last_searched_loc[1] = lon_var.get().strip()
-                    _last_searched_alt[0] = min_alt_var.get().strip()
-
-                popup.after(0, _show)
-
-            threading.Thread(target=_compute, daemon=True).start()
-
-        # Auto-rerun when filters change (only if not already searching)
-        def _auto_rerun(*args):
-            if not _search_running[0]:
-                _run_search()
-
-        type_combo.bind("<<ComboboxSelected>>", _auto_rerun)
-        season_var.trace_add("write", _auto_rerun)
-        mag_limit_entry.bind("<Return>", lambda e: _auto_rerun())
-        mag_limit_entry.bind("<FocusOut>", lambda e: _auto_rerun())
-
-        # Now safe to schedule auto-run — _run_search is defined
-        if _initial_autorun:
-            popup.after(200, _run_search)
-        else:
-            popup.after(200, _auto_detect_then_run)
-
-        def on_select(event):
-            sel = tree.selection()
-            if sel:
-                name = tree.item(sel[0], "values")[0]
-                self.target_search.delete(0, tk.END)
-                self.target_search.insert(0, name)
-                popup.destroy()
-                self.analyze_framing()
-
-        tree.bind("<Double-1>", on_select)
-        ttk.Label(popup,
-                  text="Click a column header to sort  ·  Double-click a target to load it  ·  “up” = already above the horizon at dark",
-                  font=("Helvetica", 8)).pack(pady=(0, 6))
-
-        # Apply current day/night theme to the popup window and its widgets
-        self._theme_popup(popup)
-
     # ═══════════════════════════════════════════════════════════════════
-    # INTEGRATION PLAN & NINA PROFILE IMPORT
+    # FILTER CHOICES & NINA PROFILE IMPORT
     # ═══════════════════════════════════════════════════════════════════
 
     def _filter_mode_choices(self):
@@ -8171,127 +7446,6 @@ class AstroApp:
         if fs and fs.get("members"):
             return [m["name"] for m in fs["members"]]
         return ["Lum"]                              # legacy/unrecognized — safe fallback
-
-    def show_integration_plan(self, silent=False):
-        """Compute integration-plan figures (subs, total time, SNR, overhead).
-
-        Uses the sub-exposure and sky-flux values stored by the most recent
-        analyze_framing() run, and the allocated-hours state in
-        session_hours_var.  All values are purely computational — no
-        network calls needed. The StringVars this writes into are headless
-        now (the Targets List tab that displayed them as stat cards is
-        retired) but are still read internally, so this keeps running on
-        every analysis. Pass silent=True (auto-calls from analyze_framing)
-        to suppress warning dialogs.
-        """
-        if self._last_exp_s is None:
-            if not silent:
-                messagebox.showwarning("No Analysis",
-                    "Please run Analyze Target first so the sub-exposure\n"
-                    "recommendation is available.")
-            return
-
-        try:
-            session_hrs = float(self.session_hours_var.get())
-            if session_hrs <= 0:
-                raise ValueError("Session hours must be positive.")
-        except ValueError as e:
-            if not silent:
-                messagebox.showerror("Invalid Input", f"Session hours: {e}")
-            return
-
-        # Use manual override if provided, else fall back to calculated recommendation
-        manual_str = self.manual_exp_var.get().strip()
-        try:
-            exp = float(manual_str)
-            if exp <= 0:
-                raise ValueError
-        except ValueError:
-            exp = self._last_exp_s
-
-        # Update the hint label to always show the recommended value
-        self._recommended_exp_label.config(text=f"(recommended: {self._last_exp_s:.1f}s)")
-
-        # Read overhead per sub (default 5s if blank or invalid)
-        try:
-            overhead_s = float(self.overhead_per_sub_var.get())
-            if overhead_s < 0:
-                raise ValueError
-        except (ValueError, AttributeError):
-            overhead_s = 5.0
-
-        time_per_sub = exp + overhead_s
-        session_s    = session_hrs * 3600.0
-        n_subs_all   = int(session_s / time_per_sub)
-
-        if n_subs_all < 1:
-            if not silent:
-                messagebox.showwarning("Session Too Short",
-                    f"With {exp:.1f}s subs, a {session_hrs:.1f}h session gives less\n"
-                    f"than one complete sub-exposure.\n\n"
-                    f"Try a longer session or a shorter sub-exposure.")
-            return
-
-        # ── Multi-filter allocation ───────────────────────────────────────
-        filters      = self._get_filter_names()
-        n_filters    = len(filters)
-        multi_filter = n_filters > 1
-
-        # Divide subs equally among filters; each filter gets a whole-number count
-        subs_per_filter  = n_subs_all // n_filters
-        total_subs_used  = subs_per_filter * n_filters       # may be < n_subs_all due to int division
-        total_int_s      = total_subs_used * exp
-        total_int_hrs    = total_int_s / 3600.0
-        int_per_filter_h = (subs_per_filter * exp) / 3600.0
-
-        snr_gain         = math.sqrt(subs_per_filter) if multi_filter else math.sqrt(total_subs_used)
-        overhead_total_s = n_subs_all * overhead_s
-        overhead_pct     = (overhead_total_s / session_s) * 100
-
-        noise_note = ""
-        if self._last_sky_flux is not None and self.current_target_info:
-            c = self.data["cameras"].get(self.camera_choice.get(), {})
-            rn  = float(c.get("read_noise", 3))
-            sky_e_per_sub = self._last_sky_flux * exp
-            if sky_e_per_sub > rn ** 2 * 5:
-                noise_note = "ℹ️  Sky-noise limited — more subs always help."
-            elif sky_e_per_sub > rn ** 2:
-                noise_note = "ℹ️  Transitional regime — subs & darks both matter."
-            else:
-                noise_note = "ℹ️  Read-noise limited — consider longer subs if possible."
-
-        # Build per-filter breakdown line
-        if multi_filter:
-            filter_breakdown = (
-                f"{n_filters} filters ({', '.join(filters)})  ·  "
-                f"{subs_per_filter} subs × {int_per_filter_h:.2f}h each  "
-                f"=  {total_subs_used} total subs / {total_int_hrs:.2f}h total\n"
-                + noise_note
-            )
-        else:
-            filter_breakdown = noise_note
-
-        # ── Update headless integration-plan state ──────────────────────
-        target_id = self.current_target_info["id"] if self.current_target_info else "unknown"
-        common    = (self.current_target_info.get("common", "").split(";")[0].strip()
-                     if self.current_target_info else "")
-        subtitle  = (f"Target: {target_id}"
-                     + (f"  —  {common}" if common else "")
-                     + f"   ·   Sub-exposure: {exp:.1f}s")
-        self._plan_target_var.set(subtitle)
-
-        # Stat cards: show per-filter values when multiple filters are in use
-        if multi_filter:
-            self._plan_subs_var.set(f"{subs_per_filter}\nper filter")
-            self._plan_total_var.set(f"{int_per_filter_h:.2f}h\nper filter")
-        else:
-            self._plan_subs_var.set(str(total_subs_used))
-            self._plan_total_var.set(f"{total_int_hrs:.2f}h")
-
-        self._plan_snr_var.set(f"{snr_gain:.1f}×")
-        overhead_min = overhead_total_s / 60.0
-        self._plan_overhead_var.set(f"{overhead_pct:.0f}%  ({overhead_min:.0f} min)")
-        self._plan_noise_var.set(filter_breakdown)
 
     # Canonical narrowband filter names (upper-case for case-insensitive matching)
     _NARROWBAND_NAMES = {"HA", "H-A", "HALPHA", "H-ALPHA",
@@ -8792,26 +7946,11 @@ class AstroApp:
     # ═══════════════════════════════════════════════════════════════════
     # ANALYSIS PLUMBING (deferred/dirty-flag dispatch)
     # ═══════════════════════════════════════════════════════════════════
-    # Equipment changes mark the analysis "dirty" rather than re-running
-    # immediately; a timer-based after() then fires _run_deferred_analysis
-    # if the Planner or Session tab is visible.  This avoids re-entrancy
-    # through macOS Cocoa Tk's update_idletasks() cascade.
-
     def toggle_filter_visibility(self, *args):
-        """Show or hide the filter-mode chip based on whether the selected
-        camera is mono — in the Planner tab's chips bar, and (independently)
-        the equipment drawer's own filter row/combobox if the drawer
-        happens to be open (a separate widget bound to the same
-        self.filter_mode StringVar — see _open_equip_drawer for why it
-        can't just be the same widget moved back and forth)."""
+        """Show the equipment drawer's Filter row only for mono cameras
+        (if the drawer happens to be open)."""
         c = self.data["cameras"].get(self.camera_choice.get())
         show = bool(c and not c.get("is_color", True))
-        if show:
-            if not self.filter_dropdown.winfo_ismapped():
-                self.filter_dropdown.pack(side="left", padx=(0, 6),
-                                          before=self._equip_summary_label)
-        else:
-            self.filter_dropdown.pack_forget()
 
         drawer_row = getattr(self, "_drawer_filter_row", None)
         if drawer_row is not None and drawer_row.winfo_exists():
@@ -8819,49 +7958,6 @@ class AstroApp:
                 drawer_row.pack(fill="x", pady=(0, 6))
             else:
                 drawer_row.pack_forget()
-
-    def _mark_analysis_dirty(self):
-        """Flag that input data has changed and analysis needs to re-run.
-
-        If the Target Planner tab is currently visible, schedules
-        analyze_framing via after() so the tab can finish rendering first.
-        If a different tab is active, just sets the flag — _on_tab_changed
-        will pick it up when the user returns to the Planner tab.
-        """
-        self._analysis_dirty = True
-        try:
-            current = self.tab_control.select()
-            if current == str(self.tab_planner):
-                self._schedule_analysis()
-        except Exception:
-            pass
-
-    def _schedule_analysis(self):
-        """Schedule analyze_framing via after() if not already scheduled.
-
-        Uses after(100) — NOT after_idle — so the callback cannot be flushed
-        prematurely by update_idletasks() inside _draw_queue_gantt or
-        _draw_altitude_chart (which is what causes the blank-planner bug on macOS).
-        """
-        if self._analysis_after_id is not None:
-            return  # already scheduled — don't stack
-        self._analysis_after_id = self.root.after(100, self._run_deferred_analysis)
-
-    def _run_deferred_analysis(self):
-        """Execute the deferred analysis and clear the scheduling state."""
-        self._analysis_after_id = None
-        if not self._analysis_dirty:
-            return
-        # Only run if the Planner tab is still active — the user may have
-        # switched away during the after(100) delay.  If so, leave the
-        # dirty flag set; _on_tab_changed will pick it up later.
-        try:
-            current = self.tab_control.select()
-            if current != str(self.tab_planner):
-                return  # dirty flag stays set
-        except Exception:
-            pass
-        self.analyze_framing()
 
     # ═══════════════════════════════════════════════════════════════════
     # RIG PRESETS — named snapshots of the equipment chip combination
@@ -8912,7 +8008,7 @@ class AstroApp:
         """Repopulate the rig dropdown values from saved rigs and refresh the indicator."""
         rigs = self.data.get("settings", {}).get("rigs", [])
         names = [r.get("name", "") for r in rigs if r.get("name")]
-        self.rig_dropdown["values"] = names
+        self._rig_names = names
         # Explore's saved-rig quick-add mirrors the same list
         if hasattr(self, "_explore_rig_pick"):
             self._explore_rig_pick["values"] = names
@@ -8920,6 +8016,9 @@ class AstroApp:
         if hasattr(self, "_equip_rig_refresh"):
             self._equip_rig_refresh(preserve_name=self.data.get("settings", {}).get("active_rig", ""))
         self._update_rig_indicator()
+        # Explore cards flip between TRIAL and named-rig looks as rigs change
+        if getattr(self, "_explore_rigs", None):
+            self._explore_refresh_cards()
 
     def _update_rig_indicator(self):
         """Set the rig dropdown display text based on whether chips match the active rig.
@@ -8931,7 +8030,7 @@ class AstroApp:
         if getattr(self, "_applying_rig", False):
             return
         if not hasattr(self, "rig_choice"):
-            return   # Called before the planner tab was built
+            return   # Called before the equipment state was created
         active_name = self.data.get("settings", {}).get("active_rig", "")
         if not active_name:
             self.rig_choice.set("")
@@ -8961,8 +8060,6 @@ class AstroApp:
 
         Only applies values still valid against the current inventory (so a
         deleted scope/camera in the rig doesn't corrupt the chip state).
-        Triggers an analyze refresh via :meth:`_mark_analysis_dirty` since
-        chip values have changed.
         """
         self._applying_rig = True
         try:
@@ -8972,7 +8069,7 @@ class AstroApp:
                 self.camera_choice.set(rig["camera"])
             if rig.get("reduction"):
                 self.reduction_factor.set(rig["reduction"])
-            if rig.get("filter") in self.filter_dropdown["values"]:
+            if rig.get("filter") in self._filter_choices:
                 self.filter_mode.set(rig["filter"])
         finally:
             self._applying_rig = False
@@ -8980,8 +8077,120 @@ class AstroApp:
         self.data.setdefault("settings", {})["active_rig"] = rig.get("name", "")
         self._persist_data()
         self._update_rig_indicator()
-        if getattr(self, "auto_update_enabled", False):
-            self._mark_analysis_dirty()
+
+    # ── Rig identity helpers (Explore cards, sky map rig sync) ──────────
+
+    @staticmethod
+    def _red_float(red):
+        """Reducer value ("0.8×", "1.0x", 0.8, None) → float, default 1.0."""
+        if isinstance(red, (int, float)):
+            return float(red) or 1.0
+        try:
+            return float(str(red or "1.0").strip().rstrip("×x")) or 1.0
+        except ValueError:
+            return 1.0
+
+    @staticmethod
+    def _red_str(red):
+        """Reducer value → the chip's display string, e.g. 0.8 → "0.8×"."""
+        if isinstance(red, str) and red.strip():
+            return red.strip()
+        return f"{AstroApp._red_float(red):.1f}×"
+
+    def _rig_matching(self, scope, camera, reduction, filt):
+        """Saved rig whose scope, camera, reducer AND filter all match, else None.
+
+        A colour camera has no filter — None and "" compare equal — and the
+        reducer compares numerically so "0.80×" and "0.8×" are the same rig.
+        """
+        want_red = self._red_float(reduction)
+        want_f = filt or ""
+        for rig in self.data.get("settings", {}).get("rigs", []):
+            if (rig.get("scope") == scope and rig.get("camera") == camera
+                    and abs(self._red_float(rig.get("reduction")) - want_red) < 1e-6
+                    and (rig.get("filter") or "") == want_f):
+                return rig
+        return None
+
+    def _rig_fov(self, scope, camera, reduction):
+        """(fov_w, fov_h) in degrees for a scope/camera/reducer, or None."""
+        s = self.data.get("scopes", {}).get(scope)
+        c = self.data.get("cameras", {}).get(camera)
+        if not s or not c:
+            return None
+        try:
+            eff_fl = float(s.get("native_fl", 1)) * self._red_float(reduction)
+            sw, sh = float(c.get("sensor_w", 1)), float(c.get("sensor_h", 1))
+            return (2 * math.degrees(math.atan(sw / (2 * eff_fl))),
+                    2 * math.degrees(math.atan(sh / (2 * eff_fl))))
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    def _explore_rig_filter(self, r):
+        """An Explore rig's filter in saved-rig terms ("" for colour cameras)."""
+        return "" if r.get("is_color", True) else (r.get("filter_mode") or "")
+
+    def _explore_rig_saved(self, r):
+        """Saved rig matching an Explore rig card exactly, else None."""
+        return self._rig_matching(r["scope"], r["camera"], r["reduction"],
+                                  self._explore_rig_filter(r))
+
+    def _explore_rig_on_tonight(self, r):
+        """True when an Explore rig card is the equipment Tonight's Plan is using."""
+        if not hasattr(self, "scope_choice"):
+            return False
+        snap = self._current_rig_snapshot()
+        return (snap["scope"] == r["scope"] and snap["camera"] == r["camera"]
+                and abs(self._red_float(snap["reduction"]) - self._red_float(r["reduction"])) < 1e-6
+                and (snap["filter"] or "") == self._explore_rig_filter(r))
+
+    def _sync_rig_to_app(self, scope, camera, reduction, filt):
+        """Make a setup the active equipment on Tonight's Plan.
+
+        A saved rig is applied through _apply_rig (so the rig chip shows its
+        name); an unsaved setup just sets the chips, which leaves the rig chip
+        reading "Custom…". Existing plan rows keep their own equipment.
+        Returns the label to show the user (rig name or "scope · camera").
+        """
+        saved = self._rig_matching(scope, camera, reduction, filt)
+        if saved is not None:
+            self._apply_rig(saved)
+            return saved.get("name", "")
+        if scope in self.data.get("scopes", {}):
+            self.scope_choice.set(scope)
+        if camera in self.data.get("cameras", {}):
+            self.camera_choice.set(camera)
+        self.reduction_factor.set(self._red_str(reduction))
+        if filt and filt in self._filter_choices:
+            self.filter_mode.set(filt)
+        self._update_rig_indicator()
+        return f"{scope} · {camera}"
+
+    def _save_rig_snapshot(self, name, snap, parent=None):
+        """Save (or, after confirming, overwrite) a named rig. Returns True if saved.
+
+        Shared by Explore's "☆ Save as rig" chip and the sky map's Save as rig.
+        ``parent=None`` skips the overwrite prompt and refuses duplicates
+        instead (the sky map asks in its own window).
+        """
+        name = (name or "").strip()
+        if not name or name == "Custom…":
+            return False
+        settings = self.data.setdefault("settings", {})
+        rigs = settings.setdefault("rigs", [])
+        existing = next((r for r in rigs if r.get("name") == name), None)
+        if existing is not None:
+            if parent is None or not messagebox.askyesno(
+                    "Overwrite rig?",
+                    f"A rig named '{name}' already exists.\n\nOverwrite it with this setup?",
+                    parent=parent):
+                return False
+            existing.update(snap)
+        else:
+            rigs.append({"name": name, **snap})
+        self._persist_data()
+        self._refresh_rig_dropdown()
+        return True
 
     def _build_rig_list_and_details(self, list_parent, details_parent, *, list_height=8, list_width=22):
         """Build a saved-rigs Listbox plus a Scope/Reducer/Camera/Filter
@@ -9123,8 +8332,8 @@ class AstroApp:
             return
         if not messagebox.askyesno("Update Rig",
                                     f"Overwrite '{name}' with the current equipment settings?\n\n"
-                                    "This replaces the saved snapshot with whatever's selected in "
-                                    "the planner right now.",
+                                    "This replaces the saved snapshot with the equipment "
+                                    "currently selected.",
                                     parent=parent):
             return
         rig.update(self._current_rig_snapshot())
@@ -9182,8 +8391,8 @@ class AstroApp:
 
         ``name=None`` opens a blank "New Rig" form; otherwise pre-fills from
         that rig's own saved snapshot — never from the live equipment chips
-        (self.scope_choice etc.), since those live on the Planner tab /
-        Plan-tab drawer, which may not even be open, so adding or editing a
+        (self.scope_choice etc.), which the Plan tab's equipment drawer
+        edits and which may not reflect this rig, so adding or editing a
         rig here shouldn't depend on their current state. The Name field is
         editable in BOTH modes — renaming is just "change the Name field and
         Save" here, no separate Rename button (Jerry: "move the rename
@@ -10210,12 +9419,10 @@ class AstroApp:
         self._theme_popup(dlg)
 
     def on_parameter_change(self, *args):
-        """Called whenever a planner Combobox changes — marks dirty if auto-update is on."""
+        """Called whenever an equipment selection (scope/camera/filter/reducer) changes."""
         # Update the rig chip indicator (shows "Custom…" if chips diverge from
         # the active rig's saved snapshot)
         self._update_rig_indicator()
-        if self.auto_update_enabled:
-            self._mark_analysis_dirty()
         # A browsing-grid card's ✓/✚ icon is rig-aware now (see
         # _build_target_card) -- it reflects whether THIS target already
         # has a plan entry under the CURRENTLY selected scope/camera/
@@ -10232,8 +9439,7 @@ class AstroApp:
         back to back (scope, camera, filter mode, reduction all change in
         one go), each landing here via on_parameter_change. Collapsing
         those into a single rescan shortly after the last one avoids
-        kicking off a full rescan per write -- same debounce shape as
-        _mark_analysis_dirty/_schedule_analysis above.
+        kicking off a full rescan per write.
         """
         if getattr(self, "_grid_rig_refresh_after_id", None) is not None:
             return  # already scheduled -- don't stack
@@ -10243,6 +9449,10 @@ class AstroApp:
         """Fire the debounced rescan scheduled by _schedule_grid_rig_refresh."""
         self._grid_rig_refresh_after_id = None
         self._refresh_visible_grid()
+        # Explore's legend cards show which rig is "● ON TONIGHT" — follow
+        # the equipment chips (same debounce, one redraw per rig switch).
+        if getattr(self, "_explore_rigs", None):
+            self._explore_refresh_cards()
 
     def _on_bortle_changed(self, *args):
         """Sky darkness (Bortle) changed — unconditionally refresh everything
@@ -10251,14 +9461,12 @@ class AstroApp:
         Bortle lives at the top of the screen as a standalone "sky
         conditions" setting now, decoupled from rig presets entirely (it's
         an environmental fact, not equipment). Per Jerry: changing it should
-        always recalculate everything that uses it, regardless of whether
-        Auto Update is on, which tab is currently showing, or whether the
-        Target Planner tab is even reachable in navigation right now — never
-        just mark it dirty and hope the user revisits a tab that shows it.
+        always recalculate everything that uses it, regardless of which tab
+        is currently showing.
 
-        So this bypasses _mark_analysis_dirty/_schedule_analysis (both of
-        which gate on tab visibility) and calls the analysis pipeline
-        directly. suppress_incomplete_warning=True keeps this silent when no
+        So this calls the analysis pipeline directly (which also saves the
+        new Bortle as part of the session). suppress_incomplete_warning=True
+        keeps this silent when no
         target/scope/camera is loaded yet -- it fires on every dropdown
         change, so popping a blocking "Incomplete" dialog just because
         nothing happens to be selected would be intrusive, not helpful.
@@ -10339,14 +9547,12 @@ class AstroApp:
         """Categorize how much the Moon interferes with imaging a target
         right now.
 
-        Shared by the "Analyze Target" results panel and the target-card
-        moon-interference line, so both use identical thresholds instead of
-        duplicating them. Mirrors the exact tiers that used to be inlined in
-        ``_analyze_framing_impl``: negligible illumination, then separation
-        bands at 45° and 20°.
+        Shared by Explore's report panel and the target-card
+        moon-interference line, so both use identical thresholds:
+        negligible illumination, then separation bands at 45° and 20°.
 
         Returns ``(tag, icon, note, impact, illum_pct, sep_deg)`` — ``tag``
-        is one of "optimal"/"highlight"/"warning" (matches the results
+        is one of "optimal"/"highlight"/"warning" (matches the report
         panel's text-tag names so callers there don't need translating).
         """
         _, illum_pct, _, _, _, _ = _calc_moon_phase()
@@ -10367,7 +9573,7 @@ class AstroApp:
     def analyze_framing(self, **kwargs):
         """Public entry point for the main analysis pipeline (re-entrancy-guarded wrapper)."""
         # Re-entrancy guard — if update_idletasks() flushes a stacked call,
-        # this prevents it from clearing results_txt mid-draw.
+        # this prevents a second run from resetting the framing mid-draw.
         if getattr(self, "_analyzing", False):
             return
         self._analyzing = True
@@ -10376,12 +9582,16 @@ class AstroApp:
         finally:
             self._analyzing = False
 
-    def _analyze_framing_impl(self, suppress_incomplete_warning=False):
-        """Compute FOV, scale, exposure, imaging window, moon separation for the selected target.
+    def _analyze_framing_impl(self, suppress_incomplete_warning=False,
+                              restore_saved_framing=False):
+        """Analyze the active target for the Frame dialog.
 
-        Populates self.results_txt with the analysis report, renders the DSS thumbnail
-        and altitude chart, and updates the (now headless) integration-plan state
-        that show_integration_plan reads.
+        Resolves the target and rig, saves them as the session to restore at
+        next launch, computes the sensor FOV and tonight's imaging window,
+        then (only while the Frame dialog is open) draws the altitude chart
+        and the DSS framing view — restoring any saved plan framing.
+        Exposure figures are not computed here: the plan rows, Explore's
+        report and NINA export each compute their own.
 
         ``suppress_incomplete_warning`` skips the blocking "Incomplete" dialog
         when no target/scope/camera is resolved yet — used by
@@ -10389,7 +9599,7 @@ class AstroApp:
         darkness change regardless of what else is loaded, and shouldn't pop
         a dialog just because nothing happens to be selected right now.
         """
-        raw = self.target_search.get().strip().upper().replace(" ", "")
+        raw = self.active_target_id.upper().replace(" ", "")
         raw = self._normalize_catalog_key(raw)
 
         t = self.targets.get(raw) or self.common_names_map.get(raw)
@@ -10402,14 +9612,10 @@ class AstroApp:
             dynamic_reduction = 1.0
 
         if not t or not s or not c:
-            if not self.auto_update_enabled and not suppress_incomplete_warning:
+            if not suppress_incomplete_warning:
                 messagebox.showwarning("Incomplete", "Please select Scope, Camera, and a valid Target.")
             return
 
-        # Analysis will proceed — clear the dirty flag
-        self._analysis_dirty = False
-
-        self.auto_update_enabled = True
         self.current_target_info = t
         # Persist session so it's restored on next launch
         self.data["session"] = {
@@ -10417,173 +9623,70 @@ class AstroApp:
             "camera":      c_name,
             "bortle":      self.bortle_choice.get(),
             "reduction":   self.reduction_factor.get(),
-            "target":      self.target_search.get().strip(),
+            "target":      self.active_target_id,
             "filter_mode": self.filter_mode.get(),
         }
         self._persist_data()
-        self.results_txt.delete('1.0', tk.END)
 
         native_fl = float(s.get("native_fl", 1))
-        aperture = float(s.get("aperture", 1))
         eff_fl = native_fl * dynamic_reduction
-        eff_f_ratio = eff_fl / aperture
-        
-        ps = float(c.get("pixel_size", 1))
         sw, sh = float(c.get("sensor_w", 1)), float(c.get("sensor_h", 1))
-        
         fw, fh = 2*math.degrees(math.atan(sw/(2*eff_fl))), 2*math.degrees(math.atan(sh/(2*eff_fl)))
         # Remember the framed FOV (deg) for the sky-map window; the position
         # angle is read live from self._fov_angle when the map is opened.
         self._skymap_fovw, self._skymap_fovh = fw, fh
-        scale = (ps / eff_fl) * 206.265
-        t_maj, t_min = t['size_maj']/60.0, t['size_min']/60.0
+        t_maj = t['size_maj']/60.0
+        t_min = (t['size_min'] or t['size_maj'])/60.0
 
-        if scale < 0.67:
-            status, tag = "Over-sampled", "warning"
-        elif 0.67 <= scale <= 2.0:
-            status, tag = "Optimal", "optimal"
-        else:
-            status, tag = "Under-sampled", "warning"
-
-        b_data = BORTLE_FACTORS.get(self.bortle_choice.get())
-        is_color = c.get("is_color", True)
-        
-        rf = 1.0 
-        if not is_color:
-            rf = self._rf_for_filter_mode(self.filter_mode.get())
-
-        sky_flux = (((b_data["color"] if is_color else b_data["mono"]) * (c.get("qe", 0.5) * (ps**2))) / (eff_f_ratio**2)) / rf
-        exp = (C_VALUE * (c.get("read_noise", 1)**2)) / (sky_flux + 1e-5)
-
-        _mag_parts = []
-        if t.get("v_mag") is not None:
-            _mag_parts.append(f"V-mag: {t['v_mag']:.1f}")
-        if t.get("surf_br") is not None:
-            _mag_parts.append(f"SB: {t['surf_br']:.1f}")
-        _mag_suffix = ("  ·  " + "  ·  ".join(_mag_parts)) if _mag_parts else ""
-        ra_str  = self._fmt_ra_hms(t["ra_deg"])
-        dec_str = self._fmt_dec_dms(t["dec_deg"])
-
-        # ── TARGET header ─────────────────────────────────────────────────
-        self.results_txt.insert(tk.END, f"{t['id']}", "header")
-        if t['common']:
-            self.results_txt.insert(tk.END, f"  —  {t['common'].split(';')[0].strip()}", "header")
-        self.results_txt.insert(tk.END, f"\n")
-        self.results_txt.insert(tk.END, f"RA {ra_str}  ·  Dec {dec_str}{_mag_suffix}\n", "dim")
-        self.results_txt.insert(tk.END, "\n")
-
-        # ── FRAMING section ───────────────────────────────────────────────
-        self.results_txt.insert(tk.END, "━ FRAMING ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_framing")
-        self.results_txt.insert(tk.END, "  Image scale: ", "dim")
-        self.results_txt.insert(tk.END, f"{scale:.2f}\"/px ", "highlight")
-        self.results_txt.insert(tk.END, f"({status})\n", tag)
-        self.results_txt.insert(tk.END, "  Focal length: ", "dim")
-        self.results_txt.insert(tk.END, f"{eff_fl:.0f}mm (f/{eff_f_ratio:.1f})\n")
-        self.results_txt.insert(tk.END, "  FOV: ", "dim")
-        self.results_txt.insert(tk.END, f"{fw:.2f}° × {fh:.2f}°\n")
-        f_fits = (t_maj < fw and t_min < fh)
-        self.results_txt.insert(tk.END, "  Framing: ", "dim")
-        self.results_txt.insert(tk.END, "✅ Fits sensor\n" if f_fits else "❌ Too big for sensor\n",
-                                "optimal" if f_fits else "warning")
-        self.results_txt.insert(tk.END, "\n")
-
-        # ── EXPOSURE section ──────────────────────────────────────────────
-        self.results_txt.insert(tk.END, "━ EXPOSURE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_exposure")
-        self.results_txt.insert(tk.END, "  Recommended sub: ", "dim")
-        self.results_txt.insert(tk.END, f"{exp:.1f}s\n", "amber")
-        self.results_txt.insert(tk.END, "  Sky flux: ", "dim")
-        self.results_txt.insert(tk.END, f"{sky_flux:.1f} e⁻/px/s\n")
-        self.results_txt.insert(tk.END, "  Read noise: ", "dim")
-        self.results_txt.insert(tk.END, f"{c.get('read_noise', '?')} e⁻\n")
-        # Regime note
-        if sky_flux * exp > float(c.get("read_noise", 3))**2 * 5:
-            regime_text, regime_tag = "Sky-limited ✓", "amber"
-        elif sky_flux * exp > float(c.get("read_noise", 3))**2:
-            regime_text, regime_tag = "Transitional", "highlight"
-        else:
-            regime_text, regime_tag = "Read-noise limited", "warning"
-        self.results_txt.insert(tk.END, "  Regime: ", "dim")
-        self.results_txt.insert(tk.END, f"{regime_text}\n", regime_tag)
-        self.results_txt.insert(tk.END, "\n")
-
-        # ── Moon separation (shared with the target-card moon line) ────────
-        moon_tag, _moon_icon, _moon_note, moon_impact, illum_pct, sep_deg = \
-            self._moon_condition(t["ra_deg"], t["dec_deg"])
-
-        # Store values the integration planner needs
-        self._last_exp_s    = exp
-        self._last_sky_flux = sky_flux
-
-        # ── Best imaging window ───────────────────────────────────────────
+        # ── Tonight's imaging window → start/end markers on the chart ─────
+        self._last_win_start = self._last_win_end = None
         lat, lon = self._get_saved_location()
         if lat is not None:
             _min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
-            win_start, win_end, win_hrs, peak_t, peak_a, _ = _calc_best_imaging_window(
+            win_start, win_end, _win_hrs, _peak_t, _peak_a, _ = _calc_best_imaging_window(
                 t["ra_deg"], t["dec_deg"], lat, lon, min_alt=_min_alt)
-            self._last_win_hrs   = win_hrs if win_hrs else None
             self._last_win_start = win_start
             self._last_win_end   = win_end
-            # Auto-fill the (headless) allocated-hours state that
-            # show_integration_plan reads, from tonight's actual dark
-            # window.
-            if win_hrs and win_hrs > 0:
-                # Use default_alloc_hrs from settings if configured, else window
-                default_alloc = self.data.get("settings", {}).get("default_alloc_hrs", "0")
-                try:
-                    default_alloc_f = float(default_alloc)
-                except (ValueError, TypeError):
-                    default_alloc_f = 0
-                if default_alloc_f > 0:
-                    self.session_hours_var.set(f"{default_alloc_f:.1f}")
-                else:
-                    self.session_hours_var.set(f"{win_hrs:.1f}")
-
-            # ── TONIGHT'S WINDOW section ──────────────────────────────────
-            self.results_txt.insert(tk.END, "━ TONIGHT'S WINDOW ━━━━━━━━━━━━━━━━━━━━\n", "sec_window")
-            if win_start:
-                self.results_txt.insert(tk.END, "  Window: ", "dim")
-                self.results_txt.insert(tk.END, f"{win_start} – {win_end}", "optimal")
-                self.results_txt.insert(tk.END, f"  ({win_hrs}h)\n", "optimal")
-                self.results_txt.insert(tk.END, "  Peak alt: ", "dim")
-                self.results_txt.insert(tk.END, f"{peak_a}° at {peak_t}\n")
-                try:
-                    transit_str = _calc_transit_time(t["ra_deg"], lon)
-                    self.results_txt.insert(tk.END, "  Transit: ", "dim")
-                    self.results_txt.insert(tk.END, f"{transit_str}\n")
-                except Exception:
-                    pass
-            else:
-                self.results_txt.insert(tk.END, "  ")
-                self.results_txt.insert(tk.END,
-                    f"⚠️ Target below {int(_min_alt)}° during all dark hours tonight\n",
-                    "warning")
-            self.results_txt.insert(tk.END, "\n")
-
-            # ── MOON section ──────────────────────────────────────────────
-            self.results_txt.insert(tk.END, "━ MOON ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_moon")
-            self.results_txt.insert(tk.END, "  Separation: ", "dim")
-            self.results_txt.insert(tk.END, f"{sep_deg:.0f}°\n", moon_tag)
-            self.results_txt.insert(tk.END, "  Illumination: ", "dim")
-            self.results_txt.insert(tk.END, f"{illum_pct}%\n", moon_tag)
-            self.results_txt.insert(tk.END, "  Impact: ", "dim")
-            self.results_txt.insert(tk.END, f"{moon_impact}\n", moon_tag)
-
-            # Draw altitude chart
+            # Draw altitude chart (skips itself when no Frame dialog is open)
             self.root.after(10, lambda tgt=t, la=lat, lo=lon: self._draw_altitude_chart(tgt, la, lo))
-
-        cw, ch = 240, 240
 
         # Store FOV params so the image callback can draw the overlay
         self._fov_params = (fw, fh, t_maj, t_min)
 
         needed_survey = _dss_survey_size_deg(fw, fh)
 
+        # Tonight's-plan framing for this target on this rig, if any (see the
+        # reset branch below for why it matters).
+        existing_framed = self._saved_plan_framing(t['id'], s_name, c_name)
+
         cached_ok = (self._cached_dss_img is not None
                      and self._cached_dss_target == t['id']
                      and self._cached_dss_survey_deg is not None
                      and 0.5 <= needed_survey / self._cached_dss_survey_deg <= 2.0)
 
-        if cached_ok:
+        if not self._frame_view_open():
+            # No Frame dialog open (e.g. a Bortle change re-ran this
+            # analysis): the headless numbers above are still refreshed,
+            # but there's no framing view to reset, restore or fetch for.
+            pass
+        elif cached_ok:
+            # Opening the Frame dialog on a planned target shows the PLAN's
+            # framing even when the DSS image is still cached from an earlier
+            # look — otherwise it showed whatever pan/rotation was left in
+            # memory, so a framing changed since (e.g. sent from the sky
+            # map's frame composer) didn't appear.  Only on dialog open
+            # (restore_saved_framing): other re-analyses keep in-progress,
+            # not-yet-confirmed edits.
+            if restore_saved_framing and existing_framed is not None:
+                self._fov_offset_x = 0.0
+                self._fov_offset_y = 0.0
+                self._fov_angle    = 0.0
+                self._zoom_level   = 1.0
+                self._set_frame_label("zoom", "1.0×")
+                self._pending_frame_restore = self._frame_restore_from(t, existing_framed)
+                self._apply_pending_frame_restore(t['id'], self._cached_dss_survey_deg)
+                self._skymap_log(f"Frame dialog {t['id']}: restored PA "
+                                 f"{existing_framed.get('rotation_angle')} (cached DSS)")
             self._draw_fov_overlay(self._cached_dss_img, self._cached_dss_survey_deg, t['id'])
         else:
             # New target or FOV scale changed significantly — reset framing and fetch fresh DSS.
@@ -10602,35 +9705,31 @@ class AstroApp:
             # image's fetched survey size and the canvas width, neither
             # known until the fetch below completes — so it's only STAGED
             # here; _show_dss_result applies it once those are known.
-            existing_framed = next(
-                (pe for pe in self._plan_entries
-                 if pe["target_id"] == t['id'] and pe.get("scope") == s_name
-                 and pe.get("camera") == c_name and pe.get("filter_mode") == self.filter_mode.get()
-                 and (pe.get("rotation_angle") or pe.get("framed_ra_deg") is not None)),
-                None)
             self._fov_offset_x = 0.0
             self._fov_offset_y = 0.0
             self._fov_angle    = 0.0
             self._zoom_level   = 1.0
-            self._pending_frame_restore = {
-                "target_id":      t['id'],
-                "ra0_deg":        t['ra_deg'],
-                "dec0_deg":       t['dec_deg'],
-                "framed_ra_deg":  existing_framed.get("framed_ra_deg"),
-                "framed_dec_deg": existing_framed.get("framed_dec_deg"),
-                "rotation_angle": existing_framed.get("rotation_angle", 0.0) or 0.0,
-            } if existing_framed is not None else None
-            self._rot_label.config(text=f"{self._screen_to_sky_pa(0.0):.1f}°")
-            self._zoom_label.config(text="1.0×")
+            self._pending_frame_restore = (self._frame_restore_from(t, existing_framed)
+                                           if existing_framed is not None else None)
+            self._restored_framing = None
+            self._set_frame_label("rot", f"{self._screen_to_sky_pa(0.0):.1f}°")
+            if self._pending_frame_restore is not None:
+                # Apply the saved framing NOW (rotation exactly, pan at the
+                # expected survey scale) rather than only when the DSS image
+                # lands: if the download is slow or fails — far more common
+                # on Windows — the dialog still shows, and Update keeps, the
+                # saved framing.  The landing image re-applies it at its
+                # true scale.
+                self._apply_pending_frame_restore(t['id'], needed_survey, consume=False)
+                self._skymap_log(
+                    f"Frame dialog {t['id']}: restored PA {self._pending_frame_restore['rotation_angle']} "
+                    f"centre {self._pending_frame_restore['framed_ra_deg']}, "
+                    f"{self._pending_frame_restore['framed_dec_deg']} (before DSS)")
+            self._set_frame_label("zoom", "1.0×")
             self.preview_canvas.delete("all")
-            _lw = self.preview_canvas.winfo_width() or cw
-            _lh = self.preview_canvas.winfo_height() or ch
+            _lw, _lh = self._preview_size()
             self.preview_canvas.create_text(_lw//2, _lh//2, text="Loading DSS image…", fill="yellow", font=("Helvetica", 9))
             self.root.after(50, lambda: self.fetch_thumbnail(t, fw, fh))
-
-        # Refresh the headless integration-plan state for the current target
-        # (read by the Frame dialog / NINA export, not displayed directly)
-        self.root.after(20, lambda: self.show_integration_plan(silent=True))
 
     def _sample_altitude_series(self, t, lat, lon):
         """Sample a target's altitude across tonight's nautical-dark window.
@@ -10729,6 +9828,8 @@ class AstroApp:
 
     def _draw_altitude_chart(self, t, lat, lon):
         """Draw an altitude-vs-time chart covering tonight's nautical dark window."""
+        if not self._chart_view_open():
+            return   # no Frame dialog open — nothing to draw into
         canvas = self.alt_canvas
         canvas.update_idletasks()
         cw = canvas.winfo_width() or 860
@@ -10777,7 +9878,7 @@ class AstroApp:
             moon_set_label = f"🌑 {int(lh):02d}:{int((lh%1)*60):02d}"
 
         # ── Layout ─────────────────────────────────────────────────────────
-        lm, rm, tm, bm = 46, 16, 22, 28
+        lm, rm, tm, bm = 46, 16, 26, 28
         pw = cw - lm - rm
         ph = ch - tm - bm
 
@@ -10950,11 +10051,20 @@ class AstroApp:
                            fill="#ffff00", outline="")
 
         label  = f"▲ {peak_alt:.0f}°  @  {ph_val:02d}:{pm_val:02d}"
-        anchor = "sw" if peak_x < lm + pw * 0.65 else "se"
-        ox     = 9 if anchor == "sw" else -9
-        canvas.create_text(peak_x + ox + 1, peak_y - 7, text=label,
+        left_half = peak_x < lm + pw * 0.65
+        ox     = 9 if left_half else -9
+        # A label drawn above the marker needs ~14px; when the peak is
+        # that close to the plot top it would ride up into the chart title
+        # (high-altitude targets), so put it below the marker instead.
+        if peak_y - 8 - 14 < tm:
+            anchor = "nw" if left_half else "ne"
+            ly = peak_y + 8
+        else:
+            anchor = "sw" if left_half else "se"
+            ly = peak_y - 8
+        canvas.create_text(peak_x + ox + 1, ly + 1, text=label,
                            fill="#000000", font=("Helvetica", 9, "bold"), anchor=anchor)
-        canvas.create_text(peak_x + ox,     peak_y - 8, text=label,
+        canvas.create_text(peak_x + ox,     ly,     text=label,
                            fill="#ffee44",  font=("Helvetica", 9, "bold"), anchor=anchor)
 
         # ── Border & title ───────────────────────────────────────────────────
@@ -11002,6 +10112,8 @@ class AstroApp:
         instead" pill, and only actually displays a picture once the full
         request lands, the user cancels, or the slow lane gives up.
         """
+        if not self._frame_view_open():
+            return   # the Frame dialog closed before this deferred fetch fired
         target_id = target_info['id']
 
         # Survey size: show enough sky so the FOV fits with some padding.
@@ -11021,7 +10133,7 @@ class AstroApp:
             # fast before the wide-FOV wait state existed, and still is.
             threading.Thread(
                 target=self._fetch_dss_lane,
-                args=(target_id, fast_lane,
+                args=(target_info, fast_lane,
                       lambda img, deg: self._show_dss_result(target_id, img, deg, token),
                       lambda: self._show_fov_error(target_id, token)),
                 daemon=True).start()
@@ -11060,27 +10172,37 @@ class AstroApp:
                 self._show_fov_error(target_id, token)
 
         threading.Thread(target=self._fetch_dss_lane,
-                          args=(target_id, fast_lane, _fast_success, _fast_failed),
+                          args=(target_info, fast_lane, _fast_success, _fast_failed),
                           daemon=True).start()
         threading.Thread(target=self._fetch_dss_lane,
-                          args=(target_id, [slow_lane], _slow_success, _slow_failed),
+                          args=(target_info, [slow_lane], _slow_success, _slow_failed),
                           daemon=True).start()
 
-    def _fetch_dss_lane(self, target_id, lane_attempts, on_success, on_all_failed):
+    def _fetch_dss_lane(self, target, lane_attempts, on_success, on_all_failed):
         """Run one DSS fetch lane (an ordered list of (size_deg, timeout_s)
         attempts) on a background thread, trying each size until one
         succeeds. Pure I/O + Tk-safe callback scheduling — does no direct
         Tk calls itself, so it's safe to run from any thread.
 
+        ``target`` is the target record.  SkyView is asked for the image by
+        its J2000 coordinates, not its name: a name makes SkyView resolve it
+        through SIMBAD/NED, which fails outright for custom targets (sky-map
+        fields like "Field J0536-0513" come back as an HTML error page) and,
+        for catalog objects, can centre the image on SIMBAD's position rather
+        than the catalog position the framing overlay and NINA export use.
+
         ``on_success(img, fetched_deg)`` / ``on_all_failed()`` are invoked
         on the main thread via ``root.after(0, ...)``.
         """
+        target_id = target["id"]
+        position = f"{float(target['ra_deg']) % 360.0:.6f},{float(target['dec_deg']):.6f}"
         for size_deg, timeout_s in lane_attempts:
             try:
                 pixels = 600  # fetch high-res, we'll downscale
                 url = (
                     f"https://skyview.gsfc.nasa.gov/current/cgi/runquery.pl"
-                    f"?Survey=DSS2+Red&Position={urllib.request.quote(target_id)}"
+                    f"?Survey=DSS2+Red&Position={urllib.request.quote(position)}"
+                    f"&Coordinates=J2000"
                     f"&Size={size_deg:.4f}&Pixels={pixels}&Return=GIF&Catalog=none"
                 )
                 req = urllib.request.Request(url, headers={"User-Agent": f"LightbucketAstroPlanner/{__version__}"})
@@ -11138,23 +10260,101 @@ class AstroApp:
         self._cached_dss_target = target_id
         self._cached_dss_survey_deg = fetched_deg
         self._fov_result_token = token
+        if not self._frame_view_open():
+            # Dialog closed while this was downloading: keep the image
+            # cached (reopening the same target shows it instantly) but
+            # leave any staged framing restore for the next open.
+            return
         self._apply_pending_frame_restore(target_id, fetched_deg)
         self._draw_fov_overlay(img, fetched_deg, target_id)
 
-    def _apply_pending_frame_restore(self, target_id, survey_deg):
+    def _preview_size(self):
+        """(width, height) of the FOV preview canvas, safe before it's on
+        screen.  Tk reports 1×1 for a widget that isn't mapped yet (1, not 0,
+        so the old ``winfo_width() or 240`` never fell back).  On Windows the
+        Frame dialog is often not mapped yet when its first analysis runs,
+        which turned a restored pan into a near-zero pixel offset.  Falls
+        back to the canvas's configured size, then 240."""
+        c = self.preview_canvas
+        if not self._frame_view_open():
+            return self._FRAME_FOV_PX, self._FRAME_FOV_PX
+        w, h = c.winfo_width(), c.winfo_height()
+        if w <= 1 or h <= 1:
+            try:
+                if w <= 1:
+                    w = int(float(c.cget("width")))
+                if h <= 1:
+                    h = int(float(c.cget("height")))
+            except (tk.TclError, ValueError):
+                pass
+        return (w if w > 1 else 240), (h if h > 1 else 240)
+
+    def _skymap_log(self, msg):
+        """Append a line to skymap.log in the app's data folder — the trail
+        of sky-map hand-offs and Frame-dialog restores.  The packaged Windows
+        build has no console, so this is where those events can be checked."""
+        try:
+            path = self.data_path.parent / "skymap.log"
+            if path.exists() and path.stat().st_size > 256 * 1024:
+                path.write_text("", encoding="utf-8")
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {msg}\n")
+        except Exception:
+            pass
+
+    def _saved_plan_framing(self, target_id, scope, camera):
+        """The plan row holding this target's saved framing (a pan and/or a
+        rotation), or None.  Prefers this rig + the active filter mode, then
+        any filter on this rig (an LRGB row and an Ha row of one target point
+        the same way), then the most recent framed row on ANY rig — a
+        framing's centre and PA are sky positions, valid whatever rig opens
+        the dialog (e.g. the sky map was opened with a different active rig
+        than the Frame dialog uses)."""
+        framed = [pe for pe in self._plan_entries
+                  if pe["target_id"] == target_id
+                  and (pe.get("rotation_angle") or pe.get("framed_ra_deg") is not None)]
+        if not framed:
+            return None
+        fm = self.filter_mode.get()
+        same_rig = [pe for pe in framed if pe.get("scope") == scope and pe.get("camera") == camera]
+        if same_rig:
+            return next((pe for pe in same_rig if pe.get("filter_mode") == fm), same_rig[0])
+        return framed[-1]
+
+    @staticmethod
+    def _frame_restore_from(t, pe):
+        """Staged-restore dict for _apply_pending_frame_restore from a plan row."""
+        return {
+            "target_id":      t['id'],
+            "ra0_deg":        t['ra_deg'],
+            "dec0_deg":       t['dec_deg'],
+            "framed_ra_deg":  pe.get("framed_ra_deg"),
+            "framed_dec_deg": pe.get("framed_dec_deg"),
+            "rotation_angle": pe.get("rotation_angle", 0.0) or 0.0,
+        }
+
+    def _apply_pending_frame_restore(self, target_id, survey_deg, consume=True):
         """Restore a previously-saved pan/rotation staged by
         _analyze_framing_impl's reset branch, now that the DSS fetch has
         landed and the survey size (needed to convert the saved RA/Dec back
         into pixels) is finally known. Consumes (clears) the staged restore
         either way, so it's never mistakenly reapplied to a later, unrelated
-        fetch for a different target."""
+        fetch for a different target.  ``consume=False`` applies it early
+        (at an estimated survey size) and leaves it staged for the image.
+
+        Also remembers the restore in ``_restored_framing`` together with the
+        pixel pan it produced: while the pan is untouched, _framed_center
+        returns the saved centre exactly — no pixel round trip, and no
+        dependence on a DSS image having loaded."""
         pending = getattr(self, "_pending_frame_restore", None)
-        self._pending_frame_restore = None
+        if consume:
+            self._pending_frame_restore = None
         if pending is None or pending["target_id"] != target_id:
             return
+        self._restored_framing = dict(pending, off_x=0.0, off_y=0.0, survey_deg=survey_deg)
 
         self._fov_angle = self._screen_to_sky_pa(pending["rotation_angle"])
-        self._rot_label.config(text=f"{pending['rotation_angle']:.1f}°")
+        self._set_frame_label("rot", f"{pending['rotation_angle']:.1f}°")
 
         framed_ra, framed_dec = pending["framed_ra_deg"], pending["framed_dec_deg"]
         if framed_ra is None or framed_dec is None:
@@ -11166,7 +10366,7 @@ class AstroApp:
         # same px_per_deg source of truth _framed_center/_draw_fov_overlay
         # already share.
         zoom       = getattr(self, "_zoom_level", 1.0) or 1.0
-        canvas_w   = self.preview_canvas.winfo_width() or 240
+        canvas_w   = self._preview_size()[0]
         deg_per_px = survey_deg / (canvas_w * zoom)
         if deg_per_px <= 0:
             return
@@ -11179,6 +10379,7 @@ class AstroApp:
 
         self._fov_offset_x = -d_east_deg / deg_per_px
         self._fov_offset_y = -d_north_deg / deg_per_px
+        self._restored_framing.update(off_x=self._fov_offset_x, off_y=self._fov_offset_y)
 
     def _show_fov_error(self, target_id, token):
         """Show the geometric-ellipse fallback — every lane relevant to
@@ -11189,7 +10390,8 @@ class AstroApp:
         if token != self._fov_wait_token:
             return
         self._cancel_fov_wait_tick()
-        self._fov_image_error()
+        if self._frame_view_open():
+            self._fov_image_error()
 
     def _cancel_fov_wait_tick(self):
         """Stop the wide-field wait screen's spinner/elapsed-timer redraw
@@ -11211,9 +10413,12 @@ class AstroApp:
         cur = self.current_target_info
         if cur is None or cur.get("id") != self._fov_wait_target:
             return
+        if not self._frame_view_open():
+            self._cancel_fov_wait_tick()
+            return
 
-        cw = self.preview_canvas.winfo_width() or 240
-        ch = self.preview_canvas.winfo_height() or 240
+        cw = self._preview_size()[0]
+        ch = self._preview_size()[1]
         self.preview_canvas.delete("all")
         self.preview_canvas.create_rectangle(0, 0, cw, ch, fill="#0a1420", outline="")
 
@@ -11284,8 +10489,10 @@ class AstroApp:
 
     def _draw_fov_overlay(self, dss_img, survey_deg, target_id):
         """Scale DSS image to the canvas and draw the sensor FOV rectangle (with pan/rotate) on top."""
-        cw = self.preview_canvas.winfo_width() or 240
-        ch = self.preview_canvas.winfo_height() or 240
+        if not self._frame_view_open():
+            return
+        cw = self._preview_size()[0]
+        ch = self._preview_size()[1]
 
         # Apply zoom: center-crop a 1/zoom fraction of the image then resize to canvas
         zoom = max(1.0, self._zoom_level)
@@ -11296,6 +10503,8 @@ class AstroApp:
         top   = (orig_h - crop_h) / 2
         dss_cropped = dss_img.crop((left, top, left + crop_w, top + crop_h))
         dss_resized = dss_cropped.resize((cw, ch), Image.Resampling.LANCZOS)
+        if getattr(self, "night_mode", False):
+            dss_resized = self._night_sky_image(dss_resized)
         photo = ImageTk.PhotoImage(dss_resized)
         self._fov_photo = photo
 
@@ -11343,8 +10552,14 @@ class AstroApp:
         # what to check: if it's smaller than expected, a large request
         # fell back to a smaller one (see the [DSS fetch] console log for
         # why) rather than the frame math being wrong.
-        label = (f"{target_id}  {'✅ fits' if fits else '❌ too big'}  "
-                 f"{self._screen_to_sky_pa(self._fov_angle):.1f}°  ·  img {survey_deg:.1f}°")
+        fit_txt = '✅ fits' if fits else '❌ too big'
+        t_cur = self.current_target_info
+        if self._fov_params and t_cur is not None and t_cur.get("id") == target_id:
+            fr = self._target_framing(t_cur, self._fov_params[0], self._fov_params[1])
+            fit_txt = (f"✅ fits · {fr['span_pct']:.0f}% span" if fr["fits"]
+                       else "❌ too big")
+        label = (f"{target_id}  {fit_txt}  ·  "
+                 f"PA {self._screen_to_sky_pa(self._fov_angle):.1f}°  ·  img {survey_deg:.1f}°")
         self.preview_canvas.create_text(cw//2+1, ch-9,  text=label, fill="black", font=("Helvetica", 8, "bold"))
         self.preview_canvas.create_text(cw//2,   ch-10, text=label, fill="white", font=("Helvetica", 8, "bold"))
 
@@ -11359,8 +10574,8 @@ class AstroApp:
 
     def _fov_centre(self):
         """Return the current (x, y) centre of the FOV overlay on the preview canvas."""
-        cw = self.preview_canvas.winfo_width() or 240
-        ch = self.preview_canvas.winfo_height() or 240
+        cw = self._preview_size()[0]
+        ch = self._preview_size()[1]
         return cw / 2 + self._fov_offset_x, ch / 2 + self._fov_offset_y
 
     @staticmethod
@@ -11392,9 +10607,8 @@ class AstroApp:
 
         The preview maps sky to canvas as px_per_deg = canvas_width / survey_deg
         * zoom, and the pan is accumulated in canvas pixels (self._fov_offset_x/y).
-        Reads the live preview canvas width so this stays correct regardless of
-        which widget self.preview_canvas currently points at (the Planner tab's
-        240px canvas, or the Frame dialog's larger one) — same source of truth
+        Reads the Frame dialog's live canvas width (_preview_size) — same
+        source of truth
         ``_draw_fov_overlay``/``_fov_centre`` use, so all three always agree on
         the same pixel scale.  SkyView DSS2 images are North-up / East-left, so
         screen +x is West and screen +y is South.  The box centre is positioned
@@ -11409,11 +10623,22 @@ class AstroApp:
         survey_deg = getattr(self, "_cached_dss_survey_deg", None)
         zoom       = getattr(self, "_zoom_level", 1.0) or 1.0
 
+        # A saved framing was restored for this target and the pan hasn't
+        # been touched since: that saved centre, exactly.  (Independent of
+        # whether — or at what scale — a DSS image loaded.)
+        r = getattr(self, "_restored_framing", None)
+        if (r and r.get("framed_ra_deg") is not None
+                and abs(r["ra0_deg"] - ra0_deg) < 1e-9 and abs(r["dec0_deg"] - dec0_deg) < 1e-9):
+            if abs(offset_x - r["off_x"]) < 0.5 and abs(offset_y - r["off_y"]) < 0.5:
+                return r["framed_ra_deg"], r["framed_dec_deg"]
+            if not survey_deg or self._cached_dss_target != r["target_id"]:
+                survey_deg = r["survey_deg"]      # panned before any image landed
+
         # No pan, or no scale to convert pixels to degrees -> catalog centre.
         if (offset_x == 0.0 and offset_y == 0.0) or not survey_deg:
             return ra0_deg, dec0_deg
 
-        canvas_w    = self.preview_canvas.winfo_width() or 240
+        canvas_w    = self._preview_size()[0]
         deg_per_px  = survey_deg / (canvas_w * zoom)
         d_east_deg  = -offset_x * deg_per_px   # screen +x (right) = West  = -East
         d_north_deg = -offset_y * deg_per_px   # screen +y (down)  = South = -North
@@ -11453,7 +10678,7 @@ class AstroApp:
             current_angle = math.degrees(math.atan2(event.y - cy, event.x - cx))
             delta = current_angle - self._rotate_start_angle
             self._fov_angle = (self._rotate_fov_start + delta) % 360
-            self._rot_label.config(text=f"{self._screen_to_sky_pa(self._fov_angle):.1f}°")
+            self._set_frame_label("rot", f"{self._screen_to_sky_pa(self._fov_angle):.1f}°")
             self._redraw_fov_overlay()
 
     def _fov_mouse_up(self, event):
@@ -11463,6 +10688,8 @@ class AstroApp:
 
     def _fov_mouse_hover(self, event):
         """Change cursor to indicate grab handles."""
+        if not self._frame_view_open():
+            return
         if self._fov_corners and self._fov_corner_hit(event.x, event.y) is not None:
             self.preview_canvas.config(cursor="exchange")
         else:
@@ -11471,7 +10698,7 @@ class AstroApp:
     def _apply_zoom(self, factor):
         """Multiply zoom by factor, clamp to 1×–16×, then redraw."""
         self._zoom_level = max(1.0, min(16.0, self._zoom_level * factor))
-        self._zoom_label.config(text=f"{self._zoom_level:.1f}×")
+        self._set_frame_label("zoom", f"{self._zoom_level:.1f}×")
         self._redraw_fov_overlay()
 
     def _fov_mousewheel(self, event):
@@ -11487,8 +10714,8 @@ class AstroApp:
         self._fov_offset_y = 0.0
         self._fov_angle    = 0.0
         self._zoom_level   = 1.0
-        self._rot_label.config(text=f"{self._screen_to_sky_pa(0.0):.1f}°")
-        self._zoom_label.config(text="1.0×")
+        self._set_frame_label("rot", f"{self._screen_to_sky_pa(0.0):.1f}°")
+        self._set_frame_label("zoom", "1.0×")
         self._redraw_fov_overlay()
 
     def _redraw_fov_overlay(self):
@@ -11499,8 +10726,10 @@ class AstroApp:
 
     def _fov_image_error(self):
         """Display 'DSS image unavailable' fallback on the preview canvas."""
-        cw = self.preview_canvas.winfo_width() or 240
-        ch = self.preview_canvas.winfo_height() or 240
+        if not self._frame_view_open():
+            return
+        cw = self._preview_size()[0]
+        ch = self._preview_size()[1]
         self.preview_canvas.delete("all")
         self.preview_canvas.create_text(cw//2, ch//2 - 10, text="DSS image unavailable", fill="gray", font=("Helvetica", 9))
         self.preview_canvas.create_text(cw//2, ch//2 + 10, text="(check network)", fill="gray", font=("Helvetica", 8))
@@ -11559,7 +10788,7 @@ class AstroApp:
         self._explore_hilite = None      # key of hover-highlighted rig, or None
         self._explore_active_rig_key = None  # key of the rig whose report shows on the right
         self._explore_photo = None       # keep PhotoImage alive
-        self._explore_photo_cache = None # (img ref, deg, zoom, photo) → avoid re-resizing per hover
+        self._explore_photo_cache = None # (img ref, deg, zoom, photo, night) → avoid re-resizing per hover
         self._explore_pa_deg = 0.0       # shared NINA-style sky PA (CCW N→E); applied to every visible rig frame
         self._explore_zoom   = 1.0       # shared zoom (1.0–16.0), crop+resize of the fetched image
         self._explore_redraw_after_id = None  # throttle guard — see _explore_schedule_redraw
@@ -11593,7 +10822,7 @@ class AstroApp:
         outer.pack(fill="both", expand=True)
 
         # ── Left rail ─────────────────────────────────────────────────────
-        rail = tk.Frame(outer, bg=RAIL_BG, width=276)
+        rail = tk.Frame(outer, bg=RAIL_BG, width=330)   # 330: room for rig names on Windows fonts
         rail.pack(side="left", fill="y")
         rail.pack_propagate(False)
 
@@ -11612,7 +10841,7 @@ class AstroApp:
 
         self._explore_target_lbl = tk.Label(rail, text="No target selected", bg=RAIL_BG,
                                             fg="#778899", font=("Helvetica", 9),
-                                            anchor="w", justify="left", wraplength=248)
+                                            anchor="w", justify="left", wraplength=302)
         self._explore_target_lbl.pack(fill="x", padx=12, pady=(3, 6))
 
         tk.Frame(rail, bg="#2a3642", height=1).pack(fill="x", padx=12)
@@ -11990,6 +11219,10 @@ class AstroApp:
             self.explore_camera_var.set(rig["camera"])
         if rig.get("reduction"):
             self.explore_reduction_var.set(rig["reduction"])
+        # Carry the rig's filter too, so the analyzed card matches the saved
+        # rig exactly (and shows its name rather than TRIAL)
+        if rig.get("filter"):
+            self.explore_filter_var.set(rig["filter"])
         self._explore_analyze()
 
     # ── Image management ──────────────────────────────────────────────────
@@ -12080,7 +11313,7 @@ class AstroApp:
             self._explore_redraw()
             threading.Thread(
                 target=self._fetch_dss_lane,
-                args=(target_id, fast_lane,
+                args=(t, fast_lane,
                       lambda img, deg: self._explore_show_result(target_id, seq, img, deg, token),
                       lambda: self._explore_show_error(target_id, seq, token)),
                 daemon=True).start()
@@ -12118,10 +11351,10 @@ class AstroApp:
                 self._explore_show_error(target_id, seq, token)
 
         threading.Thread(target=self._fetch_dss_lane,
-                          args=(target_id, fast_lane, _fast_success, _fast_failed),
+                          args=(t, fast_lane, _fast_success, _fast_failed),
                           daemon=True).start()
         threading.Thread(target=self._fetch_dss_lane,
-                          args=(target_id, [slow_lane], _slow_success, _slow_failed),
+                          args=(t, [slow_lane], _slow_success, _slow_failed),
                           daemon=True).start()
 
     def _explore_show_result(self, target_id, seq, img, fetched_deg, token):
@@ -12466,7 +11699,9 @@ class AstroApp:
             # reuses its address for the new one, so (id, span, zoom) collides
             # and the canvas silently shows the previous target's picture.
             cache = self._explore_photo_cache
-            if cache and cache[0] is v["img"] and cache[1] == span and cache[2] == zoom:
+            nm_img = getattr(self, "night_mode", False)
+            if (cache and cache[0] is v["img"] and cache[1] == span
+                    and cache[2] == zoom and cache[4] == nm_img):
                 photo = cache[3]
             else:
                 src = v["img"]
@@ -12479,8 +11714,10 @@ class AstroApp:
                     left, top = (orig_w - crop_w) / 2, (orig_h - crop_h) / 2
                     src = src.crop((left, top, left + crop_w, top + crop_h))
                 resized = src.resize((cpx, cpx), Image.Resampling.LANCZOS)
+                if nm_img:
+                    resized = self._night_sky_image(resized)
                 photo = ImageTk.PhotoImage(resized)
-                self._explore_photo_cache = (v["img"], span, zoom, photo)
+                self._explore_photo_cache = (v["img"], span, zoom, photo, nm_img)
             self._explore_photo = photo
             cv.create_image(0, 0, anchor="nw", image=photo)
         else:
@@ -12655,6 +11892,53 @@ class AstroApp:
 
     # ── Legend cards ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _target_framing(t, fov_w, fov_h):
+        """How a target sits in a sensor frame — the one place fit/fill
+        numbers are computed, so every display agrees.
+
+        Returns a dict:
+          fits      — major axis fits the frame width and minor axis its height
+          span_pct  — linear span: the target's major axis as a % of the
+                      frame's SHORT side. Orientation-free (the target's own
+                      position angle isn't in the catalog data we use), so it
+                      answers "how big is it in my frame" conservatively.
+          area_pct  — the catalog ellipse's area as a % of the sensor area
+                      (the old "fills N%" figure).
+          maj, min  — the sizes used, in arcmin (min falls back to maj when
+                      the catalog leaves it blank, e.g. OpenNGC's M52).
+          known     — False when the catalog has no size at all and the 10′
+                      placeholder was used.
+          src       — catalog the size came from ("OpenNGC", "Sharpless",
+                      "built-in", "sky map"), or "" if unknown.
+
+        Sizes are degrees in, as fov_w/fov_h are.
+        """
+        maj_raw = t.get("size_maj") or 0.0
+        known = maj_raw > 0
+        maj = maj_raw if known else 10.0
+        mn = t.get("size_min") or maj
+        maj_d, min_d = maj / 60.0, mn / 60.0
+        fits = (maj_d <= fov_w and min_d <= fov_h)
+        short_side = max(min(fov_w, fov_h), 1e-9)
+        span_pct = 100.0 * maj_d / short_side
+        area_pct = min(100.0, 100.0 * (math.pi / 4.0 * maj_d * min_d)
+                       / max(fov_w * fov_h, 1e-9))
+        return dict(fits=fits, span_pct=span_pct, area_pct=area_pct,
+                    maj=maj, min=mn, known=known, src=t.get("size_src", ""))
+
+    @staticmethod
+    def _target_size_note(fr):
+        """Footer text naming the size a framing figure was computed from,
+        e.g. "9.9′ · OpenNGC" or "11′ × 7′ · OpenNGC"."""
+        if not fr["known"]:
+            return "size not in catalog · assumed 10′"
+        if abs(fr["min"] - fr["maj"]) < 0.05:
+            size = f"{fr['maj']:g}′"
+        else:
+            size = f"{fr['maj']:g}′ × {fr['min']:g}′"
+        return f"{size} · {fr['src']}" if fr["src"] else size
+
     def _explore_refresh_cards(self):
         """Rebuild the legend cards (one per analyzed rig) in the left rail.
 
@@ -12669,16 +11953,30 @@ class AstroApp:
         nm = getattr(self, "night_mode", False)
         card_bg    = "#2a0000" if nm else "#1e2d3e"
         border_off = "#331111" if nm else "#2a3642"
-        name_on    = "#cc4444" if nm else "#dddddd"
+        # Option C ("stat tiles") palette — one step larger and lighter than
+        # the old card text so the framing numbers read at a glance.
+        name_on    = "#e05555" if nm else "#f1f5f9"
         name_off   = "#661111" if nm else "#667788"
-        stats_fg   = "#993333" if nm else "#8899aa"
-        eye_on     = "#cc4400" if nm else "#7eb8d4"
+        stats_fg   = "#b34444" if nm else "#b4c3d2"
+        eye_on     = "#dd5500" if nm else "#9fd0e6"
         eye_off    = "#661111" if nm else "#556677"
-        del_fg     = "#993333" if nm else "#667788"
-        fits_fg    = "#cc6600" if nm else "#4caf50"
-        nofit_fg   = "#ff2222" if nm else "#ef5350"
+        del_fg     = "#b34444" if nm else "#8899aa"
+        fits_fg    = "#ff8800" if nm else "#6ee787"
+        nofit_fg   = "#ff3333" if nm else "#ef5350"
+        area_num   = "#dd6666" if nm else "#e2e8f0"
+        tile_lbl   = "#aa4444" if nm else "#a3b3c3"
+        src_fg     = "#883333" if nm else "#8494a6"
+        tile_bg    = "#1a0000" if nm else "#0f1c2a"
+        area_bar   = "#551111" if nm else "#3a5a7a"
         empty_fg   = "#661111" if nm else "#556677"
         empty_bg   = "#1a0000" if nm else self._explore_cards_frame.cget("bg")
+        # Rig-identity badges: "● ON TONIGHT" for the card Tonight's Plan is
+        # using, TRIAL for setups that aren't a saved rig yet.
+        tonight_fg = "#ff6633" if nm else "#38bdf8"
+        tonight_bg = "#1a0000" if nm else "#0f2233"
+        trial_fg   = "#cc5500" if nm else "#f2c14e"
+        trial_bg   = "#1a0000" if nm else "#3a2e10"
+        gear_fg    = "#994444" if nm else "#93a4b6"
 
         frame = self._explore_cards_frame
         for w in frame.winfo_children():
@@ -12694,10 +11992,16 @@ class AstroApp:
         t = self._explore_target
         for r in self._explore_rigs:
             is_active = (r["key"] == self._explore_active_rig_key)
+            saved = self._explore_rig_saved(r)
+            on_tonight = self._explore_rig_on_tonight(r)
             this_bg = active_bg if is_active else card_bg
+            if on_tonight:
+                border = tonight_fg
+            else:
+                border = r["color"] if r["visible"] else border_off
             card = tk.Frame(frame, bg=this_bg,
-                            highlightthickness=2 if is_active else 1,
-                            highlightbackground=r["color"] if r["visible"] else border_off)
+                            highlightthickness=2 if (is_active or on_tonight) else 1,
+                            highlightbackground=border)
             card.pack(fill="x", pady=3)
 
             row1 = tk.Frame(card, bg=this_bg)
@@ -12711,57 +12015,140 @@ class AstroApp:
             sw.create_line(0, 5, 14, 5, **line_kwargs)
 
             name_fg = name_on if r["visible"] else name_off
-            title = f"{r['slot'] + 1}· {r['scope']} · {r['camera']}"
-            if len(title) > 34:
-                title = title[:33] + "…"
-            title += f" · {r['reduction']}"
+            gear = f"{r['scope']} · {r['camera']} · {r['reduction']}"
+            filt = self._explore_rig_filter(r)
+            if filt:
+                gear += f" · {filt}"
+            # Saved rig → its name is the title (gear moves to a subtitle);
+            # unsaved setup → the gear itself is the title, tagged TRIAL.
+            full_title = f"{r['slot'] + 1}· {saved['name']}" if saved else \
+                         f"{r['slot'] + 1}· {r['scope']} · {r['camera']} · {r['reduction']}"
+            # Two-line header: the title gets row1's full width; badges and
+            # the 👁/✕ controls sit on their own line beneath it (row1b), so
+            # a long rig name never fights the badges for space.
+            max_len = 40
+            title = full_title if len(full_title) <= max_len else full_title[:max_len - 1] + "…"
             name_lbl = tk.Label(row1, text=title, bg=this_bg,
-                                fg=name_fg, font=("Helvetica", 9, "bold"), anchor="w")
+                                fg=name_fg, font=("Helvetica", 10, "bold"), anchor="w")
             name_lbl.pack(side="left", padx=(4, 0), fill="x", expand=True)
+            if title != full_title:
+                ToolTip(name_lbl, full_title[full_title.index("· ") + 2:])
 
-            del_lbl = tk.Label(row1, text="✕", bg=this_bg, fg=del_fg,
-                               font=("Helvetica", 9, "bold"), cursor="hand2")
+            row1b = tk.Frame(card, bg=this_bg)
+            row1b.pack(fill="x", padx=(24, 6), pady=(1, 1))
+
+            del_lbl = tk.Label(row1b, text="✕", bg=this_bg, fg=del_fg,
+                               font=("Helvetica", 10, "bold"), cursor="hand2")
             del_lbl.pack(side="right", padx=(2, 0))
             del_lbl.bind("<Button-1>", lambda e, k=r["key"]: self._explore_remove_rig(k))
             ToolTip(del_lbl, "Remove this rig from the comparison")
 
-            eye_lbl = tk.Label(row1, text="👁" if r["visible"] else "‒",
+            eye_lbl = tk.Label(row1b, text="👁" if r["visible"] else "‒",
                                bg=this_bg,
                                fg=eye_on if r["visible"] else eye_off,
-                               font=("Helvetica", 9), cursor="hand2", width=2)
+                               font=("Helvetica", 10), cursor="hand2", width=2)
             eye_lbl.pack(side="right")
             eye_lbl.bind("<Button-1>", lambda e, k=r["key"]: self._explore_toggle_rig(k))
             ToolTip(eye_lbl, "Show / hide this rig's frame")
+
+            badges = []
+            if on_tonight:
+                b = tk.Label(row1b, text="● ON TONIGHT", bg=tonight_bg, fg=tonight_fg,
+                             font=("Helvetica", 7, "bold"), padx=5, pady=0)
+                b.pack(side="left", padx=(0, 4))
+                ToolTip(b, "Tonight's Plan is using this equipment")
+                badges.append(b)
+            if not saved:
+                b = tk.Label(row1b, text="TRIAL", bg=trial_bg, fg=trial_fg,
+                             font=("Helvetica", 7, "bold"), padx=5, pady=0)
+                b.pack(side="left", padx=(0, 4))
+                ToolTip(b, "Not a saved rig yet — use ☆ Save as rig to keep it")
+                badges.append(b)
+
+            gear_lbl = None
+            if saved:
+                gear_lbl = tk.Label(card, text=gear, bg=this_bg, fg=gear_fg,
+                                    font=("Helvetica", 9), anchor="w")
+                gear_lbl.pack(fill="x", padx=24, pady=(0, 0))
 
             stats = (f"{r['fov_w']:.2f}°×{r['fov_h']:.2f}°  ·  "
                      f"{r['scale']:.2f}\"/px  ·  f/{r['f_ratio']:.1f}  ·  "
                      f"{r['eff_fl']:.0f}mm")
             stats_lbl = tk.Label(card, text=stats, bg=this_bg,
-                                 fg=stats_fg, font=("Helvetica", 8), anchor="w")
+                                 fg=stats_fg, font=("Helvetica", 9), anchor="w")
             stats_lbl.pack(fill="x", padx=24, pady=(0, 0))
 
-            extra_widgets = []
+            extra_widgets = [row1b] + badges + ([gear_lbl] if gear_lbl else [])
+
+            def _save_chip(parent, k=r["key"]):
+                chip = tk.Label(parent, text="☆ Save as rig", bg=trial_bg, fg=trial_fg,
+                                font=("Helvetica", 9, "bold"), padx=7, pady=2,
+                                cursor="hand2")
+                chip.pack(side="right", anchor="s", padx=(6, 0))
+                chip.bind("<Button-1>", lambda e: self._explore_save_rig_from_card(k))
+                ToolTip(chip, "Save this setup as a named rig")
+                return chip
             if t is not None:
-                t_maj = (t.get("size_maj") or 10.0) / 60.0
-                t_min = (t.get("size_min") or t.get("size_maj") or 10.0) / 60.0
-                fits = (t_maj <= r["fov_w"] and t_min <= r["fov_h"])
-                fill_pct = min(100.0, 100.0 * (math.pi / 4.0 * t_maj * t_min)
-                               / max(r["fov_w"] * r["fov_h"], 1e-9))
-                fit_txt = (f"✅ fits · target fills {fill_pct:.0f}%" if fits
-                           else "❌ too big for sensor")
-                fit_lbl = tk.Label(card, text=fit_txt, bg=this_bg,
-                                   fg=fits_fg if fits else nofit_fg,
-                                   font=("Helvetica", 8), anchor="w")
-                fit_lbl.pack(fill="x", padx=24, pady=(0, 4))
-                extra_widgets.append(fit_lbl)
+                # Option C stat tiles: span (accent bar in the rig's colour)
+                # and area as big-number tiles, catalog size to the right.
+                # Too-big rigs get a single red span tile instead.
+                fr = self._target_framing(t, r["fov_w"], r["fov_h"])
+                tiles = tk.Frame(card, bg=this_bg)
+                tiles.pack(fill="x", padx=24, pady=(5, 6))
+                extra_widgets.append(tiles)
+
+                def _tile(num, label, num_fg, bar):
+                    box = tk.Frame(tiles, bg=tile_bg)
+                    box.pack(side="left", padx=(0, 6))
+                    tk.Frame(box, bg=bar, width=3).pack(side="left", fill="y")
+                    inner = tk.Frame(box, bg=tile_bg)
+                    inner.pack(side="left", padx=(6, 8), pady=(2, 3))
+                    n = tk.Label(inner, text=num, bg=tile_bg, fg=num_fg,
+                                 font=("Helvetica", 13, "bold"), anchor="w")
+                    n.pack(anchor="w")
+                    l = tk.Label(inner, text=label, bg=tile_bg, fg=tile_lbl,
+                                 font=("Helvetica", 8), anchor="w")
+                    l.pack(anchor="w")
+                    extra_widgets.extend([box, inner, n, l])
+                    return [box, inner, n, l]
+
+                tip = ("Span: the target's long axis as a share of the\n"
+                       "frame's short side. Area: the catalog ellipse's\n"
+                       "area as a share of the sensor.")
+                if fr["fits"]:
+                    for w in _tile(f"{fr['span_pct']:.0f}%", "span", fits_fg, r["color"]):
+                        ToolTip(w, tip)
+                    for w in _tile(f"{fr['area_pct']:.0f}%", "area", area_num, area_bar):
+                        ToolTip(w, tip)
+                else:
+                    for w in _tile(f"{fr['span_pct']:.0f}%", "too big", nofit_fg, nofit_fg):
+                        ToolTip(w, "Too big for this sensor — the target's\n"
+                                   "long axis is wider than the frame.")
+
+                note = self._target_size_note(fr)
+                size_txt, _, src_txt = note.partition(" · ")
+                src_lbl = tk.Label(tiles, text=f"{size_txt}\n{src_txt}" if fr["known"] else note,
+                                   bg=this_bg, fg=src_fg, justify="left",
+                                   font=("Helvetica", 8), anchor="sw",
+                                   wraplength=110)
+                src_lbl.pack(side="left", anchor="s", padx=(2, 0))
+                extra_widgets.append(src_lbl)
+                if not saved:
+                    _save_chip(tiles)
             else:
                 stats_lbl.pack_configure(pady=(0, 4))
+                if not saved:
+                    chip_row = tk.Frame(card, bg=this_bg)
+                    chip_row.pack(fill="x", padx=24, pady=(0, 6))
+                    _save_chip(chip_row)
+                    extra_widgets.append(chip_row)
 
             # Hover — highlight this rig's frame on the canvas
             hover_widgets = [card, row1, sw, name_lbl, stats_lbl, eye_lbl, del_lbl] + extra_widgets
             for w in hover_widgets:
-                w.bind("<Enter>", lambda e, k=r["key"]: self._explore_set_hilite(k))
-                w.bind("<Leave>", lambda e: self._explore_set_hilite(None))
+                # add="+" so the span/area tiles' tooltips survive.
+                w.bind("<Enter>", lambda e, k=r["key"]: self._explore_set_hilite(k), add="+")
+                w.bind("<Leave>", lambda e: self._explore_set_hilite(None), add="+")
 
             # Click (anywhere except the ✕/👁 controls, which have their own
             # actions) — show this rig's report on the right, same as
@@ -12769,6 +12156,27 @@ class AstroApp:
             select_widgets = [card, row1, sw, name_lbl, stats_lbl] + extra_widgets
             for w in select_widgets:
                 w.bind("<Button-1>", lambda e, k=r["key"]: self._explore_select_rig_for_report(k))
+
+    def _explore_save_rig_from_card(self, key):
+        """Explore card's "☆ Save as rig" — name it, save it, show the named look."""
+        r = next((x for x in self._explore_rigs if x["key"] == key), None)
+        if r is None:
+            return
+        name = simpledialog.askstring(
+            "Save as rig", "Name this rig:",
+            initialvalue=f"{r['scope']} · {r['camera']}", parent=self.root)
+        if not name or not name.strip():
+            return
+        snap = {"scope": r["scope"], "reduction": r["reduction"],
+                "camera": r["camera"], "filter": self._explore_rig_filter(r)}
+        if name.strip() == "Custom…":
+            messagebox.showerror("Reserved name",
+                                 "\"Custom…\" is a reserved label — please choose another name.")
+            return
+        if self._save_rig_snapshot(name, snap, parent=self.root):
+            self._show_toast(f"Saved rig: {name.strip()}")
+            self._update_rig_indicator()
+            self._explore_refresh_cards()
 
     def _explore_set_hilite(self, key):
         """Set / clear the hover-highlighted rig and redraw the frames."""
@@ -12846,7 +12254,8 @@ class AstroApp:
             status, tag = "Optimal", "optimal"
         else:
             status, tag = "Under-sampled", "warning"
-        f_fits = (t_maj < r["fov_w"] and t_min < r["fov_h"])
+        fr = self._target_framing(t, r["fov_w"], r["fov_h"])
+        f_fits = fr["fits"]
 
         b_data = BORTLE_FACTORS.get(self.bortle_choice.get(),
                                     BORTLE_FACTORS.get("4 (Rural/Suburban)"))
@@ -12879,7 +12288,7 @@ class AstroApp:
                 transit_str = None
 
         return dict(
-            status=status, tag=tag, f_fits=f_fits, exp=exp, sky_flux=sky_flux,
+            status=status, tag=tag, f_fits=f_fits, fr=fr, exp=exp, sky_flux=sky_flux,
             read_noise=read_noise, regime_text=regime_text, regime_tag=regime_tag,
             moon_tag=moon_tag, moon_impact=moon_impact, illum_pct=illum_pct, sep_deg=sep_deg,
             win_start=win_start, win_end=win_end, win_hrs=win_hrs, peak_t=peak_t, peak_a=peak_a,
@@ -12941,9 +12350,21 @@ class AstroApp:
         txt.insert(tk.END, f"{r['eff_fl']:.0f}mm (f/{r['f_ratio']:.1f})\n")
         txt.insert(tk.END, "  FOV: ", "dim")
         txt.insert(tk.END, f"{r['fov_w']:.2f}° × {r['fov_h']:.2f}°\n")
+        fr = rep['fr']
         txt.insert(tk.END, "  Framing: ", "dim")
-        txt.insert(tk.END, "✅ Fits sensor\n" if rep['f_fits'] else "❌ Too big for sensor\n",
-                  "optimal" if rep['f_fits'] else "warning")
+        if fr["fits"]:
+            txt.insert(tk.END, f"✅ Fits · spans {fr['span_pct']:.0f}%", "optimal")
+            txt.insert(tk.END, f" · {fr['area_pct']:.0f}% of area\n", "dim")
+        else:
+            txt.insert(tk.END, f"❌ Too big for sensor · spans {fr['span_pct']:.0f}%\n", "warning")
+        size_note = self._target_size_note(fr)
+        size_txt, _, src_txt = size_note.partition(" · ")
+        txt.insert(tk.END, "  Target size: ", "dim")
+        if fr["known"]:
+            txt.insert(tk.END, size_txt)
+            txt.insert(tk.END, f" · {src_txt}\n" if src_txt else "\n", "dim")
+        else:
+            txt.insert(tk.END, size_note + "\n", "dim")
 
         txt.insert(tk.END, "\n━ EXPOSURE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n", "sec_exposure")
         txt.insert(tk.END, "  Recommended sub: ", "dim")
@@ -12983,33 +12404,19 @@ class AstroApp:
         """Kick the finicky Explore widgets into painting (macOS Cocoa Tk)."""
         self._kick_paint([self.explore_canvas, self.explore_search, self._explore_report_txt])
 
-    def open_sky_map(self):
-        """Open the interactive sky map centred on the Planner tab's last
-        analyzed target (self.current_target_info) — kept as a thin wrapper
-        over _launch_sky_map for anything still reading that state; the
-        Explore tab's own "Show Sky Map" button calls
-        _explore_open_sky_map instead, which reads Explore's own target/
-        rig/rotation rather than the Planner tab's.
-        """
-        t = self.current_target_info
-        if not t:
-            messagebox.showinfo(
-                "No Target",
-                "Select and analyze a target first, then open the sky map.")
-            return
-        self._launch_sky_map(
-            t,
-            getattr(self, "_skymap_fovw", 0.0) or 0.0,
-            getattr(self, "_skymap_fovh", 0.0) or 0.0,
-            self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0) or 0.0))
-
     def _explore_open_sky_map(self):
         """Explore tab's "Show Sky Map" button — centres the map on
         whatever Explore currently has loaded, framed by the active rig's
         FOV (the one shown in the report panel) rather than the Planner
         tab's own, separate, framing state. _explore_pa_deg is already a
         sky PA (see _explore_redraw's comment), so it's passed straight
-        through with no _screen_to_sky_pa conversion needed."""
+        through with no _screen_to_sky_pa conversion needed.
+
+        The active card's setup also becomes Tonight's Plan's equipment
+        (saved rig → applied by name; unsaved → chips set, rig chip reads
+        "Custom…"), so a framing sent back from the map lands on the rig
+        the map is drawing. Existing plan rows keep their own equipment.
+        """
         t = self._explore_target
         if not t:
             messagebox.showinfo(
@@ -13017,20 +12424,32 @@ class AstroApp:
                 "Search for a target on the Explore tab first, then open the sky map.")
             return
         fovw = fovh = 0.0
+        rig = None
         active_key = self._explore_active_rig_key
         for r in self._explore_rigs:
             if r["key"] == active_key:
                 fovw, fovh = r["fov_w"], r["fov_h"]
+                filt = self._explore_rig_filter(r)
+                already = self._explore_rig_on_tonight(r)
+                label = self._sync_rig_to_app(r["scope"], r["camera"], r["reduction"], filt)
+                if not already:
+                    self._show_toast(f"Tonight's Plan now using {label}", duration_ms=2600)
+                rig = self._skymap_current_rig()
                 break
-        self._launch_sky_map(t, fovw, fovh, self._explore_pa_deg)
+        self._launch_sky_map(t, fovw, fovh, self._explore_pa_deg,
+                             rig=rig or self._skymap_current_rig())
 
-    def _launch_sky_map(self, t, fovw_deg, fovh_deg, pa_deg):
+    def _launch_sky_map(self, t, fovw_deg, fovh_deg, pa_deg, rig=None):
         """Shared sky-map launcher — feeds the embedded d3-celestial
         explorer (a pywebview window in a separate process) a target
         centre, framed FOV, position angle and theme via a localhost URL.
         Coordinates — not the object id — are passed, so Sharpless/Caldwell
         targets resolve correctly. Falls back to the default browser when
         pywebview/WebView2 is unavailable.
+
+        ``rig`` ({scope, camera, reduction, filter_mode}) is the rig whose
+        frame the map draws; framings sent back from the map's composer are
+        added to Tonight's Plan with that same rig (see _skymap_api_tonight).
         """
         ra, dec = t.get("ra_deg"), t.get("dec_deg")
         if ra is None or dec is None:
@@ -13047,6 +12466,20 @@ class AstroApp:
                 "Expected a 'skymap' folder containing skymap.html.")
             return
 
+        port = self._ensure_skymap_server(skymap_dir)
+        if not port:
+            return
+        # What this window was opened with — read by the /api/tonight handler.
+        self._skymap_target = t
+        self._skymap_rig = rig or self._skymap_current_rig()
+        info = self._skymap_rig_info(self._skymap_rig)
+        rig_label = info["label"]
+        # An unsaved setup is remembered so the map's rig menu can offer it
+        # (with "Save as rig…") even after switching to a saved rig.
+        self._skymap_trial_rig = None if info["saved"] else dict(self._skymap_rig)
+        if not (fovw_deg and fovh_deg) and info["fovw"]:
+            fovw_deg, fovh_deg = info["fovw"], info["fovh"]
+
         import urllib.parse
         params = {
             "ra":      f"{float(ra):.5f}",
@@ -13058,15 +12491,18 @@ class AstroApp:
             "fovh":    f"{fovh_deg or 0.0:.4f}",
             "pa":      f"{pa_deg or 0.0:.1f}",
             "theme":   "night" if getattr(self, "night_mode", False) else "day",
+            "rig":     rig_label,
+            "rigcolor": info["color"],
+            "key":     self._skymap_key,
+            # Remembered Layers / labels / magnitude / Hide planned settings
+            "prefs":   json.dumps(self.data.get("settings", {}).get("skymap_prefs") or {},
+                                  separators=(",", ":")),
         }
         # Active catalog tier → which star/DSO files the map loads + mag ceiling.
         tier = SKYMAP_TIERS.get(self._skymap_active_tier(), SKYMAP_TIERS["lean"])
         params["stars"] = tier["stars"]
         params["dsos"] = tier["dsos"]
         params["maglimit"] = str(tier["maglimit"])
-        port = self._ensure_skymap_server(skymap_dir)
-        if not port:
-            return
         url = (f"http://127.0.0.1:{port}/skymap.html?"
                + urllib.parse.urlencode(params))
         self._spawn_skymap_viewer(url)
@@ -13087,6 +12523,629 @@ class AstroApp:
             return "Caldwell"
         return ""
 
+    # ─── Sky-map frame composer → Tonight's Plan (/api/tonight) ─────────
+    # d3-celestial DSO type codes → the app's object categories, for custom
+    # targets created from sky-map-only objects (LBN, LDN, vdB, Ced…).
+    _SKYMAP_TYPE_TO_CATEGORY = {
+        "g": "Galaxy", "s": "Galaxy", "s0": "Galaxy", "sd": "Galaxy",
+        "e": "Galaxy", "i": "Galaxy", "gg": "Galaxy",
+        "en": "Nebula", "bn": "Nebula", "sfr": "Nebula", "rn": "Nebula",
+        "dn": "Nebula", "snr": "Nebula", "pn": "Planetary Nebula",
+        "oc": "Open Cluster", "gc": "Globular Cluster",
+        "ast": "Asterism", "pos": "Asterism",
+    }
+
+    def _skymap_current_rig(self):
+        """The main rig chip's selection, in the shape _launch_sky_map takes."""
+        return {"scope": self.scope_choice.get(), "camera": self.camera_choice.get(),
+                "reduction": self.reduction_factor.get(),
+                "filter_mode": self.filter_mode.get()}
+
+    def _skymap_rig_filter(self, rig):
+        """A sky-map rig dict's filter in saved-rig terms ("" for colour cameras)."""
+        if self._camera_is_color(rig.get("camera") or ""):
+            return ""
+        return rig.get("filter_mode") or rig.get("filter") or ""
+
+    def _skymap_rig_info(self, rig):
+        """Everything the map needs to draw/label a rig: name (saved rigs
+        only), label, gear, FOV and accent colour (same colour as its plan
+        cards and timeline bars)."""
+        scope, cam = rig.get("scope") or "", rig.get("camera") or ""
+        red = self._red_str(rig.get("reduction"))
+        filt = self._skymap_rig_filter(rig)
+        saved = self._rig_matching(scope, cam, red, filt)
+        fov = self._rig_fov(scope, cam, red) or (0.0, 0.0)
+        return {"name": saved.get("name", "") if saved else "",
+                "label": saved.get("name", "") if saved else
+                         " · ".join(x for x in (scope, cam) if x),
+                "saved": saved is not None,
+                "scope": scope, "camera": cam, "reduction": red, "filter": filt,
+                "fovw": round(fov[0], 4), "fovh": round(fov[1], 4),
+                "color": self._get_rig_accent_color(scope, cam)}
+
+    def _skymap_api_rigs(self):
+        """GET /api/rigs — the map's rig menu: the unsaved setup the map was
+        opened with (if any, and still unsaved) first, then every saved rig."""
+        def _get():
+            cur = getattr(self, "_skymap_rig", None) or self._skymap_current_rig()
+            cur_info = self._skymap_rig_info(cur)
+            items = []
+            trial = getattr(self, "_skymap_trial_rig", None)
+            if trial is not None:
+                ti = self._skymap_rig_info(trial)
+                if ti["saved"]:
+                    self._skymap_trial_rig = None      # saved elsewhere since
+                else:
+                    ti["id"] = "__trial__"
+                    ti["current"] = not cur_info["saved"]
+                    items.append(ti)
+            for rig in self.data.get("settings", {}).get("rigs", []):
+                if not rig.get("name"):
+                    continue
+                ri = self._skymap_rig_info({"scope": rig.get("scope"), "camera": rig.get("camera"),
+                                            "reduction": rig.get("reduction"),
+                                            "filter_mode": rig.get("filter")})
+                ri.update({"id": rig["name"], "name": rig["name"], "label": rig["name"],
+                           "saved": True,
+                           "current": cur_info["saved"] and cur_info["name"] == rig["name"]})
+                items.append(ri)
+            return {"ok": True, "rigs": items, "current": cur_info}
+        try:
+            return self._run_on_tk(_get)
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    # Keys the map may remember, and their allowed values (anything else in a
+    # /api/prefs body is dropped).
+    _SKYMAP_PREF_LAYERS = ("conlines", "connames", "grid", "mw", "bounds")
+    _SKYMAP_PREF_DSO = ("gal", "neb", "dark", "clu", "rem")
+    _SKYMAP_PREF_LABELS = ("stars", "dsos", "lens")
+
+    def _skymap_api_prefs(self, body):
+        """POST /api/prefs — the map's Layers panel, deep-sky groups, label
+        HUD, magnitude slider and Hide planned, saved to the gear file so the
+        next map opens the same way (the map window's own storage doesn't
+        survive closing it)."""
+        def _bools(src, keys):
+            src = src if isinstance(src, dict) else {}
+            return {k: src[k] for k in keys if isinstance(src.get(k), bool)}
+        labels = body.get("labels") if isinstance(body.get("labels"), dict) else {}
+        prefs = {"layers": _bools(body.get("layers"), self._SKYMAP_PREF_LAYERS),
+                 "dso": _bools(body.get("dso"), self._SKYMAP_PREF_DSO),
+                 "labels": _bools(labels, self._SKYMAP_PREF_LABELS)}
+        if labels.get("density") in (0, 1, 2):
+            prefs["labels"]["density"] = labels["density"]
+        try:
+            mag = float(body.get("mag"))
+            if math.isfinite(mag):
+                prefs["mag"] = round(max(0.0, min(20.0, mag)), 1)
+        except (TypeError, ValueError):
+            pass
+        if isinstance(body.get("hidePlanned"), bool):
+            prefs["hidePlanned"] = body["hidePlanned"]
+
+        def _save():
+            settings = self.data.setdefault("settings", {})
+            if settings.get("skymap_prefs") != prefs:
+                settings["skymap_prefs"] = prefs
+                self._persist_data()
+            return {"ok": True}
+        try:
+            return self._run_on_tk(_save)
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _skymap_api_select_rig(self, body):
+        """POST /api/rig {id} — switch the map's rig (a saved rig's name, or
+        "__trial__" for the unsaved setup). Synced to Tonight's Plan the same
+        way opening the map does."""
+        rid = str(body.get("id") or "")
+
+        def _do():
+            if rid == "__trial__":
+                rig = getattr(self, "_skymap_trial_rig", None)
+                if rig is None:
+                    return {"ok": False, "error": "That setup is no longer available."}
+                scope, cam = rig.get("scope"), rig.get("camera")
+                red, filt = rig.get("reduction"), self._skymap_rig_filter(rig)
+            else:
+                saved = self._find_rig(rid)
+                if saved is None:
+                    return {"ok": False, "error": f"No saved rig named '{rid}'."}
+                scope, cam = saved.get("scope"), saved.get("camera")
+                red, filt = saved.get("reduction"), saved.get("filter") or ""
+            if (scope not in self.data.get("scopes", {})
+                    or cam not in self.data.get("cameras", {})):
+                return {"ok": False, "error": "That rig's scope or camera is no longer in your gear."}
+            label = self._sync_rig_to_app(scope, cam, red, filt)
+            self._skymap_rig = self._skymap_current_rig()
+            info = self._skymap_rig_info(self._skymap_rig)
+            self._show_toast(f"Tonight's Plan now using {label}", duration_ms=2600)
+            self._skymap_log(f"Sky map rig -> {label}")
+            return {"ok": True, "rig": info}
+        try:
+            return self._run_on_tk(_do)
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _skymap_api_save_rig(self, body):
+        """POST /api/saverig {name} — save the map's unsaved setup as a rig.
+        Duplicate names are refused (the map asks for another name) rather
+        than overwritten from a window the app's dialogs would sit behind."""
+        name = str(body.get("name") or "").strip()[:60]
+
+        def _do():
+            trial = getattr(self, "_skymap_trial_rig", None)
+            if trial is None:
+                return {"ok": False, "error": "There's no unsaved setup to save."}
+            if not name or name == "Custom…":
+                return {"ok": False, "error": "Please enter a name for this rig."}
+            if self._find_rig(name) is not None:
+                return {"ok": False, "error": f"A rig named '{name}' already exists."}
+            snap = {"scope": trial.get("scope") or "",
+                    "reduction": self._red_str(trial.get("reduction")),
+                    "camera": trial.get("camera") or "",
+                    "filter": self._skymap_rig_filter(trial)}
+            if not self._save_rig_snapshot(name, snap):
+                return {"ok": False, "error": "The rig couldn't be saved."}
+            self._skymap_trial_rig = None
+            # If the map (and the app's chips) are on that setup, the app's
+            # rig chip takes the new name instead of reading "Custom…".
+            cur = getattr(self, "_skymap_rig", None) or self._skymap_current_rig()
+            cur_info = self._skymap_rig_info(cur)
+            if cur_info["name"] == name and self._explore_rig_like_chips(cur):
+                self._apply_rig(self._find_rig(name))
+            self._show_toast(f"Saved rig: {name}")
+            self._skymap_log(f"Sky map saved rig '{name}'")
+            return {"ok": True, "rig": self._skymap_rig_info(cur)}
+        try:
+            return self._run_on_tk(_do)
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def _explore_rig_like_chips(self, rig):
+        """True when a sky-map rig dict is what the app's chips show now."""
+        snap = self._current_rig_snapshot()
+        return (snap["scope"] == rig.get("scope") and snap["camera"] == rig.get("camera")
+                and abs(self._red_float(snap["reduction"]) - self._red_float(rig.get("reduction"))) < 1e-6)
+
+    def _run_on_tk(self, fn, timeout=15.0):
+        """Run ``fn`` on the Tk main thread and return its result.
+
+        For the sky-map server's request threads: Tk widgets/variables must
+        only be touched from the main thread, so work is queued with
+        root.after (the same pattern the background scans use) and this
+        thread waits for it.  Raises TimeoutError if the main thread is
+        stuck (e.g. a native modal dialog is open).
+
+        The request thread never calls into Tk itself — not even
+        ``root.after``: it only puts the job on a plain queue that the main
+        thread drains (_pump_tk_queue).  Cross-thread Tcl calls are what
+        behave differently between the macOS and Windows Tk builds (on
+        Windows they can stall or be dropped until the next UI event), so
+        the hand-off uses none.
+        """
+        if threading.current_thread() is threading.main_thread():
+            return fn()
+        done, box = threading.Event(), {}
+
+        def _w():
+            try:
+                box["v"] = fn()
+            except Exception as exc:
+                box["e"] = exc
+            finally:
+                done.set()
+        self._tk_jobs.put(_w)
+        if not done.wait(timeout):
+            raise TimeoutError("the app is busy — close any open dialog and try again")
+        if "e" in box:
+            raise box["e"]
+        return box["v"]
+
+    def _pump_tk_queue(self):
+        """Main-thread side of _run_on_tk: run queued jobs, re-arm."""
+        import queue as _q
+        try:
+            while True:
+                self._tk_jobs.get_nowait()()
+        except _q.Empty:
+            pass
+        except Exception:
+            pass
+        try:
+            self.root.after(40, self._pump_tk_queue)
+        except tk.TclError:
+            pass                                   # app closing
+
+    @staticmethod
+    def _clean_target_name(raw):
+        """A target name that's safe everywhere it ends up — plan rows, the
+        NINA target set, and file paths NINA may build from it."""
+        n = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", str(raw or ""))
+        return re.sub(r"\s+", " ", n).strip()[:60]
+
+    @staticmethod
+    def _field_name(ra_deg, dec_deg):
+        """Default name for a custom field, e.g. 'Field J2058+4420'."""
+        h = (ra_deg % 360.0) / 15.0
+        hh, mm = int(h), int((h - int(h)) * 60)
+        a = abs(dec_deg)
+        dd, dm = int(a), int((a - int(a)) * 60)
+        return f"Field J{hh:02d}{mm:02d}{'-' if dec_deg < 0 else '+'}{dd:02d}{dm:02d}"
+
+    def _skymap_ci_index(self):
+        """Case/space-insensitive lookup over targets + common names (cached,
+        rebuilt when either dict grows)."""
+        n = len(self.targets) + len(self.common_names_map)
+        cache = getattr(self, "_skymap_ci", None)
+        if not cache or cache[0] != n:
+            idx = {}
+            for d in (self.common_names_map, self.targets):   # targets win
+                for k, v in d.items():
+                    idx[str(k).replace(" ", "").upper()] = v
+            self._skymap_ci = (n, idx)
+        return self._skymap_ci[1]
+
+    def _skymap_resolve(self, obj_id, ra_deg=None, dec_deg=None):
+        """Find a sky-map object ("NGC 7000", "M31", "Sh2 155", "C 41") in the
+        app's own catalog.  When a position is given, a match more than 1°
+        away is rejected — protects against a stray alias collision."""
+        raw = (obj_id or "").strip()
+        if not raw:
+            return None
+        compact = raw.replace(" ", "").upper()
+        cands = [compact, self._normalize_catalog_key(compact)]
+        m = re.match(r"^SH2[-_]?(\d+)$", compact)
+        if m:
+            cands += [f"SH2-{int(m.group(1))}", f"Sh2-{int(m.group(1))}"]
+        t = None
+        for c in cands:
+            t = self.targets.get(c) or self.common_names_map.get(c)
+            if t:
+                break
+        if not t:
+            idx = self._skymap_ci_index()
+            for c in cands:
+                t = idx.get(c.upper())
+                if t:
+                    break
+        if t and ra_deg is not None and dec_deg is not None:
+            d1, d2 = math.radians(dec_deg), math.radians(t["dec_deg"])
+            cos_sep = (math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2)
+                       * math.cos(math.radians(ra_deg - t["ra_deg"])))
+            if math.degrees(math.acos(max(-1.0, min(1.0, cos_sep)))) > 1.0:
+                return None
+        return t
+
+    def _make_custom_target(self, name, ra_deg, dec_deg, obj=None):
+        """A catalog-shaped record for a target the app's catalog doesn't
+        have: a sky-map-only object (keeps its own name, size and type) or a
+        free sky position.  Not registered until it's actually committed."""
+        obj = obj or {}
+        size_maj = size_min = 0.0
+        nums = re.findall(r"\d+(?:\.\d+)?", str(obj.get("dim") or ""))
+        if nums:
+            size_maj = float(nums[0])
+            size_min = float(nums[1]) if len(nums) > 1 else size_maj
+        key = name.replace(" ", "").upper()
+        clash = self.targets.get(key) or self.common_names_map.get(key)
+        if clash and not clash.get("custom"):
+            name = f"{name} field"          # never shadow a real catalog object
+        return {
+            "id": name, "common": obj.get("common") or "",
+            "size_maj": size_maj, "size_min": size_min,
+            "ra_deg": ra_deg % 360.0, "dec_deg": dec_deg,
+            "obj_type": (self._SKYMAP_TYPE_TO_CATEGORY.get(obj.get("type") or "", "Other")
+                         if obj.get("type") else "Field"),
+            "v_mag": None, "surf_br": None, "catalogs": set(), "custom": True,
+            "size_src": "sky map",
+        }
+
+    def _register_custom_target(self, rec):
+        """Make a custom target findable like a catalog one (plan search,
+        Frame dialog, pinned grid cards) for the rest of the session."""
+        key = rec["id"].replace(" ", "").upper()
+        if key not in self.targets:
+            self.targets[key] = rec
+        if rec["id"].upper() not in self.searchable_names:
+            self.searchable_names.append(rec["id"].upper())
+
+    def _register_plan_customs(self):
+        """After loading a session: re-register any plan target the catalog
+        doesn't know (custom fields / sky-map-only objects), from the plan
+        row's own name and coordinates."""
+        for e in self._plan_entries:
+            tid = e.get("target_id") or ""
+            key = tid.replace(" ", "").upper()
+            if not tid or self.targets.get(key) or self.common_names_map.get(key):
+                continue
+            try:
+                ra, dec = float(e["ra_deg"]), float(e["dec_deg"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            self._register_custom_target({
+                "id": tid, "common": e.get("common") or "", "size_maj": 0.0,
+                "size_min": 0.0, "ra_deg": ra, "dec_deg": dec,
+                "obj_type": "Field" if tid.startswith("Field ") else "Other",
+                "v_mag": None, "surf_br": None, "catalogs": set(), "custom": True})
+
+    def _skymap_api_tonight(self, body):
+        """POST /api/tonight — the sky map's "Send framing → Tonight".
+
+        Runs on a server thread.  Body: {name, ra, dec, pa, object, force}
+        where ra/dec is the frame centre (J2000 deg), pa the NINA sky PA and
+        object what the frame is framing ({kind:"target"} for the target the
+        map was opened on, {kind:"dso", id, type, dim, common} for a map
+        object — each with the map's ra/dec for it, since the frame may be
+        nudged off-centre — or null for a free field).
+
+        Commits exactly like the Frame dialog's Confirm: the rig the map was
+        opened with, allow_update_framing=True (re-sending an already-planned
+        target updates its pointing/rotation).  A short or missing imaging
+        window is returned as {confirm: true} for the map to ask about, and
+        the map re-sends with force=true.
+        """
+        try:
+            ra, dec = float(body.get("ra")), float(body.get("dec"))
+            pa = float(body.get("pa") or 0.0) % 360.0
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "The frame position was missing."}
+        if not (math.isfinite(ra) and math.isfinite(dec) and -90.0 <= dec <= 90.0):
+            return {"ok": False, "error": "The frame position was invalid."}
+        ra %= 360.0
+        obj = body.get("object") if isinstance(body.get("object"), dict) else None
+        name = self._clean_target_name(body.get("name")) or \
+            self._clean_target_name((obj or {}).get("id")) or self._field_name(ra, dec)
+        force = bool(body.get("force"))
+        # Where the map had the object the frame is on (the frame centre can
+        # be offset from it — a nudge to take in a neighbour).
+        try:
+            obj_ra = float(obj["ra"]) % 360.0 if obj and obj.get("ra") is not None else ra
+            obj_dec = float(obj["dec"]) if obj and obj.get("dec") is not None else dec
+        except (TypeError, ValueError):
+            obj_ra, obj_dec = ra, dec
+
+        def _prep():
+            rig = getattr(self, "_skymap_rig", None) or self._skymap_current_rig()
+            scope, cam = rig.get("scope"), rig.get("camera")
+            if (not scope or not cam or scope not in self.data.get("scopes", {})
+                    or cam not in self.data.get("cameras", {})):
+                return {"error": "Choose a scope and camera in the app (rig chip), "
+                                 "then reopen the sky map."}
+            t = None
+            if obj and obj.get("kind") == "target":
+                t = getattr(self, "_skymap_target", None)
+            elif obj and obj.get("kind") == "dso":
+                t = self._skymap_resolve(obj.get("id"), obj_ra, obj_dec)
+            on_object = t is not None
+            if t is None:
+                # A sky-map-only object keeps its own position as the target
+                # (the frame centre becomes its framing); a free field is
+                # simply the frame centre.
+                t = (self._make_custom_target(name, obj_ra, obj_dec, obj) if obj
+                     else self._make_custom_target(name, ra, dec, None))
+            filter_mode = rig.get("filter_mode") or self.filter_mode.get()
+            existing = any(pe["target_id"] == t["id"] and pe.get("scope") == scope
+                           and pe.get("camera") == cam and pe.get("filter_mode") == filter_mode
+                           for pe in self._plan_entries)
+            lat, lon = self._get_saved_location()
+            try:
+                min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
+            except (TypeError, ValueError):
+                min_alt = 20.0
+            try:
+                reduction = float(str(rig.get("reduction") or "1").rstrip("×x"))
+            except ValueError:
+                reduction = 1.0
+            return {"t": t, "on_object": on_object,
+                    "scope": scope, "cam": cam, "filter_mode": filter_mode,
+                    "reduction": reduction, "bortle": self.bortle_choice.get(),
+                    "existing": existing, "lat": lat, "lon": lon, "min_alt": min_alt}
+
+        try:
+            prep = self._run_on_tk(_prep)
+        except TimeoutError as exc:
+            return {"ok": False, "error": f"Couldn't add it: {exc}."}
+        if "error" in prep:
+            return {"ok": False, "error": prep["error"]}
+        t = prep["t"]
+
+        # Same imaging-window check the app's own add does, but answered in
+        # the map window (where the user is) instead of a dialog behind it.
+        if not force and not prep["existing"]:
+            if prep["lat"] is None or prep["lon"] is None:
+                return {"ok": False, "confirm": True,
+                        "message": "No observer location is set, so tonight's imaging "
+                                   "window can't be checked."}
+            try:
+                _s, _e, hrs, _p, _pa, _d = _calc_best_imaging_window(
+                    t["ra_deg"], t["dec_deg"], prep["lat"], prep["lon"],
+                    min_alt=prep["min_alt"])
+                hrs = hrs or 0.0
+            except Exception:
+                hrs = None
+            if hrs is not None and hrs < 0.5:
+                msg = (f"{t['id']} has no imaging window tonight."
+                       if hrs == 0.0 else
+                       f"{t['id']} has only {int(round(hrs * 60))} min of imaging "
+                       f"window tonight.")
+                return {"ok": False, "confirm": True, "message": msg}
+
+        # Framing an app-catalog object (or the launched target): carry the
+        # frame's offset from the object over onto the app's OWN catalog
+        # position — the sky map's copy of an object can sit an arcminute or
+        # two away from it, and that difference must not leak into the
+        # framing.  Un-nudged, this lands exactly on the catalog position.
+        if prep["on_object"]:
+            d_ra = ((ra - obj_ra + 540.0) % 360.0) - 180.0
+            cos_o = math.cos(math.radians(obj_dec))
+            cos_t = math.cos(math.radians(t["dec_deg"]))
+            d_ra = d_ra * cos_o / cos_t if abs(cos_t) > 1e-6 else d_ra
+            ra = (t["ra_deg"] + d_ra) % 360.0
+            dec = max(-90.0, min(90.0, t["dec_deg"] + (dec - obj_dec)))
+
+        def _commit():
+            if t.get("custom"):
+                self._register_custom_target(t)
+            self._mark_grid_touched(t["id"])
+            self._add_target_to_plan_direct(
+                t, prep["scope"], prep["cam"], prep["bortle"], prep["filter_mode"],
+                prep["reduction"], rotation_angle=round(pa, 1),
+                framed_ra_deg=ra, framed_dec_deg=dec, report_text="",
+                allow_update_framing=True, confirm_short_window=False)
+        try:
+            self._run_on_tk(_commit)
+        except TimeoutError as exc:
+            return {"ok": False, "error": f"Couldn't add it: {exc}."}
+        verb = "framing updated in" if prep["existing"] else "added to"
+        self._skymap_log(f"Sky map -> plan: {t['id']} centre {ra:.5f},{dec:.5f} PA {pa} "
+                         f"on {prep.get('scope')} / {prep.get('cam')} — {verb.split()[0]}")
+        return {"ok": True, "id": t["id"],
+                "message": f"{t['id']} {verb} Tonight's Plan · {prep['scope']}"}
+
+    def _skymap_api_target(self, qs):
+        """GET /api/target — data for the sky map's target card.
+
+        Query: ra, dec (the object's position), id (sky-map ID), kind
+        ("target" | "dso").  Uses the same helpers as the app's own target
+        cards and Frame dialog — _sample_altitude_series, _calc_best_imaging_
+        window, _moon_condition — so the numbers match everywhere.
+        """
+        try:
+            ra, dec = float(qs.get("ra")), float(qs.get("dec"))
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Missing position."}
+        ra %= 360.0
+        kind, obj_id = qs.get("kind") or "dso", qs.get("id") or ""
+
+        def _prep():
+            t = None
+            if kind == "target":
+                t = getattr(self, "_skymap_target", None)
+            elif obj_id:
+                t = self._skymap_resolve(obj_id, ra, dec)
+            if t is None:
+                t = self.targets.get(obj_id.replace(" ", "").upper())
+                if t is not None and not t.get("custom"):
+                    t = None          # only already-registered customs here
+            rig = getattr(self, "_skymap_rig", None) or self._skymap_current_rig()
+            planned = [{"filter_mode": pe.get("filter_mode") or "",
+                        "scope": pe.get("scope") or "", "camera": pe.get("camera") or "",
+                        "same_rig": (pe.get("scope") == rig.get("scope")
+                                     and pe.get("camera") == rig.get("camera"))}
+                       for pe in self._plan_entries if t is not None and pe["target_id"] == t["id"]]
+            try:
+                min_alt = float(self.data.get("settings", {}).get("min_alt", 20))
+            except (TypeError, ValueError):
+                min_alt = 20.0
+            lat, lon = self._get_saved_location()
+            return {"t": t, "planned": planned, "min_alt": min_alt, "lat": lat, "lon": lon,
+                    "rig_filter": rig.get("filter_mode") or self.filter_mode.get()}
+        try:
+            prep = self._run_on_tk(_prep)
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc)}
+
+        t = prep["t"]
+        pos = {"ra_deg": t["ra_deg"], "dec_deg": t["dec_deg"]} if t else {"ra_deg": ra, "dec_deg": dec}
+        out = {"ok": True, "in_catalog": bool(t and not t.get("custom")),
+               "id": t["id"] if t else obj_id, "common": (t or {}).get("common", "").split(";")[0].strip(),
+               "obj_type": (t or {}).get("obj_type") or "",
+               "size_maj": (t or {}).get("size_maj") or 0.0, "size_min": (t or {}).get("size_min") or 0.0,
+               "v_mag": (t or {}).get("v_mag"), "min_alt": prep["min_alt"],
+               "planned": prep["planned"], "rig_filter": prep["rig_filter"],
+               "has_location": prep["lat"] is not None and prep["lon"] is not None}
+        if not out["has_location"]:
+            return out
+        lat, lon = prep["lat"], prep["lon"]
+
+        series = self._sample_altitude_series(pos, lat, lon)
+        if series["dark_start_jd"] is not None and series["alts"]:
+            alts, n = series["alts"], len(series["alts"])
+            k = max(1, n // 72)                       # ~72 points is plenty for a card
+            span_h = series["total_jd"] * 24.0
+            t0 = series["times_h"][0]
+            pad = 30.0 / 1440.0 / series["total_jd"]  # the helper's ±30 min padding
+
+            def _hhmm(h):
+                h %= 24.0
+                return f"{int(h):02d}:{int(round((h - int(h)) * 60)) % 60:02d}"
+
+            def _frac(hhmm):
+                try:
+                    hh, mm = (int(x) for x in str(hhmm).split(":")[:2])
+                except ValueError:
+                    return None
+                return (((hh + mm / 60.0) - t0) % 24.0) / span_h
+
+            out["curve"] = {"alts": [round(a, 1) for a in alts[::k]],
+                            "dusk": _hhmm(t0 + 0.5), "dawn": _hhmm(t0 + span_h - 0.5),
+                            "dusk_frac": pad, "dawn_frac": 1.0 - pad}
+            try:
+                ws, we, hrs, peak_t, peak_a, _d = _calc_best_imaging_window(
+                    pos["ra_deg"], pos["dec_deg"], lat, lon, min_alt=prep["min_alt"])
+            except Exception:
+                ws = we = peak_t = None
+                hrs = peak_a = 0.0
+            out["window"] = {"start": ws or "", "end": we or "", "hrs": round(hrs or 0.0, 2),
+                             "start_frac": _frac(ws) if ws else None,
+                             "end_frac": _frac(we) if we else None}
+            peak_i = max(range(n), key=lambda i: alts[i])
+            out["peak"] = {"alt": round(alts[peak_i]), "time": _hhmm(series["times_h"][peak_i])}
+        tag, _icon, note, impact, illum, sep = self._moon_condition(pos["ra_deg"], pos["dec_deg"])
+        out["moon"] = {"tag": tag, "note": note, "impact": impact,
+                       "illum": illum, "sep": round(sep)}
+        return out
+
+    def _skymap_api_plan(self):
+        """GET /api/plan — tonight's plan for the map's planned framings: one
+        item per target per rig (multi-filter rows collapse), at its framed
+        centre and rotation, with that rig's own FOV, label and accent
+        colour so every rig's framing draws at its true size."""
+        def _get():
+            rig = getattr(self, "_skymap_rig", None) or self._skymap_current_rig()
+            rigs = self.data.get("settings", {}).get("rigs", [])
+            seen, items = set(), []
+            for pe in self._plan_entries:
+                scope, cam = pe.get("scope") or "", pe.get("camera") or ""
+                red = pe.get("reduction")
+                if red is None:
+                    # Rows added before reducers were stored: borrow a saved
+                    # rig with the same scope + camera, else assume 1.0×.
+                    twin = next((r for r in rigs if r.get("scope") == scope
+                                 and r.get("camera") == cam), None)
+                    red = twin.get("reduction") if twin else 1.0
+                red_f = self._red_float(red)
+                key = (pe["target_id"], scope, cam, round(red_f, 3))
+                if key in seen:
+                    continue
+                seen.add(key)
+                ra = pe.get("framed_ra_deg")
+                dec = pe.get("framed_dec_deg")
+                if ra is None or dec is None:
+                    ra, dec = pe.get("ra_deg"), pe.get("dec_deg")
+                if ra is None or dec is None:
+                    continue
+                fov = self._rig_fov(scope, cam, red_f) or (0.0, 0.0)
+                filt = "" if self._camera_is_color(cam) else (pe.get("filter_mode") or "")
+                saved = (self._rig_matching(scope, cam, red_f, filt)
+                         or self._rig_matching(scope, cam, red_f, ""))
+                label = saved.get("name") if saved else " · ".join(x for x in (scope, cam) if x)
+                items.append({"id": pe["target_id"], "ra": float(ra), "dec": float(dec),
+                              "pa": float(pe.get("rotation_angle") or 0.0),
+                              "scope": scope, "camera": cam,
+                              "fovw": round(fov[0], 4), "fovh": round(fov[1], 4),
+                              "rig": label, "color": self._get_rig_accent_color(scope, cam),
+                              "same_rig": (scope == rig.get("scope")
+                                           and cam == rig.get("camera"))})
+            return items
+        try:
+            return {"ok": True, "items": self._run_on_tk(_get)}
+        except TimeoutError as exc:
+            return {"ok": False, "error": str(exc)}
+
     def _ensure_skymap_server(self, skymap_dir):
         """Lazily start a localhost static server rooted at the sky-map folder.
 
@@ -13098,22 +13157,112 @@ class AstroApp:
         port = getattr(self, "_skymap_port", None)
         if port:
             return port
+        if getattr(self, "_tk_jobs", None) is None:     # (main thread here)
+            import queue as _q
+            self._tk_jobs = _q.Queue()
+            self._pump_tk_queue()
         try:
-            import functools, http.server, os
+            import functools, http.server, os, secrets
             bundled_root = str(skymap_dir)
             user_root = str(self._skymap_catalog_root())
+            app = self
+            # Shared secret the page must echo in X-LB-Key on API calls, so
+            # no other local web page can post into Tonight's Plan even if it
+            # guessed the port.
+            self._skymap_key = secrets.token_urlsafe(16)
 
             class _QuietHandler(http.server.SimpleHTTPRequestHandler):
                 def log_message(self, *args):
                     pass
+
+                def do_GET(self):
+                    """Static files, plus the read-only sky-map API:
+                    /api/target (target-card data) and /api/plan (what's
+                    already in Tonight's Plan, for the map's ✓ markers)."""
+                    route = self.path.split("?")[0]
+                    if not route.startswith("/api/"):
+                        return super().do_GET()
+                    if self.headers.get("X-LB-Key") != app._skymap_key:
+                        return self._json(403, {"ok": False, "error": "Not authorised."})
+                    import urllib.parse as _up
+                    qs = {k: v[0] for k, v in _up.parse_qs(self.path.partition("?")[2]).items()}
+                    try:
+                        if route == "/api/target":
+                            res = app._skymap_api_target(qs)
+                        elif route == "/api/plan":
+                            res = app._skymap_api_plan()
+                        elif route == "/api/rigs":
+                            res = app._skymap_api_rigs()
+                        else:
+                            return self._json(404, {"ok": False, "error": "Unknown API."})
+                    except Exception as exc:
+                        res = {"ok": False, "error": f"The app couldn't answer ({exc})."}
+                    self._json(200, res)
+
+                def do_POST(self):
+                    """Sky-map → app API: /api/tonight (the target card's
+                    "＋ Tonight" and the frame composer's "Send framing →
+                    Tonight") and /api/log (map diagnostics → skymap.log)."""
+                    route = self.path.split("?")[0]
+                    if route not in ("/api/tonight", "/api/log", "/api/rig", "/api/saverig", "/api/prefs"):
+                        return self.send_error(404)
+                    if self.headers.get("X-LB-Key") != app._skymap_key:
+                        return self._json(403, {"ok": False, "error": "Not authorised."})
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        if n <= 0 or n > 65536:
+                            raise ValueError("bad length")
+                        body = json.loads(self.rfile.read(n).decode("utf-8"))
+                        if not isinstance(body, dict):
+                            raise ValueError("bad body")
+                    except (ValueError, UnicodeDecodeError):
+                        return self._json(400, {"ok": False, "error": "Malformed request."})
+                    if route == "/api/log":            # the map's diagnostics
+                        app._skymap_log("map: " + str(body.get("msg", ""))[:400].replace("\n", " "))
+                        return self._json(200, {"ok": True})
+                    try:
+                        if route == "/api/rig":        # rig menu → switch rig
+                            res = app._skymap_api_select_rig(body)
+                        elif route == "/api/saverig":  # rig menu → Save as rig…
+                            res = app._skymap_api_save_rig(body)
+                        elif route == "/api/prefs":    # remembered map settings
+                            res = app._skymap_api_prefs(body)
+                        else:
+                            res = app._skymap_api_tonight(body)
+                    except Exception as exc:          # never let the server thread die
+                        res = {"ok": False, "error": f"The app couldn't do that ({exc})."}
+                    self._json(200, res)
+
+                def _json(self, code, obj):
+                    data = json.dumps(obj).encode("utf-8")
+                    try:
+                        self.send_response(code)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Cache-Control", "no-store")
+                        self.end_headers()
+                        self.wfile.write(data)
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        pass   # Windows reports a closed viewer as ConnectionAborted
 
                 def copyfile(self, source, outputfile):
                     # The viewer may navigate away / close mid-transfer; treat
                     # a dropped connection as normal rather than logging a trace.
                     try:
                         super().copyfile(source, outputfile)
-                    except (BrokenPipeError, ConnectionResetError):
-                        pass
+                    except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                        pass   # Windows reports a closed viewer as ConnectionAborted
+
+                def end_headers(self):
+                    # WebView2 (Windows) keeps a disk HTTP cache between runs.
+                    # "no-cache" = it may keep a copy but must check with us
+                    # first (we answer 304 when the file is unchanged), so an
+                    # app update is always picked up without re-sending the
+                    # big catalog files on every open.
+                    if "Cache-Control" not in "".join(
+                            h.decode("latin-1") for h in getattr(self, "_headers_buffer", [])):
+                        self.send_header("Cache-Control", "no-cache")
+                    super().end_headers()
 
                 def translate_path(self, path):
                     # Prefer a downloaded catalog file (Extended/Full, in the
@@ -13130,7 +13279,14 @@ class AstroApp:
                     return bundled
 
             handler = functools.partial(_QuietHandler, directory=bundled_root)
-            httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), handler)
+            class _Server(http.server.ThreadingHTTPServer):
+                # The map opens ~15 files at once.  socketserver's default
+                # listen backlog is 5: on macOS/Linux extra connections just
+                # wait, but Windows REFUSES them — so on Windows some catalog
+                # files (stars, DSOs…) failed at random and that layer was
+                # missing from the map.  A deep backlog fixes it.
+                request_queue_size = 128
+            httpd = _Server(("127.0.0.1", 0), handler)
             httpd.daemon_threads = True
             self._skymap_httpd = httpd
             self._skymap_port = httpd.server_address[1]
@@ -13506,6 +13662,18 @@ class AstroApp:
             reader = csv.DictReader(f, delimiter=';')
             if reader.fieldnames:
                 reader.fieldnames = [n.strip().lower() for n in reader.fieldnames]
+            # Where this file's object sizes come from — shown under the
+            # Explore legend card's framing line so a surprising fill number
+            # can be traced to its catalog. The built-in offline Messier
+            # list is written in the same file slot as the downloaded
+            # NGC.csv but lacks OpenNGC's "Const" column, which tells the
+            # two apart without any extra bookkeeping.
+            if Path(path).name == SHARPLESS_CATALOG_FILE:
+                size_src = "Sharpless"
+            elif "const" not in (reader.fieldnames or []):
+                size_src = "built-in"
+            else:
+                size_src = "OpenNGC"
             for row in reader:
                 name = row.get('name', '').strip().upper()
                 if not name:
@@ -13530,6 +13698,7 @@ class AstroApp:
                     "obj_type": obj_category,
                     "v_mag": _try_float(row.get('v-mag') or row.get('vmag') or ''),
                     "surf_br": _try_float(row.get('surfbr') or row.get('surf_br') or ''),
+                    "size_src": size_src,
                 }
                 # Tag with catalog memberships for the search filter + badges.
                 info["catalogs"] = self._identify_catalogs(name, info["common"])
@@ -13576,9 +13745,8 @@ class AstroApp:
             current = self.tab_control.select()
 
             # Close the equipment drawer if we're navigating away from the
-            # Plan tab — it re-parents the Planner tab's own chip widgets,
-            # so leaving it open while switching tabs would leave those
-            # widgets stuck off the Planner tab's chip bar.
+            # Plan tab — it's placed over the Plan tab and only makes sense
+            # while that tab is showing.
             if current != str(self.tab_plan) and getattr(self, "_equip_drawer", None) is not None:
                 self._close_equip_drawer()
 
@@ -13607,28 +13775,7 @@ class AstroApp:
                             self._sidebar_draw_btn(old)
                             self._sidebar_draw_btn(settings_idx)
 
-            if current == str(self.tab_planner):
-                # Always re-run analysis when entering the Planner tab.
-                # This is the simplest reliable fix for macOS Tk's Cocoa
-                # backend, which can blank Text/Canvas widgets after tab
-                # switches.  The DSS image is cached so only the text
-                # output and altitude chart are recomputed — fast enough
-                # to feel instant.
-                self._analysis_dirty = False
-                if (self.current_target_info is not None
-                        and self.scope_choice.get()
-                        and self.camera_choice.get()):
-                    self.root.after(50, self.analyze_framing)
-                else:
-                    # Empty-state Planner entry (no analysis runnable).
-                    # macOS Cocoa Tk leaves the tab black until the
-                    # mouse enters the frame — the paint pipeline is
-                    # waiting on a Motion event to refresh tracking
-                    # areas on the newly-visible widgets.  Synthesize
-                    # one to un-stick the paint without requiring the
-                    # user to move the cursor.
-                    self.root.after(50, self._kick_planner_paint)
-            elif current == str(self.tab_plan):
+            if current == str(self.tab_plan):
                 self.root.after(10, self._draw_queue_gantt)
                 self.root.after(20, self._refresh_plan_tree)
                 self.root.after(30, self._refresh_visible_grid)
@@ -13699,10 +13846,6 @@ class AstroApp:
             self.root.update_idletasks()
         except Exception:
             pass
-
-    def _kick_planner_paint(self):
-        """Kick the finicky widgets on the Planner tab into painting."""
-        self._kick_paint([self.preview_canvas, self.alt_canvas, self.results_txt])
 
     def _kick_equip_paint(self):
         """Kick the finicky widgets on the Equipment tab into painting.
@@ -13808,6 +13951,9 @@ class AstroApp:
                 "dec_deg":       e.get("dec_deg", 0.0),
                 "scope":         e["scope"],
                 "camera":        e["camera"],
+                # Reducer factor (float) — lets the sky map draw this row's
+                # planned framing at its true size. Older rows lack it.
+                "reduction":     e.get("reduction"),
                 "filter":        filt_label,
                 "filter_mode":   fm,
                 "bortle":        e["bortle"],
@@ -13829,7 +13975,8 @@ class AstroApp:
     def _add_target_to_plan_direct(self, t, scope_name, cam_name, bortle_key,
                                     filter_mode, reduction, rotation_angle=0.0,
                                     framed_ra_deg=None, framed_dec_deg=None,
-                                    report_text="", allow_update_framing=False):
+                                    report_text="", allow_update_framing=False,
+                                    confirm_short_window=True):
         """Compute a target's exposure/window in the background and commit
         it straight to Tonight's Plan — no intermediate queue, no tab jump.
 
@@ -13846,6 +13993,10 @@ class AstroApp:
         rotation from interactive framing) from a plain, neutral "add to
         tonight" click (the browsing card's ✚, which always passes
         rotation_angle=0/framed_*=None). See the duplicate-handling below.
+
+        ``confirm_short_window=False`` skips the "short / no imaging window —
+        add anyway?" prompt, for callers that already asked (the sky map's
+        frame composer asks inside the map window, where the user is).
         """
         # Keyed on (target, scope, camera, filter_mode) — the same target on
         # the same rig legitimately gets added more than once: a single
@@ -13925,7 +14076,7 @@ class AstroApp:
                     messagebox.showwarning("Incomplete",
                         f"{t['id']} could not be computed (missing scope/camera data).")
                     return
-                if win_hrs < 0.5:
+                if win_hrs < 0.5 and confirm_short_window:
                     if win_hrs == 0.0:
                         detail = f"{t['id']} has no imaging window tonight."
                         title  = "No Imaging Window"
@@ -13952,6 +14103,7 @@ class AstroApp:
                     "dec_deg":        t["dec_deg"],
                     "scope":          scope_name,
                     "camera":         cam_name,
+                    "reduction":      reduction,
                     "bortle":         bortle_key,
                     "filter_mode":    filter_mode,
                     "exp_s":          exp_s_c,
@@ -13983,43 +14135,6 @@ class AstroApp:
             self.root.after(0, _finish)
 
         threading.Thread(target=_compute, daemon=True).start()
-
-    def _add_target_from_planner_search(self):
-        """Planner tab's own "Add to Tonight" button.
-
-        Resolves whatever's in the search box (independent of whether
-        Analyze Target has been run) and commits it straight to
-        Tonight's Plan using this tab's current equipment selection and
-        any pan/rotation already set in the FOV preview — the same
-        framing state the Frame dialog's Confirm uses.
-        """
-        raw = self.target_search.get().strip().upper().replace(" ", "")
-        raw = self._normalize_catalog_key(raw)
-        t = self.targets.get(raw) or self.common_names_map.get(raw)
-        if not t:
-            messagebox.showwarning("No Target", "Please enter a valid target to add.")
-            return
-
-        scope_name = self.scope_choice.get()
-        cam_name   = self.camera_choice.get()
-        if not scope_name or not cam_name:
-            messagebox.showwarning("Incomplete", "Please select a Scope and Camera first.")
-            return
-
-        try:
-            reduction = float(self.reduction_factor.get().rstrip("×x"))
-        except ValueError:
-            reduction = 1.0
-
-        framed_ra, framed_dec = self._framed_center(t["ra_deg"], t["dec_deg"])
-        rotation_angle = self._screen_to_sky_pa(getattr(self, "_fov_angle", 0.0) or 0.0)
-
-        self._add_target_to_plan_direct(
-            t, scope_name, cam_name, self.bortle_choice.get(),
-            self.filter_mode.get(), reduction,
-            rotation_angle=rotation_angle,
-            framed_ra_deg=framed_ra, framed_dec_deg=framed_dec,
-            report_text="", allow_update_framing=True)
 
     def _parse_h(self, s):
         """Parse 'HH:MM' string to fractional hours float, or None on failure."""
@@ -14221,6 +14336,13 @@ class AstroApp:
         for i, g in enumerate(groups[:max_rows]):
             color    = self._get_rig_accent_color(g["scope"], g["camera"])
             dim_col  = _dim(color)
+            if nm:
+                # Night mode: keep each rig's hue (so bars still match the
+                # plan cards' accent bars) but pull the solid allocation bar
+                # well down toward the background so it doesn't glare on a
+                # dark-adapted screen; the available-window band dims with it.
+                color   = _dim(color, 0.42)
+                dim_col = _dim(dim_col, 0.6)
             y_top    = tm + i * row_h + 1
             y_bot    = tm + (i + 1) * row_h - 1
             y_mid    = (y_top + y_bot) / 2
@@ -14349,8 +14471,10 @@ class AstroApp:
                 (y_top, y_bot, i, x_al_s, x_al_e, start_h)
             )
 
+            bar_ink   = "#d9a0a0" if nm else "#ffffff"   # label / altitude line on the bar
+            bar_tick  = "#8a4a4a" if nm else "#ffffff"   # transit tick
             if x_al_e > x_al_s:
-                outline_col = "#ffffff" if is_drag else ""
+                outline_col = bar_ink if is_drag else ""
                 outline_w   = 2        if is_drag else 0
                 canvas.create_rectangle(x_al_s, y_top + 2, x_al_e, y_bot - 2,
                                         fill=color, outline=outline_col, width=outline_w)
@@ -14362,14 +14486,14 @@ class AstroApp:
                     if x < x_al_s or x > x_al_e:
                         if len(bright) > 1:
                             canvas.create_line(*[c for pt in bright for c in pt],
-                                               fill="#ffffff", width=1)
+                                               fill=bar_ink, width=1)
                         bright = []
                         continue
                     y = alt_base - max(0.0, min(alt_k, MAX_ALT)) / MAX_ALT * alt_span
                     bright.append((x, y))
                 if len(bright) > 1:
                     canvas.create_line(*[c for pt in bright for c in pt],
-                                       fill="#ffffff", width=1)
+                                       fill=bar_ink, width=1)
 
                 # Target label inside bar — bold 9pt
                 # When the same target is queued twice (two telescopes), include
@@ -14379,15 +14503,15 @@ class AstroApp:
                     bar_label = (f"{g['target_id']} ({scope_s})" if scope_s
                                  else g["target_id"])
                     canvas.create_text((x_al_s + x_al_e) / 2, y_mid,
-                                       text=bar_label, fill="#ffffff",
+                                       text=bar_label, fill=bar_ink,
                                        font=("Helvetica", 9, "bold"))
 
-                # Start-time stamp top-left of bar — 9pt dim to match planner "Now" label
+                # Start-time stamp top-left of bar — same ink as the bar's target label
                 disp_h = int(start_h) % 24
                 disp_m = int(round((start_h % 1) * 60)) % 60
                 canvas.create_text(x_al_s + 4, y_top + 3,
                                    text=f"{disp_h:02d}:{disp_m:02d}",
-                                   fill=fg_dim, font=("Helvetica", 9, "bold"), anchor="nw")
+                                   fill=bar_ink, font=("Helvetica", 9, "bold"), anchor="nw")
 
                 # Grip tick (left edge of alloc bar)
                 canvas.create_line(x_al_s, y_top + 3, x_al_s, y_bot - 3,
@@ -14405,7 +14529,7 @@ class AstroApp:
                 x_tr = h_to_x(tr)
                 if lm <= x_tr <= cw - rm:
                     canvas.create_line(x_tr, y_top, x_tr, y_bot,
-                                       fill="#ffffff", width=1, dash=(2, 2))
+                                       fill=bar_tick, width=1, dash=(2, 2))
 
         # ── "Now" line (only shown when viewing today's date) ────────────
         if _PLANNING_DATE is None:
@@ -14676,13 +14800,6 @@ class AstroApp:
     # SEARCH SUGGESTIONS — floating auto-complete popup
     # ═══════════════════════════════════════════════════════════════════
 
-    def _on_search_key(self, event):
-        """Handle key release in the search entry — update the floating suggestion popup."""
-        # Ignore navigation keys
-        if event.keysym in ("Up", "Down", "Return", "Escape", "Tab"):
-            return
-        self._update_floating_suggestions()
-
     def _update_floating_suggestions(self, entry=None, on_select=None):
         """Build and show/hide the floating suggestion popup below the search entry.
 
@@ -14697,11 +14814,12 @@ class AstroApp:
         legacy Planner search, the Explore tab's search), so it's only
         applied for the Plan tab's own box.
 
-        ``entry`` / ``on_select`` generalise the popup for other search
-        fields (the Explore tab reuses it); both default to the Planner's
-        search entry and select handler.
+        ``entry`` / ``on_select`` name the search box and its select
+        handler (the Plan and Explore tabs each pass their own); both are
+        required.
         """
-        entry = entry if entry is not None else self.target_search
+        if entry is None:
+            return
         typed = entry.get().upper().replace(" ", "")
         if not typed:
             self._hide_suggestions()
@@ -14747,9 +14865,10 @@ class AstroApp:
         self._show_suggestion_popup(matches, entry=entry, on_select=on_select)
 
     def _show_suggestion_popup(self, matches, entry=None, on_select=None):
-        """Show or update the floating suggestion Toplevel below the search entry."""
-        entry = entry if entry is not None else self.target_search
-        on_select = on_select if on_select is not None else self._select_suggestion
+        """Show or update the floating suggestion Toplevel below ``entry``
+        (required, with ``on_select``)."""
+        if entry is None or on_select is None:
+            return
         # Destroy old popup if it exists
         if self._suggestion_popup and self._suggestion_popup.winfo_exists():
             self._suggestion_popup.destroy()
@@ -14848,14 +14967,6 @@ class AstroApp:
             if mag_str:
                 mag_lbl.bind("<Button-1>", lambda e, tid=target_id: on_select(tid))
 
-    def _select_suggestion(self, target_id):
-        """User clicked a suggestion — fill the search entry and optionally analyze."""
-        self._hide_suggestions()
-        self.target_search.delete(0, tk.END)
-        self.target_search.insert(0, target_id)
-        if self.auto_update_enabled:
-            self._mark_analysis_dirty()
-
     def _hide_suggestions(self):
         """Destroy the floating suggestion popup if it exists."""
         if self._suggestion_popup and self._suggestion_popup.winfo_exists():
@@ -14882,8 +14993,9 @@ class AstroApp:
         # Refresh button label and whichever search box has a live suggestion
         # popup open right now.
         self._update_unified_filters_btn_label()
-        if self.target_search.get().strip():
-            self._update_floating_suggestions()
+        if hasattr(self, "explore_search") and self.explore_search.get().strip():
+            self._update_floating_suggestions(entry=self.explore_search,
+                                               on_select=self._explore_select_suggestion)
         if hasattr(self, "plan_search") and self.plan_search.get().strip():
             self._update_floating_suggestions(entry=self.plan_search,
                                                on_select=self._plan_select_suggestion)
@@ -14910,8 +15022,9 @@ class AstroApp:
         except Exception:
             pass
         self._update_unified_filters_btn_label()
-        if self.target_search.get().strip():
-            self._update_floating_suggestions()
+        if hasattr(self, "explore_search") and self.explore_search.get().strip():
+            self._update_floating_suggestions(entry=self.explore_search,
+                                               on_select=self._explore_select_suggestion)
         if hasattr(self, "plan_search") and self.plan_search.get().strip():
             self._update_floating_suggestions(entry=self.plan_search,
                                                on_select=self._plan_select_suggestion)
@@ -14959,20 +15072,6 @@ class AstroApp:
                 if cat in counts:
                     counts[cat] += 1
         return counts
-
-    # Keep legacy methods for API compatibility (called by Visible Tonight popup etc.)
-    def update_suggestions(self, event):
-        """Legacy wrapper — delegates to _on_search_key."""
-        self._on_search_key(event)
-
-    def on_suggestion_select(self, event):
-        """Legacy: load the selected suggestion into the search box."""
-        if self.suggestion_list.curselection():
-            self.target_search.delete(0, tk.END)
-            self.target_search.insert(0, self.suggestion_list.get(
-                self.suggestion_list.curselection()[0]).split(" - ")[0])
-            if self.auto_update_enabled:
-                self._mark_analysis_dirty()
 
     # ═══════════════════════════════════════════════════════════════════
     # EQUIPMENT MANAGEMENT — add / edit / delete cameras & scopes
@@ -15093,22 +15192,22 @@ class AstroApp:
 
     def refresh_dropdowns(self):
         """Repopulate the scope/camera/filter Combobox values and restore last-session choices."""
-        self.scope_dropdown['values'] = sorted(list(self.data["scopes"].keys()))
-        self.camera_dropdown['values'] = sorted(list(self.data["cameras"].keys()))
+        self._scope_names  = sorted(self.data["scopes"].keys())
+        self._camera_names = sorted(self.data["cameras"].keys())
 
         # Equipment drawer (Phase 3) has its own scope/camera comboboxes
         # bound to the same StringVars — keep their option lists in sync
         # too, same pattern as the Explore tab dropdowns just below.
         if getattr(self, "_drawer_scope_dd", None) is not None and self._drawer_scope_dd.winfo_exists():
-            self._drawer_scope_dd['values'] = sorted(list(self.data["scopes"].keys()))
+            self._drawer_scope_dd['values'] = self._scope_names
         if getattr(self, "_drawer_camera_dd", None) is not None and self._drawer_camera_dd.winfo_exists():
-            self._drawer_camera_dd['values'] = sorted(list(self.data["cameras"].keys()))
+            self._drawer_camera_dd['values'] = self._camera_names
 
         # Explore tab shares the same inventory — keep its dropdowns in sync
         # and seed sensible defaults from the last session when unset.
         if hasattr(self, "explore_scope_dropdown"):
-            self.explore_scope_dropdown['values'] = sorted(list(self.data["scopes"].keys()))
-            self.explore_camera_dropdown['values'] = sorted(list(self.data["cameras"].keys()))
+            self.explore_scope_dropdown['values'] = self._scope_names
+            self.explore_camera_dropdown['values'] = self._camera_names
             _sess = self.data.get("session", {})
             if (not self.explore_scope_var.get()
                     or self.explore_scope_var.get() not in self.data["scopes"]):
@@ -15126,9 +15225,13 @@ class AstroApp:
         # Rebuild filter dropdown from the Filter Library (self.data["filter_sets"])
         # — Mono Lum plus every user-managed Filter Set name.
         _filter_choices = self._filter_mode_choices()
-        self.filter_dropdown["values"] = _filter_choices
+        self._filter_choices = _filter_choices
         if hasattr(self, "explore_filter_dropdown"):
             self.explore_filter_dropdown["values"] = _filter_choices
+        # The drawer's filter combo previously missed this resync, so a
+        # filter set added while the drawer was open didn't appear in it.
+        if getattr(self, "_drawer_filter_dd", None) is not None and self._drawer_filter_dd.winfo_exists():
+            self._drawer_filter_dd["values"] = _filter_choices
         # Equipment tab's inline Filter Library panel mirrors the same data
         if hasattr(self, "_equip_filter_refresh"):
             self._equip_filter_refresh()
@@ -15137,12 +15240,11 @@ class AstroApp:
         #
         # Two sources exist: the named "active rig" (settings.active_rig,
         # kept up to date whenever a saved rig is picked from the rig
-        # dropdown) and a legacy per-field "session" snapshot that used to
-        # be written by the old Planner tab's analyze step. That tab is
-        # retired from navigation and its analysis path never runs anymore,
-        # so "session" is frozen wherever it last was and no longer reflects
-        # the rig actually last used -- it's kept only as a fallback for
-        # installs that predate the rig-preset feature. Preferring
+        # dropdown) and a per-field "session" snapshot written each time the
+        # Frame dialog's analysis runs (or Bortle changes). The session only
+        # reflects the rig last used to FRAME something, not a rig picked
+        # since — so it's kept as the fallback for installs that predate
+        # the rig-preset feature. Preferring
         # active_rig here is what makes the chips (and therefore the rig
         # dropdown's name-vs-"Custom…" indicator) agree at startup.
         #
@@ -15185,11 +15287,10 @@ class AstroApp:
                 self.reduction_factor.set(saved_red)
 
             if sess.get("target"):
-                self.target_search.delete(0, tk.END)
-                self.target_search.insert(0, sess["target"])
+                self._set_active_target(sess["target"])
 
             saved_fm = (active_rig or {}).get("filter") or sess.get("filter_mode")
-            if saved_fm in self.filter_dropdown["values"]:
+            if saved_fm in self._filter_choices:
                 self.filter_mode.set(saved_fm)
 
             self._equipment_chips_restored = True

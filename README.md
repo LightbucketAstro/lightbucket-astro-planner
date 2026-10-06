@@ -26,8 +26,8 @@ In one window it:
 
 - 🔭 **Searches NGC, IC, Messier, Caldwell, and Sharpless** from one box, with auto-complete on common names ("Orion Nebula" → M42 → NGC 1976) and a per-catalog filter to narrow suggestions to just the lists you care about
 - 🎯 **Frames the target on your sensor** with a draggable, rotatable FOV overlay on a live DSS image, in a dedicated Frame dialog — and your final framing carries through to the export, so if you nudge the frame off-centre or rotate it, NINA centres and rotates to match
-- 🗺️ **Opens an interactive sky map** centred on your target — a wide-field view with constellations, the Milky Way, a coordinate grid, and your sensor frame drawn in, as the zoomed-out companion to the close-up DSS framing
-- 🧭 **Compares rigs on a target** on the Explore tab — overlay up to six colour-coded scope/camera/reducer sensor frames on one DSS image, with a legend showing each rig's FOV, image scale, and how well the target fills the frame; apply a saved preset from your Rig Library in one click
+- 🗺️ **Opens an interactive sky map** centred on your target — a wide-field view with constellations, the Milky Way, and every deep-sky symbol labelled without overlap, plus a callout lens for crowded regions. Click any object for tonight's altitude curve and how it fits your rig, then drag and rotate your sensor frame on the map and send that framing straight to Tonight's Plan
+- 🧭 **Compares rigs on a target** on the Explore tab — overlay up to six colour-coded scope/camera/reducer sensor frames on one DSS image, with a legend showing each rig's FOV, image scale, and how big the target sits in the frame (its span across the frame and its share of the sensor area); apply a saved preset from your Rig Library in one click
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
 - 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
 - 📍 **Saves named location profiles** so dark-site travelers can switch between home and remote sites in a click — every twilight, moon, and altitude calculation follows the active site
@@ -37,7 +37,7 @@ In one window it:
 - 🧩 **Imports your NINA profile** — pulls in filter-wheel names (LRGB + narrowband, with a bandwidth prompt) and your configured telescope, showing a preview of exactly what will be added or updated before anything is saved, and never touches whichever filter you currently have selected
 - 🛠️ **Saves reusable equipment "rigs" and filter sets** — build a Rig Library of one-click scope + camera + reducer + filter combinations, and a Filter Library of Filter Sets that can mix LRGB and narrowband channels under a single saved filter wheel
 - 💾 **Saves and reloads sessions** as JSON, with a prompt on close so an evening's planning is never lost by accident
-- 🔴 **Switches between day and night themes** so it's legible outdoors under a red torch and indoors at a desk
+- 🔴 **Switches between day and night themes** so it's legible outdoors under a red torch and indoors at a desk — in night mode even the DSS sky images turn dim red, so a bright galaxy core never spoils your dark adaptation
 - 🌆 **Keeps Bortle class as one control** — change the single header dropdown and every already-planned target's recommended exposure rescales automatically, so a plan never silently goes stale under a different sky
 
 No account, no cloud, no subscription. Your data stays on your machine. Built as a Tkinter desktop app and shipped as native installers — no Python install required on either platform.
@@ -57,12 +57,12 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
   </tr>
   <tr>
     <td width="50%">
-      <img src="docs/screenshots/frame-dialog.png" alt="The Frame dialog showing an altitude chart above a rotated sensor frame overlaid on a galaxy">
-      <p align="center"><sub><b>Frame dialog</b> — drag to pan, grab a corner to rotate, and confirm to commit the framing to your plan</sub></p>
+      <img src="docs/screenshots/frame-dialog.png" alt="The Frame dialog: an altitude chart with a hover crosshair above a rotated sensor frame on a DSS image, with a caption showing fit, span and position angle">
+      <p align="center"><sub><b>Frame dialog</b> — drag to pan, grab a corner to rotate; the caption shows fit, span and PA, and the chart reads out time and altitude on hover</sub></p>
     </td>
     <td width="50%">
-      <img src="docs/screenshots/visible-tonight.png" alt="Visible Tonight dialog showing seasonal galaxies above the altitude floor">
-      <p align="center"><sub><b>Visible Tonight</b> — seasonal targets above your altitude floor, filtered by type and magnitude</sub></p>
+      <img src="docs/screenshots/explore-rig-cards.png" alt="Explore tab legend cards showing span and area framing tiles and the catalog size for each rig">
+      <p align="center"><sub><b>Rig cards</b> — span and area tiles show at a glance how big the target sits in each rig's frame</sub></p>
     </td>
   </tr>
   <tr>
@@ -73,6 +73,12 @@ No account, no cloud, no subscription. Your data stays on your machine. Built as
     <td width="50%">
       <img src="docs/screenshots/html-export.png" alt="Exported HTML plan report showing per-target details with an embedded altitude chart">
       <p align="center"><sub><b>HTML export</b> — a printable night's-plan report with each target's altitude chart, ready for Print → Save as PDF</sub></p>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2">
+      <img src="docs/screenshots/skymap.png" alt="The interactive sky map with collision-free labels, a pinned callout lens listing objects in a crowded region, an open object card, and the rig's sensor frame with the frame composer bar">
+      <p align="center"><sub><b>Sky map</b> — collision-free labels, a callout lens for crowded fields, object cards with tonight's altitude curve, and a draggable sensor frame you can send straight to Tonight's Plan</sub></p>
     </td>
   </tr>
 </table>
@@ -175,8 +181,8 @@ per-target imaging window, so it's worth getting right.
 If you observe from more than one place, save each as a **named location
 profile**: get the coordinates right, then use the **Location** dropdown's
 **☆ Save** to name the site (your first one is created automatically as
-*Home*). Switch sites anytime from that dropdown — or from the Visible
-Tonight dialog — and use **⚙ Manage** to rename, update, or delete them.
+*Home*). Switch sites anytime from that dropdown, and use **⚙ Manage** to
+rename, update, or delete them.
 Auto-detect fills the fields and leaves saving to you, so detecting a new
 spot never overwrites a saved site.
 
@@ -211,9 +217,8 @@ The **Analysis Preferences** card exposes:
 | ------------------------------------ | ------------------- | ----------------------------------------------------------------------------- |
 | **C-constant (sub-exposure factor)** | `10`                | Multiplier in the recommended-sub-length formula. Higher = longer subs.       |
 | **Default Bortle class**             | `4 (Rural/Suburban)`| Sets the Bortle class the header's SKY control starts on.                     |
-| **Default allocated hours**          | `4.0`               | How many hours the integration planner targets per object. `0` = use full dark window. |
-| **Min altitude for Visible Tonight** | `20°`               | Targets below this altitude during the dark window are hidden from "Visible Tonight" lists. |
-| **Auto-update analysis on equipment change** | Off          | When on, changing a piece of equipment immediately re-runs the analysis.      |
+| **Default allocated hours**          | `4.0`               | How many hours each target added to Tonight's Plan is allocated. `0` = use its full dark window. |
+| **Min altitude for Visible Tonight** | `20°`               | Starting altitude floor for Tonight's Plan's 🌙 **Tonight** grid (adjustable per session under **⚙ Filters**), and the "min" line on altitude charts. |
 
 Click **Save Preferences** to persist. The NGC / IC catalog downloads
 automatically in the background on first launch; if the download fails, the
@@ -282,11 +287,31 @@ rigs side by side. If you've saved a preset in the Rig Library, **Add saved
 rig…** applies and analyzes it in a single click.
 
 Each analyzed rig gets a **legend card** in the left rail showing its FOV,
-image scale, focal ratio and effective focal length, plus whether the target
-fits the sensor and how much of the frame it fills — the number that usually
-settles the "which rig?" question. Hover a card to highlight its frame and
-dim the others; use the 👁 toggle to hide a frame without losing its colour,
-✕ to remove it, or **✕ clear all** to start over.
+image scale, focal ratio and effective focal length, plus two big-number
+**framing tiles** — the numbers that usually settle the "which rig?"
+question:
+
+- **Span** — the target's long axis as a percentage of the frame's short
+  side. It answers "how big is it in my frame?" and works at any rotation.
+  The tile's edge bar matches that rig's frame colour on the image.
+- **Area** — the catalog ellipse's area as a share of the whole sensor.
+  This always reads much lower than span (a target spanning 30% of the
+  frame covers only about 7% of its area).
+
+A card that matches one of your saved rigs is titled with the rig's name, with
+the scope · camera · reducer · filter on the line beneath. A combination you
+haven't saved is tagged **TRIAL** and gets a **☆ Save as rig** chip on its
+tile row — name it and the card switches to the saved look. The card for the
+equipment Tonight's Plan is currently using carries an **● ON TONIGHT** badge.
+
+Next to the tiles is the catalog size those numbers came from, e.g.
+*9.9′ · OpenNGC*, so a surprising figure can be traced to its source —
+different catalogs disagree on how big a cluster or nebula is. A rig too
+small for the target shows a single red tile with its span (e.g. *412% ·
+too big*). The same span and area figures appear in the rig's report on the
+right, which also lists the target size. Hover a card to highlight its frame
+and dim the others; use the 👁 toggle to hide a frame without losing its
+colour, ✕ to remove it, or **✕ clear all** to start over.
 
 The image is fetched at whatever span your largest analyzed FOV needs — there's
 no fixed size cap, so a wide-FOV rig frames correctly instead of clipping at
@@ -299,24 +324,102 @@ you can sweep one set of equipment across a season's worth of candidates.
 Offline, the tab falls back to a geometric ellipse preview, with the frames
 still drawn to scale.
 
-The **Show Sky Map** button opens a wide-field, interactive sky map centred
-on the analyzed target. It shows stars, constellation lines and names,
-Messier objects, the Milky Way band, and a coordinate grid (each toggleable),
-with a magnitude slider, zoom control, and an approximate field-of-view
-readout. Your sensor frame is drawn on the target at the right size and
-position angle, a **Recenter** button snaps back after you pan, and the map
-follows the app's day/night theme. Analyze a target first — the button needs
+<a id="sky-map"></a>
+
+#### 🗺️ Sky map
+
+**Show Sky Map** opens a wide-field, interactive map centred on the target
+you've loaded in Explore, with the active rig's sensor frame drawn on it at
+true size and position angle. Analyze a target first — the button needs
 coordinates to centre on.
+
+The map opens with the rig card you have selected in Explore, and that rig
+becomes Tonight's Plan's active equipment too (a short toast tells you), so a
+framing you send back lands on the rig you were looking at. An unsaved
+combination is applied as-is and the rig chip reads *Custom…*. Targets already
+in your plan keep their own equipment.
+
+**Layers and labels.** The **Layers** panel (top-left) toggles constellation
+lines and names, the coordinate grid, the Milky Way, and constellation
+boundaries, plus five deep-sky groups — galaxies, bright nebulae, dark
+nebulae, clusters, and remnants & planetaries — each with a live count of
+how many are in view. Every label on the map is placed in one shared pass so
+names never overlap at any zoom; the **Labels** HUD (top-right) sets the
+density (**Sparse** / **Balanced** / **Dense**) and turns star names (★) and
+deep-sky labels (**DSO**) on or off. Bright stars get proper names when zoomed
+out, Bayer/Flamsteed designations as you zoom in. Sharpless, LBN and other
+nebulae with no catalogued magnitude are drawn too — along with supernova
+remnants — so H II regions and big emission clouds actually show up.
+Your Layers, deep-sky group, label and magnitude settings (and **Hide
+planned**) are remembered, so the map opens the way you left it.
+
+**Callout lens.** With **◎ Lens** on, hovering the map shows a circle that
+lists every object under it in tidy columns beside it, with leader lines back
+to each one — the way to read a crowded patch of Milky Way. Click to pin it in
+place, **Esc** to release, **L** to switch it on or off.
+
+**Object cards.** Click any object (or a row in a pinned lens) for its card:
+tonight's altitude curve with dusk, dawn, your best window and peak; a moon
+chip (separation and illumination, colour-coded by impact); a fit chip that
+tells you whether it **fits one frame**, is **small in frame**, or **needs a
+~N×M mosaic** on the current rig; and whether it's in the app's catalog or
+would be added as a custom target. **⌖ Frame here** moves your sensor frame
+onto it; **＋ Tonight** adds it to Tonight's Plan centred at PA 0° with the
+current rig — or shows **✓ In Tonight** if it's already planned on this rig.
+Right-click anywhere for a menu: open an object's card, frame an object,
+**Frame this spot** (an empty patch of sky), or pin/release the lens.
+
+**Frame composer.** The bar along the bottom turns the map into a framing
+tool. Drag inside the sensor frame to move it, drag the knob above its top
+edge to rotate it (hold **Shift** to snap to 15°), or type a position angle —
+**[** and **]** nudge it by 1°, **Shift** by 10°. A status chip tells you
+whether the frame is **on target**, offset from an object (e.g. *⌁ NGC 7000 ·
+offset 12′*), or a **custom field**, which is named from its coordinates
+(*Field J2058+4420*) — rename it in the name box if you like. **↺** snaps back
+to the launched target and angle. The frame is drawn in its rig's colour (the
+same colour as that rig's plan cards and timeline bars) with the rig's name
+tagged on its corner. Click the **rig chip** at the left of the bar to switch
+rigs: the frame resizes in place, keeping its centre, angle and name, and
+Tonight's Plan switches to that rig too. An unsaved setup is listed at the top
+with **☆ Save as rig…**. **Send framing → Tonight** adds the framing
+to Tonight's Plan with the rig shown on the bar, exactly like the Frame
+dialog's Confirm: centre and PA go straight through to the NINA export, and
+re-sending a target that's already planned updates its framing (with an
+**Add anyway** option when it would otherwise be a duplicate).
+
+A framing sent from the map behaves like any other plan entry back in the
+app: it's pinned under **Recently touched** in Tonight's Plan's browsing grid
+(a custom field gets a **FLD** type chip), opening **🖼 Frame** on it shows the
+centre and rotation you set on the map, and its DSS preview is fetched by
+coordinates, so even a custom field gets a real sky image.
+
+**Your plan on the map.** Targets already in Tonight's Plan are labelled with
+a green **✓**, and every planned framing — on any rig — is drawn as a dashed
+outline at that rig's true size, in its colour, tagged *✓ planned · rig name*,
+so you can see what's covered and frame neighbours around it. **◌ Hide
+planned** on the bar clears those outlines when you want a clean view. The
+markers refresh every few seconds while the map is open.
+
+**Navigation and detail.** Drag to pan, scroll or use **− / +** to zoom (the
+field width is shown between them and in the status bar), and **Recenter on
+target** to snap back. The magnitude slider (bottom-left) sets the faintest
+stars shown; its range follows the catalog tier you've installed — the app
+bundles a **Lean** tier (stars to mag 6, Messier objects) and can download
+**Extended** or **Full** tiers for fainter stars and the full deep-sky list
+from **Settings → Sky-map catalog**. The ◐ in the title bar switches the map
+between the day and red night themes.
 
 The map renders fully offline from assets bundled with the app and opens in
 its own window. On Windows that window uses the Microsoft Edge WebView2
 runtime, which ships with essentially all current Windows 10 / 11 systems; if
 it isn't available, the map falls back to opening in your default browser, so
-the button never dead-ends. macOS uses the built-in system web view — nothing
-extra to install.
+the button never dead-ends — though sending framings to Tonight's Plan needs
+the map to have been opened from the app. macOS uses the built-in system web
+view — nothing extra to install.
 
-Explore doesn't add anything to tonight's plan on its own. Once you know
-which rig you want, switch to **Tonight's Plan** to frame and commit it.
+Explore itself doesn't add anything to tonight's plan — once you know which
+rig you want, switch to **Tonight's Plan** to frame and commit it, or send a
+framing straight from the sky map.
 
 ### 🌙 Tonight's Plan
 
@@ -339,7 +442,11 @@ Two icons on each card handle adding it to your plan. **🖼 Frame** opens the
 sensor-frame preview on a live DSS image. Drag to pan the frame off-centre,
 grab a corner to rotate it; the rotation readout shows the position angle in
 NINA's own convention (counter-clockwise from north, 0° upright), so the
-number on the preview matches NINA's framing assistant. **Confirm Framing**
+number on the preview matches NINA's framing assistant. The caption under
+the image reads, e.g., *M52 ✅ fits · 23% span · PA 0.0° · img 1.2°*, and
+hovering the altitude chart shows a crosshair with the time and altitude
+under the cursor (plus moonrise/moonset when you're over those markers).
+**Confirm Framing**
 (relabeled **Update Framing** if the target's already in your plan under this
 exact rig and filter) commits that exact centre and rotation to the export.
 **＋ Add to Tonight** skips the dialog entirely, adding the target
@@ -403,7 +510,17 @@ Observer location — including named **location profiles** for multiple
 observing sites, with ☆ to save the current coordinates and ⚙ to rename,
 update, or delete saved sites — analysis preferences, data management
 (NINA profile import, NGC / IC catalog re-download, DSS image cache clear),
-sky-map catalog tiers, and **Updates**.
+the **Sky-map catalog**, and **Updates**.
+
+The **Sky-map catalog** card picks how much detail the sky map loads:
+
+| Tier         | Contents                         | Size          |
+| ------------ | -------------------------------- | ------------- |
+| **Lean**     | Stars to mag 6, Messier objects  | Bundled       |
+| **Extended** | Stars to mag 8, deep-sky to mag 6| ~7 MB download|
+| **Full**     | Stars to mag 14, deep-sky to mag 14 | ~19 MB download |
+
+Each tier downloads once, with a progress bar, and is then selectable offline.
 
 Bortle class isn't set here, or per-rig, anymore — it's the single **SKY:**
 control in the header, next to the twilight readout. Changing it immediately
@@ -436,7 +553,11 @@ Inside that folder you'll find:
 - `ngc_addendum.csv` — extra non-NGC/IC objects (downloaded alongside the main catalog)
 - `sessions/` — saved `.json` session plans
 - `dss_cache/` — cached DSS thumbnails (safe to delete)
+- `skymap_catalog/` — Extended / Full sky-map catalog tiers, if you've
+  downloaded them
 - `crash.log` — only present if the app has crashed; useful for bug reports
+- `skymap.log` — a short trail of sky-map events (opens, catalog loads,
+  framings sent to the plan); useful for sky-map bug reports
 
 To fully reset the app, quit it and delete the folder above. It will be
 re-created on next launch.
@@ -620,6 +741,63 @@ Nothing about your saved data needs migrating by hand for any of the above —
 sessions, gear, rigs, and filter sets all upgrade automatically the first
 time you launch 2.0.0.
 
+New in the next release, nothing needs migrating:
+
+- **Explore's rig cards show framing at a glance.** Each card now has
+  big-number **span** and **area** tiles instead of a single "fills N%"
+  line, plus the catalog size behind them (see [Explore](#-explore)). The
+  old figure was area-based, which made compact targets look tiny — M52 on
+  a 0.72° frame read "fills 4%" while actually spanning 23% of the frame.
+- **The Frame dialog's caption shows the span too**, and labels the
+  position angle (*PA 0.0°*) so it isn't mistaken for another measurement.
+- **The Frame dialog's altitude chart responds to the mouse** — hover for
+  a crosshair with the time and altitude under the cursor.
+- **Night mode dims the sky images.** The DSS pictures in Explore and the
+  Frame dialog turn dim red in night mode instead of staying full brightness.
+- **Fixes:** the browsing grid on Tonight's Plan no longer reverts to day
+  colours when you switch back to that tab in night mode; a high-peaking
+  target's "▲ peak @ time" label no longer collides with the chart title;
+  objects whose catalog lists only one dimension (like M52) no longer draw as
+  a flat line in the offline framing preview.
+- **The sky map became a planning tool, not just a viewer.** Click any
+  object for a card with tonight's altitude curve, moon and rig-fit chips,
+  and one-click **＋ Tonight**; drag and rotate your sensor frame on the map
+  and **Send framing → Tonight** to add it (centre and PA carry through to
+  NINA); planned targets show a ✓ and a ghost of their framing. A **callout
+  lens** reads crowded regions, all labels are now collision-free with a
+  **Sparse / Balanced / Dense** setting, the Layers panel can show or hide
+  each deep-sky group with live counts, and Sharpless / LBN nebulae with no
+  catalogued magnitude — about 900 of the bright-nebula catalog, plus the
+  supernova remnants, which were silently skipped before — are finally drawn.
+  See [Sky map](#sky-map).
+- **Framings from the sky map carry through.** They're pinned in Tonight's
+  Plan's grid, reopen in the Frame dialog with the map's centre and
+  rotation, and custom fields get a proper DSS preview.
+- **The sky map opens reliably on Windows.** It no longer comes up with no
+  stars or deep-sky objects on the first open: Windows was refusing some of
+  the map's simultaneous catalog requests, and the map was sometimes built
+  before its window had finished sizing. Catalog files that fail to load are
+  now retried instead of silently leaving a layer blank, and the map writes a
+  short `skymap.log` in your data folder to help diagnose anything that's
+  still off.
+- **The sky map knows which rig you're framing with.** It opens with the rig
+  card selected in Explore and makes it Tonight's Plan's equipment; the frame
+  is drawn in the rig's colour with its name on it; the bar's rig chip
+  switches rigs in place; and planned framings from every rig are drawn at
+  their own size and labelled, with a **Hide planned** toggle. Previously a
+  framing planned on one rig showed as an unlabelled outline that looked like
+  the live frame after switching rigs.
+- **The sky map remembers your settings.** Layers, deep-sky groups, label
+  density and toggles, the magnitude slider and Hide planned now stick
+  between opens instead of resetting every time.
+- **Explore's rig cards show your rig names.** Saved rigs are titled by
+  name, unsaved combinations are tagged **TRIAL** with a **☆ Save as rig**
+  chip, and the card Tonight's Plan is using is marked **● ON TONIGHT**.
+  **Add saved rig…** now carries the rig's filter as well.
+- **One setting retired.** *Auto-update analysis on equipment change* is
+  gone from **Settings** — it only affected the old Planner tab, which no
+  longer exists, so it had no effect.
+
 ---
 
 ## Reporting Bugs
@@ -628,7 +806,8 @@ If something breaks, please include:
 
 1. Your OS and version.
 2. The app version (shown in the title bar, and under **Settings → Updates**).
-3. A copy of `crash.log` from the data folder if one exists.
+3. A copy of `crash.log` from the data folder if one exists — and
+   `skymap.log` too if the problem is with the sky map.
 4. A short description of what you were doing when the problem occurred.
 
 ---

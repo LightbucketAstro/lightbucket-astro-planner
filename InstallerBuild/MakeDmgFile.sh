@@ -12,13 +12,13 @@
 #     brew install create-dmg
 #
 # Output:
-#     installer/LightbucketAstroPlanner-2.0.0.dmg
+#     installer/LightbucketAstroPlanner-2.1.0.dmg
 #
 
 set -e
 
 APP_NAME="Lightbucket Astro Planner"
-APP_VERSION="2.0.0"
+APP_VERSION="2.1.0"
 APP_PATH="dist/${APP_NAME}.app"
 OUTPUT_DIR="installer"
 DMG_NAME="LightbucketAstroPlanner-${APP_VERSION}.dmg"
