@@ -102,7 +102,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-2.0.0.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-2.1.0.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -121,7 +121,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-2.0.0-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-2.1.0-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -741,7 +741,7 @@ Nothing about your saved data needs migrating by hand for any of the above —
 sessions, gear, rigs, and filter sets all upgrade automatically the first
 time you launch 2.0.0.
 
-New in the next release, nothing needs migrating:
+New in 2.1.0, nothing needs migrating:
 
 - **Explore's rig cards show framing at a glance.** Each card now has
   big-number **span** and **area** tiles instead of a single "fills N%"
