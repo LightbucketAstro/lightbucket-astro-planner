@@ -21,8 +21,8 @@ Build command (run from inside InstallerBuild/):
 The app version (macOS bundle version below) is read from __version__ in
 AstroPlanner.py, so bumping that one line is all a release needs.
 
-The build environment must have pywebview installed:
-    pip install pywebview
+The build environment must have pywebview and certifi installed:
+    pip install pywebview certifi
 On Windows that also pulls pythonnet / clr_loader (the WebView2 bridge);
 on macOS it uses the built-in WKWebView via pyobjc.
 """
@@ -67,7 +67,17 @@ if SHARPLESS_CSV.exists():
     datas.append((str(SHARPLESS_CSV), "."))
 
 binaries = []
-hiddenimports = ["webview"]
+hiddenimports = ["webview", "certifi"]
+
+# ---- certifi (trusted HTTPS certificates) ---------------------------------
+# The app verifies every HTTPS download against the OS certificate store
+# plus certifi's bundle (cacert.pem). Bundle that file explicitly so a
+# frozen build never depends on PyInstaller's hook picking it up.
+try:
+    from PyInstaller.utils.hooks import collect_data_files
+    datas += collect_data_files("certifi")
+except Exception:
+    pass
 
 # ---- pywebview / WebView2 backend -----------------------------------------
 # pywebview's renderer modules and (on Windows) the pythonnet/clr bridge plus

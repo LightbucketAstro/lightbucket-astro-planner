@@ -29,7 +29,7 @@ In one window it:
 - 🗺️ **Opens an interactive sky map** centred on your target — a wide-field view with constellations, the Milky Way, and every deep-sky symbol labelled without overlap, plus a callout lens for crowded regions. Click any object for tonight's altitude curve and how it fits your rig, then drag and rotate your sensor frame on the map and send that framing straight to Tonight's Plan
 - 🧭 **Compares rigs on a target** on the Explore tab — overlay up to six colour-coded scope/camera/reducer sensor frames on one DSS image, with a legend showing each rig's FOV, image scale, and how big the target sits in the frame (its span across the frame and its share of the sensor area); apply a saved preset from your Rig Library in one click
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
-- 🌙 **Calculates tonight's imaging window** between astronomical twilight, moonrise/moonset, and per-target altitude
+- 🌙 **Calculates tonight's imaging window** inside astronomical darkness (sun below −18°), with moonrise/moonset and per-target altitude
 - 📍 **Saves named location profiles** so dark-site travelers can switch between home and remote sites in a click — every twilight, moon, and altitude calculation follows the active site
 - 📊 **Schedules the night as a drag-to-reorder plan** — commit targets straight from a live "what's up tonight" grid, reorder them by dragging a card's grip handle, and see the whole night as a collapsible timeline strip
 - 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
@@ -102,7 +102,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-2.1.0.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-2.1.1.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -121,7 +121,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-2.1.0-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-2.1.1-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -218,7 +218,7 @@ The **Analysis Preferences** card exposes:
 | **C-constant (sub-exposure factor)** | `10`                | Multiplier in the recommended-sub-length formula. Higher = longer subs.       |
 | **Default Bortle class**             | `4 (Rural/Suburban)`| Sets the Bortle class the header's SKY control starts on.                     |
 | **Default allocated hours**          | `4.0`               | How many hours each target added to Tonight's Plan is allocated. `0` = use its full dark window. |
-| **Min altitude for Visible Tonight** | `20°`               | Starting altitude floor for Tonight's Plan's 🌙 **Tonight** grid (adjustable per session under **⚙ Filters**), and the "min" line on altitude charts. |
+| **Minimum altitude**                 | `20°`               | The one altitude floor used everywhere: the 🌙 **Tonight** grid, imaging windows, altitude charts and exports. **⚙ Filters** edits the same value. |
 
 Click **Save Preferences** to persist. The NGC / IC catalog downloads
 automatically in the background on first launch; if the download fails, the
@@ -549,10 +549,12 @@ Inside that folder you'll find:
 
 - `astro_gear.json` — equipment, preferences, last session state, and your
   Rig Library and Filter Sets
+- `astro_gear.json.bak` — a copy of `astro_gear.json` as it was when the app
+  last started. If the main file is ever unreadable the app loads this copy,
+  keeps the damaged file as `astro_gear.corrupt-<date>.json`, and tells you.
 - `ngc_catalog.csv` — downloaded NGC / IC catalog
 - `ngc_addendum.csv` — extra non-NGC/IC objects (downloaded alongside the main catalog)
 - `sessions/` — saved `.json` session plans
-- `dss_cache/` — cached DSS thumbnails (safe to delete)
 - `skymap_catalog/` — Extended / Full sky-map catalog tiers, if you've
   downloaded them
 - `crash.log` — only present if the app has crashed; useful for bug reports
@@ -797,6 +799,60 @@ New in 2.1.0, nothing needs migrating:
 - **One setting retired.** *Auto-update analysis on equipment change* is
   gone from **Settings** — it only affected the old Planner tab, which no
   longer exists, so it had no effect.
+
+New in 2.1.1, nothing needs migrating (a backup of your equipment file,
+`astro_gear.json.bak`, is created automatically the first time you change
+anything):
+
+- **Faster Plan tab.** The catalog scan is about 4× faster, and its result is
+  kept: switching tabs, day/night mode, or removing a target no longer
+  rescans the whole catalog — only changing the date, site or filters does,
+  or pressing Rescan. The browsing grid's rows build about 5× faster.
+- **Cleaner catalog.** About 660 duplicate or non-existent catalog entries
+  are gone. A duplicate name now finds the real object (searching NGC 2244
+  opens NGC 2239's entry instead of an empty "Other"). Catalogued stars show
+  as STAR and stellar associations as AST instead of "Other". Messier numbers
+  come from the catalog itself, so they're there even if the extra
+  cross-reference site was down when you downloaded it. No re-download is
+  needed.
+- **Calmer startup screen.** The Explore welcome animation pauses while
+  you're on another tab, and in night mode it's a still, dim-red mark.
+- **Everything uses astronomical darkness.** Imaging windows, the dark band
+  on every chart, the Gantt timeline and the header's Dusk/Dawn now all use
+  the sun at −18°. Before, the header showed astronomical twilight while the
+  windows used nautical (−12°), so windows started about 30 minutes earlier
+  than the header's Dusk.
+- **Times are right for any planning date.** After you stepped the date with
+  ◀ / ▶, transit times were off by your UTC offset (M31 showed 04:40 instead
+  of 00:38 in Ohio), and observers east of Greenwich lost about 3 hours of
+  evening. Dates on the other side of a daylight-saving change were also an
+  hour off. All fixed.
+- **One minimum altitude.** **⚙ Filters** and **Settings** now edit the same
+  value, and every window, chart and export uses it.
+- **Your equipment file is protected.** Saves are atomic, a backup is kept,
+  and an unreadable file is recovered from the backup instead of being
+  silently replaced with empty equipment.
+- **More fixes:** the Gantt no longer shrinks a plan's hours when its bar runs
+  past the window (the overflow is drawn and flagged instead) and shows every
+  rig, not just the first 8; cancelling "save first" when loading a session
+  keeps your plan; a damaged session file can't half-load; renaming a Filter
+  Set, camera or telescope updates the rigs and plan rows that use it;
+  equipment needs a name and sensible values; a filter change during a scan
+  is no longer lost; the first-run catalog download and location auto-detect
+  no longer freeze the window; Messier names no longer depend on the SEDS
+  website; the moon hint says "Full in N days" while the moon is waxing; and
+  the mouse wheel over the browsing grid scrolls the grid (it used to scroll
+  Tonight's Plan instead).
+- **Downloads are security-checked.** Every internet connection (catalog,
+  sky images, update check, location lookup) now verifies the server's
+  certificate. Before, checking was switched off, so on shared Wi-Fi a fake
+  server could have posed as the update check. The catalog and sky images
+  still download on networks that block the check; the update check never
+  skips it.
+- **One colour per filter and per object type.** The Filter Library's
+  member list now uses the same filter colours as the plan cards (Ha is
+  violet in both), and the search suggestions use the same object-type
+  colours as the grid's type chips.
 
 ---
 
