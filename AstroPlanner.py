@@ -57,7 +57,7 @@ from datetime import date, datetime, timezone, timedelta
 from pathlib import Path
 from PIL import Image, ImageTk
 
-__version__ = "2.1.1"
+__version__ = "2.2.0"
 
 # ── Update checking (GitHub Releases) ──────────────────────────────────────
 # The app is distributed solely through GitHub Releases, so the public,
@@ -354,6 +354,348 @@ class ToolTip:
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# ROTATOR TAPE (position-angle control)
+# ═══════════════════════════════════════════════════════════════════════
+# ── Schedule timeline (Rig Lanes) — pure helpers, no Tk ──────────────
+# Times are "continuous hours": local clock hours that keep counting past
+# midnight (01:30 → 25.5) so a night is one increasing range.
+
+SCHEDULE_ORDERS = (("transit", "Transit"), ("sets", "Sets first"), ("plan", "Plan order"))
+
+
+def _fmt_hm(h):
+    """Continuous hours → 'HH:MM', rounded to the nearest minute."""
+    m = int(round(h * 60.0)) % 1440
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def _norm_h(h, ax_start):
+    """Clock hours → continuous hours on a night axis starting at ax_start."""
+    return h if h >= ax_start - 0.01 else h + 24.0
+
+
+def lane_rows(spans):
+    """Stack (key, start, end) spans into the fewest sub-rows so that no two
+    spans in a row overlap. Returns ({key: row}, n_rows). Greedy by start
+    time, which is optimal for intervals; touching spans share a row."""
+    rows_end, out = [], {}
+    for key, st, en in sorted(spans, key=lambda t: (t[1], t[2])):
+        for r, end in enumerate(rows_end):
+            if st >= end - 1e-6:
+                rows_end[r] = en
+                out[key] = r
+                break
+        else:
+            out[key] = len(rows_end)
+            rows_end.append(en)
+    return out, max(len(rows_end), 1)
+
+
+def overlap_info(spans):
+    """For (start, end) spans: (number of overlapping pairs, merged ranges
+    where two or more spans are booked at once)."""
+    iv = sorted((a, b) for a, b in spans if b > a)
+    pairs = 0
+    for i in range(len(iv)):
+        for j in range(i + 1, len(iv)):
+            if iv[j][0] >= iv[i][1] - 1e-6:
+                break
+            pairs += 1
+    events = sorted([(a, 1) for a, _ in iv] + [(b, -1) for _, b in iv])
+    depth, start, clash = 0, None, []
+    for t, d in events:
+        depth += d
+        if depth >= 2 and start is None:
+            start = t
+        elif depth < 2 and start is not None:
+            if t - start > 1e-6:
+                clash.append((start, t))
+            start = None
+    return pairs, clash
+
+
+def _free_gaps(busy, lo, hi):
+    """Free (start, end) gaps inside [lo, hi] around the busy spans."""
+    gaps, cur = [], lo
+    for a, b in sorted(busy):
+        if b <= cur:
+            continue
+        if a >= hi:
+            break
+        if a > cur:
+            gaps.append((cur, min(a, hi)))
+        cur = max(cur, b)
+    if cur < hi:
+        gaps.append((cur, hi))
+    return gaps
+
+
+def auto_schedule(blocks, order="transit"):
+    """Pack one rig's targets into the night — a camera shoots one at a time.
+
+    ``blocks``: dicts with key, ws/we (the target's window), dur, transit
+    (or None) and idx (plan order), in continuous hours. Targets are taken
+    in the chosen order — transit time, earliest window end ("sets first")
+    or plan order — and each goes in the earliest free slot inside its own
+    window. If everything fitted, each block then slides toward its transit
+    as far as its window and neighbours allow (only when nothing is left
+    over, so the free time isn't fragmented).
+
+    Returns (placed {key: start}, wont_fit [{key, need, free, at}]) where
+    free/at are the longest gap still open in that target's window."""
+    if order == "sets":
+        sort_key = lambda b: (b["we"], b["ws"], b["idx"])
+    elif order == "plan":
+        sort_key = lambda b: b["idx"]
+    else:
+        sort_key = lambda b: (b["transit"] if b.get("transit") is not None
+                              else (b["ws"] + b["we"]) / 2.0, b["idx"])
+    busy, placed, wont = [], {}, []
+    for b in sorted(blocks, key=sort_key):
+        slot = next((a for a, z in _free_gaps(busy, b["ws"], b["we"])
+                     if z - a >= b["dur"] - 1e-6), None)
+        if slot is None:
+            wont.append(b)
+            continue
+        placed[b["key"]] = slot
+        busy.append((slot, slot + b["dur"]))
+    by_key = {b["key"]: b for b in blocks}
+    if not wont:
+        # Sweep back and forth: a block hemmed in by its neighbour can move
+        # once that neighbour has, so repeat until nothing shifts.
+        seq = sorted(placed, key=placed.get)
+        for sweep in range(12):
+            moved = False
+            order_i = range(len(seq) - 1, -1, -1) if sweep % 2 == 0 else range(len(seq))
+            for i in order_i:
+                k, b = seq[i], by_key[seq[i]]
+                if b.get("transit") is None:
+                    continue
+                lo = b["ws"]
+                if i > 0:
+                    lo = max(lo, placed[seq[i - 1]] + by_key[seq[i - 1]]["dur"])
+                hi = b["we"] - b["dur"]
+                if i + 1 < len(seq):
+                    hi = min(hi, placed[seq[i + 1]] - b["dur"])
+                if lo <= hi + 1e-9:
+                    new = min(max(b["transit"] - b["dur"] / 2.0, lo), hi)
+                    if abs(new - placed[k]) > 1e-9:
+                        placed[k], moved = new, True
+            if not moved:
+                break
+    out = []
+    for b in wont:
+        gaps = _free_gaps(busy, b["ws"], b["we"])
+        best = max(gaps, key=lambda g: g[1] - g[0], default=None)
+        out.append({"key": b["key"], "need": b["dur"],
+                    "free": (best[1] - best[0]) if best else 0.0,
+                    "at": best[0] if best else None})
+    return placed, out
+
+
+def _round_rect_points(x1, y1, x2, y2, r):
+    """Points for a rounded rectangle — draw with create_polygon(smooth=True)."""
+    r = max(0.0, min(r, (x2 - x1) / 2.0, (y2 - y1) / 2.0))
+    return [x1 + r, y1, x1 + r, y1, x2 - r, y1, x2 - r, y1, x2, y1, x2, y1 + r,
+            x2, y1 + r, x2, y2 - r, x2, y2 - r, x2, y2, x2 - r, y2, x2 - r, y2,
+            x1 + r, y2, x1 + r, y2, x1, y2, x1, y2 - r, x1, y2 - r, x1, y1 + r,
+            x1, y1 + r, x1, y1]
+
+
+def ellipse_points(cx, cy, major_px, minor_px, pos_ang, n=48):
+    """Polygon points for a target outline on a North-up / East-left canvas,
+    major axis at catalog position angle ``pos_ang`` (degrees from North
+    through East). Tk ovals can't rotate, so draw this with
+    create_polygon(..., smooth=True). No angle → major axis level (E–W)."""
+    pa = math.radians(90.0 if pos_ang is None else float(pos_ang))
+    ux, uy = -math.sin(pa), -math.cos(pa)          # along the major axis
+    vx, vy = math.cos(pa), -math.sin(pa)           # along the minor axis
+    a, b = major_px / 2.0, minor_px / 2.0
+    pts = []
+    for k in range(n):
+        t = 2 * math.pi * k / n
+        ca, sb = a * math.cos(t), b * math.sin(t)
+        pts += [cx + ca * ux + sb * vx, cy + ca * uy + sb * vy]
+    return pts
+
+
+def match_sensor_pa(target_pa, sensor_w, sensor_h):
+    """Sensor PA (NINA convention, 0–180) that lines the sensor's LONG side
+    up with an object's major axis at catalog position angle ``target_pa``.
+    At sensor PA 0 the long side of a landscape sensor runs East–West
+    (direction PA 90), so the long side follows the axis at PA − 90."""
+    if target_pa is None:
+        return None
+    if (sensor_w or 0) >= (sensor_h or 0):
+        return (float(target_pa) + 90.0) % 180.0
+    return float(target_pa) % 180.0
+
+
+class PaTape(tk.Frame):
+    """Rotator tape: a degree scale that slides under a fixed pointer (like
+    a camera rotator's scale), an editable PA field, and preset chips.
+
+    ``on_change(pa)`` is called with the new sky PA (0–360, NINA
+    convention) whenever the user changes it; ``set_value`` updates the
+    display without calling back. ``is_night()`` picks the palette.
+    """
+    PX_PER_DEG = 6.0
+    DAY = {"bg": "#0d1826", "tape": "#13202f", "tick": "#2e4a63", "major": "#7eb8d4",
+           "text": "#8ea3b8", "ptr": "#38bdf8", "field_bg": "#0a131f", "field_fg": "#e6edf5",
+           "chip_bg": "#132235", "chip_fg": "#cbd5e1", "match": "#fbbf24"}
+    NIGHT = {"bg": "#0b0000", "tape": "#1a0000", "tick": "#4a0f0a", "major": "#992211",
+             "text": "#882222", "ptr": "#cc2200", "field_bg": "#1a0000", "field_fg": "#cc0000",
+             "chip_bg": "#200000", "chip_fg": "#993300", "match": "#aa4400"}
+
+    def __init__(self, parent, on_change, is_night=lambda: False, value=0.0):
+        super().__init__(parent)
+        self._on_change = on_change
+        self._is_night = is_night
+        self._value = float(value) % 360.0
+        self._match = None            # (sensor_pa, label) or None
+        self._drag_x = None
+
+        top = tk.Frame(self)
+        top.pack(fill="x")
+        self._cv = tk.Canvas(top, height=40, highlightthickness=1, cursor="sb_h_double_arrow",
+                             takefocus=1)
+        self._cv.pack(side="left", fill="x", expand=True)
+        self._var = tk.StringVar(value=f"{self._value:.1f}")
+        self._lbl = tk.Label(top, text="PA", font=("Helvetica", 9))
+        self._lbl.pack(side="left", padx=(8, 3))
+        self._entry = tk.Entry(top, textvariable=self._var, width=6, justify="right",
+                               font=("Courier", 12, "bold"), relief="flat", highlightthickness=1)
+        self._entry.pack(side="left")
+        self._deg = tk.Label(top, text="°", font=("Helvetica", 11))
+        self._deg.pack(side="left", padx=(1, 0))
+
+        self._chips = tk.Frame(self)
+        self._chips.pack(fill="x", pady=(6, 0))
+
+        self._cv.bind("<Configure>", lambda e: self.redraw())
+        self._cv.bind("<ButtonPress-1>", self._press)
+        self._cv.bind("<B1-Motion>", self._drag)
+        self._cv.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag_x", None))
+        self._cv.bind("<MouseWheel>", self._wheel)
+        self._cv.bind("<Button-4>", lambda e: self._nudge(-1 if not (e.state & 1) else -0.1))
+        self._cv.bind("<Button-5>", lambda e: self._nudge(1 if not (e.state & 1) else 0.1))
+        for w in (self._cv, self._entry):
+            w.bind("<Left>",  lambda e: (self._nudge(-0.1 if e.state & 1 else -1), "break")[1])
+            w.bind("<Right>", lambda e: (self._nudge(0.1 if e.state & 1 else 1), "break")[1])
+        self._entry.bind("<Return>", self._typed)
+        self._entry.bind("<FocusOut>", self._typed)
+        self._build_chips()
+        self.redraw()
+
+    # ── public ───────────────────────────────────────────────────────
+    def set_value(self, pa):
+        self._value = float(pa) % 360.0
+        if self.focus_get() is not self._entry:
+            self._var.set(f"{self._value:.1f}")
+        self.redraw()
+
+    def value(self):
+        return self._value
+
+    def set_match(self, sensor_pa, label, note=None):
+        """Show the "Match <label>" chip, or with ``sensor_pa=None`` hide it
+        and show ``note`` (why there's nothing to match) in its place."""
+        self._match = None if sensor_pa is None else (float(sensor_pa) % 360.0, label)
+        self._match_note = None if sensor_pa is not None else note
+        self._build_chips()
+        self.redraw()
+
+    # ── internals ────────────────────────────────────────────────────
+    def _set(self, pa):
+        self.set_value(pa)
+        self._var.set(f"{self._value:.1f}")
+        self._on_change(self._value)
+
+    def _nudge(self, d):
+        self._set(self._value + d)
+
+    def _press(self, e):
+        self._cv.focus_set()
+        self._drag_x = e.x
+
+    def _drag(self, e):
+        if self._drag_x is None:
+            return
+        dx = e.x - self._drag_x
+        self._drag_x = e.x
+        fine = 0.1 if (e.state & 1) else 1.0          # Shift = fine
+        self._set(self._value - dx / self.PX_PER_DEG * fine)
+
+    def _wheel(self, e):
+        step = 0.1 if (e.state & 1) else 1.0
+        self._nudge(-step if e.delta > 0 else step)
+
+    def _typed(self, _e=None):
+        try:
+            self._set(float(self._var.get().replace("°", "").strip()))
+        except ValueError:
+            self._var.set(f"{self._value:.1f}")
+
+    def _build_chips(self):
+        for w in self._chips.winfo_children():
+            w.destroy()
+        p = self.NIGHT if self._is_night() else self.DAY
+        items = []
+        if self._match:
+            items.append((f"Match {self._match[1]} · {self._match[0]:.0f}°", self._match[0], True))
+        elif getattr(self, "_match_note", None):
+            tk.Label(self._chips, text=self._match_note, font=("Helvetica", 9, "italic"),
+                     bg=p["chip_bg"], fg=p["text"], padx=9, pady=3).pack(side="left", padx=(0, 6))
+        items += [("0°", 0.0, False), ("90°", 90.0, False), ("Flip 180°", None, False)]
+        for text, val, accent in items:
+            lbl = tk.Label(self._chips, text=text, font=("Helvetica", 9, "bold" if accent else "normal"),
+                           bg=p["chip_bg"], fg=p["match"] if accent else p["chip_fg"],
+                           padx=9, pady=3, cursor="hand2")
+            lbl.pack(side="left", padx=(0, 6))
+            lbl.bind("<Button-1>", lambda e, v=val: self._set(self._value + 180.0 if v is None else v))
+        self._chip_hint = tk.Label(self._chips, text="drag or scroll the tape · Shift = fine",
+                                   font=("Helvetica", 8), fg=p["text"], bg=p["bg"])
+        self._chip_hint.pack(side="left", padx=(4, 0))
+
+    def redraw(self):
+        p = self.NIGHT if self._is_night() else self.DAY
+        for w in (self, self._chips, self._cv.master):
+            w.configure(bg=p["bg"])
+        for w in (self._lbl, self._deg):
+            w.configure(bg=p["bg"], fg=p["text"])
+        self._entry.configure(bg=p["field_bg"], fg=p["field_fg"], insertbackground=p["field_fg"],
+                              highlightbackground=p["ptr"], highlightcolor=p["ptr"])
+        if getattr(self, "_chip_hint", None) is not None:
+            self._chip_hint.configure(bg=p["bg"], fg=p["text"])
+        cv = self._cv
+        cv.configure(bg=p["tape"], highlightbackground=p["tick"])
+        cv.delete("all")
+        w = max(cv.winfo_width(), 60)
+        mid = w / 2.0
+        half_span = w / self.PX_PER_DEG / 2.0 + 1
+        a = math.floor(self._value - half_span)
+        while a <= self._value + half_span:
+            x = mid + (a - self._value) * self.PX_PER_DEG
+            aa = a % 360
+            if aa % 15 == 0:
+                cv.create_line(x, 0, x, 18, fill=p["major"])
+                cv.create_text(x, 30, text=str(int(aa)), fill=p["text"], font=("Courier", 9))
+            elif aa % 5 == 0:
+                cv.create_line(x, 0, x, 10, fill=p["tick"])
+            else:
+                cv.create_line(x, 0, x, 5, fill=p["tick"])
+            a += 1
+        if self._match:
+            m = self._match[0]
+            for cand in (m - 360, m, m + 360, m + 180 - 360, m + 180, m + 180 + 360):
+                x = mid + (cand - self._value) * self.PX_PER_DEG
+                if 0 <= x <= w:
+                    cv.create_oval(x - 3.5, 2.5, x + 3.5, 9.5, fill=p["match"], outline="")
+        cv.create_polygon(mid - 7, 0, mid + 7, 0, mid, 10, fill=p["ptr"], outline="")
+        cv.create_line(mid, 0, mid, 40, fill=p["ptr"], width=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # THEME PALETTE
 # ═══════════════════════════════════════════════════════════════════════
 # Centralising every colour literal here makes palette tweaks a one-line
@@ -576,6 +918,25 @@ RIG_ACCENT_COLORS = [
 # Built-in Messier catalog used as offline fallback when NGC download fails.
 # Columns: (name, type, RA h:m:s, Dec ±d:m:s, majax', minax', Vmag, SurfBr, common_names)
 # Types must match NGC_TYPE_CATEGORIES keys: E, Sa/Sb/Sc, S0, IG, OC, GC, EN, RN, PN, SNR, D*, Ast
+# Position angles (degrees, N through E) of the elongated Messier objects,
+# from OpenNGC's PosAng column. Fills in the angle when the catalog file has
+# none — the built-in fallback list, or a file from an older version — so the
+# rotator tape's "Match" chip still works for these targets.
+MESSIER_POSANG = {
+    24: 90, 31: 35, 32: 170, 33: 23, 49: 156, 51: 163, 58: 90, 59: 165, 60: 105,
+    61: 20, 63: 103, 64: 114, 65: 173, 66: 168, 74: 87, 77: 12, 81: 157, 82: 66,
+    83: 45, 84: 133, 85: 12, 86: 128, 87: 153, 88: 138, 89: 150, 90: 22, 91: 150,
+    94: 105, 95: 11, 96: 5, 98: 152, 99: 23, 100: 108, 101: 28, 104: 90, 105: 71,
+    106: 150, 108: 79, 109: 78, 110: 170,
+}
+
+
+def _messier_number(common):
+    """Messier number named in a "Common names" field ("…; M31"), or None."""
+    m = re.search(r'(?:^|[;,]\s*)M\s?(\d{1,3})\b', common or "")
+    return int(m.group(1)) if m else None
+
+
 _FALLBACK_CATALOG = [
     ("NGC 1952",  "SNR", "05:34:32", "+22:01:00",  7.0,  5.0,   8.4,  "",    "M1; Crab Nebula"),
     ("NGC 7089",  "GC",  "21:33:27", "-00:49:23",  16.0, 16.0,  6.5,  "",    "M2"),
@@ -1334,7 +1695,8 @@ def _write_fallback_catalog(path):
     load_target_catalog() can read both formats without any changes.
     Called automatically when the NGC download fails on first run.
     """
-    headers = ["Name", "Type", "RA", "Dec", "MajAx", "MinAx", "V-Mag", "SurfBr", "Common names"]
+    headers = ["Name", "Type", "RA", "Dec", "MajAx", "MinAx", "PosAng", "V-Mag", "SurfBr",
+               "Common names"]
     with open(path, "w", encoding="utf-8", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=headers, delimiter=";", extrasaction="ignore")
         writer.writeheader()
@@ -1346,6 +1708,7 @@ def _write_fallback_catalog(path):
                 "Dec":          dec,
                 "MajAx":        majax,
                 "MinAx":        minax,
+                "PosAng":       MESSIER_POSANG.get(_messier_number(common), ""),
                 "V-Mag":        vmag   if vmag   != "" else "",
                 "SurfBr":       surfbr if surfbr != "" else "",
                 "Common names": common,
@@ -1520,6 +1883,10 @@ class AstroApp:
         self._gantt_ax_start      = None   # axis left edge (float hours)
         self._gantt_ax_range      = None   # axis span (float hours)
         self._gantt_pw            = 0      # plot width pixels
+        self._gantt_preview       = None   # auto-schedule preview awaiting Apply
+        self._gantt_undo          = []     # [(entries snapshot, plan signature after)]
+        self._gantt_frozen_rows   = None   # lane sub-rows held still during a drag
+        self._gantt_press_snap    = None   # plan before a drag, for Undo
         self._sidebar_switching   = False  # True while sidebar is initiating a tab switch
 
         self.setup_header()
@@ -2939,12 +3306,22 @@ class AstroApp:
         """Flip between day (dark navy) and night (red) themes, redrawing the altitude chart."""
         self.night_mode = not self.night_mode
         self._apply_night_mode()
+        self.root.after(30, self._redraw_pa_tapes)
         # Redraw altitude chart with updated text colours
         if self.current_target_info is not None:
             lat, lon = self._get_saved_location()
             if lat is not None:
                 self.root.after(10, lambda: self._draw_altitude_chart(
                     self.current_target_info, lat, lon))
+
+    def _redraw_pa_tapes(self):
+        """Repaint every live rotator tape in the current theme."""
+        for tape in (getattr(self, "_explore_pa_tape", None), self._rot_label):
+            if tape is not None and isinstance(tape, PaTape) and self._widget_alive(tape):
+                tape._build_chips()
+                tape.redraw()
+        if getattr(self, "_fov_offline", False):
+            self._redraw_fov_overlay()          # geometric view follows the theme
 
     def _apply_night_mode(self):
         """Apply the currently-selected theme to every ttk style and tk widget.
@@ -3603,8 +3980,21 @@ class AstroApp:
         """Update the Frame dialog's rotation ("rot") or zoom ("zoom")
         readout, if the dialog is open."""
         lbl = self._rot_label if which == "rot" else self._zoom_label
-        if self._widget_alive(lbl):
+        if not self._widget_alive(lbl):
+            return
+        if which == "rot":
+            # The rotation readout is the rotator tape; text is "<PA>°".
+            try:
+                lbl.set_value(float(str(text).rstrip("°")))
+            except ValueError:
+                pass
+        else:
             lbl.config(text=text)
+
+    def _frame_pa_changed(self, sky_pa):
+        """Rotator tape in the Frame dialog moved — rotate the sensor box."""
+        self._fov_angle = self._screen_to_sky_pa(sky_pa)   # (its own inverse)
+        self._redraw_fov_overlay()
 
     @staticmethod
     def _night_sky_image(img, brightness=0.45):
@@ -3875,17 +4265,22 @@ class AstroApp:
                                 highlightthickness=1, highlightbackground="#2e4a63")
         fov_canvas.pack()
         fov_canvas.create_text(170, 170, text="Loading…", fill="gray", font=("Helvetica", 9))
-        tk.Label(dlg, text="drag to pan · corners to rotate", bg="#0d1620",
-                 fg="#9fb3c8", font=("Helvetica", 10)).pack(pady=(4, 0))
+        tk.Label(dlg, text="drag to pan · drag a corner or the tape to rotate · scroll to zoom",
+                 bg="#0d1620", fg="#9fb3c8", font=("Helvetica", 10)).pack(pady=(4, 0))
+
+        # Rotator tape — sets the sensor's sky PA (NINA convention).
+        rot_label = PaTape(dlg, on_change=self._frame_pa_changed,
+                           is_night=lambda: self.night_mode,
+                           value=self._screen_to_sky_pa(self._fov_angle))
+        rot_label.pack(fill="x", padx=16, pady=(8, 0))
+        cam = self.data["cameras"].get(self.camera_choice.get(), {})
+        note = self._pa_match_note(t)
+        rot_label.set_match(
+            None if note else match_sensor_pa(t.get("pos_ang"), cam.get("sensor_w"), cam.get("sensor_h")),
+            t["id"], note)
 
         ctrl_row = tk.Frame(dlg, bg="#0d1620")
         ctrl_row.pack(pady=(6, 4))
-        tk.Label(ctrl_row, text="Rot:", bg="#0d1620", fg="#778899",
-                 font=("Helvetica", 9)).pack(side="left", padx=(0, 2))
-        rot_label = tk.Label(ctrl_row, text=f"{self._screen_to_sky_pa(0.0):.1f}°",
-                              bg="#0d1620", fg="#ffffff", font=("Helvetica", 9), width=5)
-        rot_label.pack(side="left")
-        tk.Label(ctrl_row, text="|", bg="#0d1620", fg="#2e4a63").pack(side="left", padx=6)
         reset_btn = ttk.Button(ctrl_row, text="⌖ Reset", width=7, command=lambda: self._reset_fov_framing())
         reset_btn.pack(side="left", padx=2)
         tk.Label(ctrl_row, text="|", bg="#0d1620", fg="#2e4a63").pack(side="left", padx=6)
@@ -4964,7 +5359,7 @@ class AstroApp:
         gantt_header.pack(fill="x", padx=12, pady=(6, 2))
         tk.Label(gantt_header, text="SCHEDULE TIMELINE", bg="#050810", fg="#7eb8d4",
                  font=("Helvetica", 9, "bold")).pack(side="left")
-        tk.Label(gantt_header, text="·  drag a bar to set its start time",
+        tk.Label(gantt_header, text="·  one lane per rig  ·  drag a block to move it",
                  bg="#050810", fg="#556677", font=("Helvetica", 9)).pack(side="left", padx=(6, 0))
         self._gantt_collapse_btn = tk.Label(gantt_header, text="⌄ collapse", bg="#050810",
                  fg="#38bdf8", font=("Helvetica", 9, "underline"), cursor="hand2")
@@ -10420,6 +10815,7 @@ class AstroApp:
 
         w = self._fov_wait
         token = self._dss_wait_begin(w)
+        self._fov_offline = False
         if slow_lane is not None:
             w.target_id = target_id
             w.survey_deg = survey_size
@@ -10901,7 +11297,11 @@ class AstroApp:
         self._redraw_fov_overlay()
 
     def _redraw_fov_overlay(self):
-        """Redraw the overlay using the cached DSS image (no network call)."""
+        """Redraw the overlay using the cached DSS image (no network call),
+        or the geometric view when the image couldn't be fetched."""
+        if getattr(self, "_fov_offline", False) and self._frame_view_open():
+            self._draw_fov_geometric()
+            return
         if self._cached_dss_img is not None and self._cached_dss_target is not None:
             self._draw_fov_overlay(self._cached_dss_img, self._cached_dss_survey_deg,
                                    self._cached_dss_target)
@@ -10910,19 +11310,43 @@ class AstroApp:
         """Display 'DSS image unavailable' fallback on the preview canvas."""
         if not self._frame_view_open():
             return
-        cw = self._preview_size()[0]
-        ch = self._preview_size()[1]
-        self.preview_canvas.delete("all")
-        self.preview_canvas.create_text(cw//2, ch//2 - 10, text="DSS image unavailable", fill="gray", font=("Helvetica", 9))
-        self.preview_canvas.create_text(cw//2, ch//2 + 10, text="(check network)", fill="gray", font=("Helvetica", 8))
-        # Fall back to geometric preview
-        if self._fov_params:
-            fw, fh, t_maj, t_min = self._fov_params
-            px_scale = (min(cw, ch) * 0.8) / max(fw, fh, t_maj, t_min)
-            self.preview_canvas.create_rectangle(cw/2-fw*px_scale/2, ch/2-fh*px_scale/2,
-                                                  cw/2+fw*px_scale/2, ch/2+fh*px_scale/2, outline="white", width=2)
-            self.preview_canvas.create_oval(cw/2-t_maj*px_scale/2, ch/2-t_min*px_scale/2,
-                                             cw/2+t_maj*px_scale/2, ch/2+t_min*px_scale/2, outline="cyan", width=2)
+        self._fov_offline = True
+        self._draw_fov_geometric()
+
+    def _draw_fov_geometric(self):
+        """Offline Frame view: the target outline at its catalog angle and
+        the sensor frame at the current rotation, at true relative scale.
+        Corner handles are kept so rotating still works without an image."""
+        cv = self.preview_canvas
+        cw, ch = self._preview_size()
+        nm = self.night_mode
+        cv.delete("all")
+        cv.configure(bg="#0b0000" if nm else "black")
+        dim = "#661111" if nm else "gray"
+        cv.create_text(cw // 2, 14, text="DSS image unavailable — geometric view (check network)",
+                       fill=dim, font=("Helvetica", 8))
+        if not self._fov_params:
+            return
+        fw, fh, t_maj, t_min = self._fov_params
+        px = (min(cw, ch) * 0.8) / max(fw, fh, t_maj, t_min) * self._zoom_level
+        t = self.current_target_info or {}
+        cv.create_polygon(ellipse_points(cw / 2.0, ch / 2.0, t_maj * px, t_min * px, t.get("pos_ang")),
+                          outline="#992211" if nm else "cyan", fill="", width=2, smooth=True)
+        a = math.radians(self._fov_angle)
+        ca, sa = math.cos(a), math.sin(a)
+        rw, rh = fw * px / 2, fh * px / 2
+        cx, cy = self._fov_centre()          # follows pan, so corner drags pivot here
+        rot = lambda dx, dy: (cx + dx * ca - dy * sa, cy + dx * sa + dy * ca)
+        corners = [rot(-rw, -rh), rot(rw, -rh), rot(rw, rh), rot(-rw, rh)]
+        self._fov_corners = corners
+        cv.create_polygon([c for p in corners for c in p], outline="#cc2200" if nm else "white",
+                          fill="", width=2, dash=(6, 3))
+        for hx, hy in corners:
+            cv.create_rectangle(hx - 5, hy - 5, hx + 5, hy + 5,
+                                outline="#aa4400" if nm else "yellow",
+                                fill="#2a0000" if nm else "#333300", width=2)
+        cv.create_text(cw // 2, ch - 12, text=f"PA {self._screen_to_sky_pa(self._fov_angle):.1f}°",
+                       fill="#cc0000" if nm else "#e6edf5", font=("Helvetica", 9, "bold"))
 
     # ═══════════════════════════════════════════════════════════════════
     # EXPLORE TAB — compare sensor FOVs of multiple rigs over one target
@@ -11127,9 +11551,9 @@ class AstroApp:
         self.explore_canvas.bind("<Button-4>",   self._explore_mousewheel)   # Linux scroll up
         self.explore_canvas.bind("<Button-5>",   self._explore_mousewheel)   # Linux scroll down
         # Click-drag pans every visible rig frame together over the fixed
-        # DSS image (rotation stays on the slider below, which already
-        # spins every frame together too — no need to handle frames
-        # separately for either).
+        # DSS image; grabbing a frame corner rotates them all together (one
+        # shared PA, also on the rotator tape below).
+        self.explore_canvas.bind("<Motion>",          self._explore_fov_hover)
         self.explore_canvas.bind("<ButtonPress-1>",   self._explore_fov_mouse_down)
         self.explore_canvas.bind("<B1-Motion>",       self._explore_fov_mouse_drag)
         self.explore_canvas.bind("<ButtonRelease-1>", self._explore_fov_mouse_up)
@@ -11158,29 +11582,18 @@ class AstroApp:
         zoom_pill.place(in_=self.explore_canvas, relx=1.0, x=-10, y=10, anchor="ne")
         ToolTip(zoom_pill, "Zoom in/out (scroll wheel over the image works too)")
 
-        # Rotate bar — one shared slider spins every visible rig frame
+        # Rotator tape — one shared PA spins every visible rig frame
         # together; the DSS image itself stays fixed North-up, same
         # convention as the Frame dialog's FOV preview.
         rotate_bar = tk.Frame(canvas_col, bg="#131f2e")
         rotate_bar.pack(fill="x", pady=(6, 0))
-        tk.Label(rotate_bar, text="↻ ROTATE", bg="#131f2e", fg="#778899",
-                 font=("Helvetica", 9)).pack(side="left", padx=(8, 6))
-        self._explore_pa_var = tk.DoubleVar(value=0.0)
-        explore_pa_scale = ttk.Scale(rotate_bar, from_=0.0, to=360.0, orient="horizontal",
-                                     variable=self._explore_pa_var,
-                                     style="Explore.Horizontal.TScale",
-                                     command=self._explore_on_rotate)
-        explore_pa_scale.pack(side="left", fill="x", expand=True, padx=(0, 8), pady=6)
-        self._explore_pa_label = tk.Label(rotate_bar, text="0.0°",
-                                          bg="#131f2e", fg="#cc8833",
-                                          font=("Helvetica", 9, "bold"), width=6, anchor="e")
-        self._explore_pa_label.pack(side="left")
+        self._explore_pa_tape = PaTape(rotate_bar, on_change=self._explore_on_rotate,
+                                       is_night=lambda: self.night_mode, value=0.0)
+        self._explore_pa_tape.pack(side="left", fill="x", expand=True, padx=(8, 8), pady=6)
         explore_reset_lbl = tk.Label(rotate_bar, text="reset", bg="#131f2e", fg="#7eb8d4",
                                      font=("Helvetica", 8), cursor="hand2")
-        explore_reset_lbl.pack(side="left", padx=(8, 8))
+        explore_reset_lbl.pack(side="left", padx=(0, 8), anchor="n", pady=(16, 0))
         explore_reset_lbl.bind("<Button-1>", lambda e: self._explore_reset_view())
-        ToolTip(explore_pa_scale,
-               "Rotate every visible rig frame together\n(the image itself stays fixed North-up)")
         ToolTip(explore_reset_lbl, "Reset rotation, zoom, and pan\nto 0° / 1.0× / centred")
 
         tk.Label(canvas_col, text="drag the image to pan every frame",
@@ -11795,9 +12208,9 @@ class AstroApp:
             # Offline / fetch failed — geometric representation of the target
             t_maj = (t.get("size_maj") or 10.0) / 60.0 * ppd
             t_min = (t.get("size_min") or t.get("size_maj") or 10.0) / 60.0 * ppd
-            cv.create_oval(cxc - t_maj / 2, cyc - t_min / 2,
-                           cxc + t_maj / 2, cyc + t_min / 2,
-                           outline="cyan", width=2)
+            cv.create_polygon(ellipse_points(cxc, cyc, t_maj, t_min, t.get("pos_ang")),
+                              outline="#992211" if getattr(self, "night_mode", False) else "cyan",
+                              fill="", width=2, smooth=True)
             cv.create_text(cpx // 2, 16,
                            text="DSS unavailable — geometric view (check network)",
                            fill="#778899", font=("Helvetica", 9))
@@ -11826,6 +12239,8 @@ class AstroApp:
             return fcx + dx * cos_a - dy * sin_a, fcy + dx * sin_a + dy * cos_a
 
         clipped = False
+        self._explore_corners = []          # every visible frame corner, for grabbing
+        self._explore_rot_centre = (fcx, fcy)
         for r in self._explore_rigs:
             if not r["visible"]:
                 continue
@@ -11847,6 +12262,13 @@ class AstroApp:
                 kwargs["dash"] = r["dash"]
             flat = [coord for pt in corners for coord in pt]
             cv.create_polygon(flat, **kwargs)
+            # corner handles — grab one to rotate every frame (skipped on a
+            # frame too small to show them without hiding it)
+            for hx, hy in (corners if min(rw, rh) >= 18 else []):
+                if 0 <= hx <= cpx and 0 <= hy <= cpx:
+                    self._explore_corners.append((hx, hy))
+                    cv.create_rectangle(hx - 4, hy - 4, hx + 4, hy + 4, outline=color,
+                                        fill="#0b0000" if self.night_mode else "#0a131f", width=2)
             # Slot number just inside the frame's first corner (clamped on-canvas)
             tx = min(max(corners[0][0], 0) + 11, cpx - 10)
             ty = min(max(corners[0][1], 0) + 10, cpx - 10)
@@ -11871,15 +12293,40 @@ class AstroApp:
     # ── Rotate / zoom ────────────────────────────────────────────────────
 
     def _explore_on_rotate(self, value):
-        """Rotate slider moved — update the shared PA and redraw.
+        """Rotator tape moved — update the shared PA and redraw.
 
-        The slider's own value IS the displayed NINA-style sky PA (no
-        conversion needed here); _explore_redraw negates it when building
-        the screen rotation matrix so increasing PA turns the frames
-        counter-clockwise, matching NINA."""
+        The tape's value IS the displayed NINA-style sky PA (no conversion
+        needed here); _explore_redraw negates it when building the screen
+        rotation matrix so increasing PA turns the frames counter-clockwise,
+        matching NINA."""
         self._explore_pa_deg = float(value) % 360.0
-        self._explore_pa_label.config(text=f"{self._explore_pa_deg:.1f}°")
         self._explore_schedule_redraw()
+
+    @staticmethod
+    def _pa_match_note(t):
+        """Why "Match" can't apply to target t, or None if it can."""
+        if t.get("pos_ang") is None:
+            return f"{t.get('id', 'target')}: no catalog angle to match"
+        if (t.get("size_min") or 0) >= (t.get("size_maj") or 0):
+            return f"{t.get('id', 'target')} is round — no long axis to match"
+        return None
+
+    def _explore_update_pa_match(self):
+        """Point the tape's "Match" chip at the loaded target and the rig
+        whose report is showing (its sensor shape decides the angle)."""
+        tape = getattr(self, "_explore_pa_tape", None)
+        if tape is None:
+            return
+        t = self._explore_target
+        rig = next((r for r in self._explore_rigs if r.get("key") == self._explore_active_rig_key), None)
+        if t is None or rig is None:
+            tape.set_match(None, "")
+            return
+        note = self._pa_match_note(t)
+        if note:
+            tape.set_match(None, "", note)
+            return
+        tape.set_match(match_sensor_pa(t["pos_ang"], rig.get("fov_w"), rig.get("fov_h")), t["id"])
 
     def _explore_schedule_redraw(self):
         """Coalesce rapid rotate-slider events into at most one redraw per
@@ -11924,17 +12371,44 @@ class AstroApp:
         else:
             self._explore_apply_zoom(1 / 1.25)
 
+    def _explore_corner_hit(self, x, y):
+        """True when (x, y) is on a frame corner handle."""
+        return any(abs(x - hx) <= 8 and abs(y - hy) <= 8
+                   for hx, hy in getattr(self, "_explore_corners", []))
+
+    def _explore_fov_hover(self, event):
+        """Rotate cursor over a corner handle, move cursor elsewhere."""
+        if self._explore_target is None:
+            return
+        self.explore_canvas.config(
+            cursor="exchange" if self._explore_corner_hit(event.x, event.y) else "fleur")
+
     def _explore_fov_mouse_down(self, event):
-        """Begin a pan drag — records the start point; rotation stays on
-        the slider (see setup_explore_tab's rotate_bar), so there's no
-        corner-handle hit-testing to do here."""
+        """Begin a drag: rotate when a corner handle is grabbed, else pan."""
         self._explore_dragging = True
         self._explore_drag_start = (event.x, event.y)
+        self._explore_rotating = self._explore_corner_hit(event.x, event.y)
+        if self._explore_rotating:
+            cx, cy = self._explore_rot_centre
+            self._explore_rot_a0 = math.degrees(math.atan2(event.y - cy, event.x - cx))
+            self._explore_rot_pa0 = self._explore_pa_deg
 
     def _explore_fov_mouse_drag(self, event):
-        """Accumulate the pan offset and redraw (throttled, same as the
-        rotate slider — see _explore_schedule_redraw)."""
+        """Rotate (corner grabbed) or pan, then redraw (throttled — see
+        _explore_schedule_redraw)."""
         if not self._explore_dragging or self._explore_drag_start is None:
+            return
+        if getattr(self, "_explore_rotating", False):
+            cx, cy = self._explore_rot_centre
+            a = math.degrees(math.atan2(event.y - cy, event.x - cx))
+            # screen angle is clockwise-positive on this y-down canvas; PA
+            # runs counter-clockwise (N toward E), hence the minus
+            pa = (self._explore_rot_pa0 - (a - self._explore_rot_a0)) % 360.0
+            if event.state & 0x0001:            # Shift: snap to 15°
+                pa = (round(pa / 15.0) * 15.0) % 360.0
+            self._explore_pa_deg = pa
+            self._explore_pa_tape.set_value(pa)
+            self._explore_schedule_redraw()
             return
         dx = event.x - self._explore_drag_start[0]
         dy = event.y - self._explore_drag_start[1]
@@ -11944,8 +12418,9 @@ class AstroApp:
         self._explore_schedule_redraw()
 
     def _explore_fov_mouse_up(self, event):
-        """End the pan drag."""
+        """End the pan / rotate drag."""
         self._explore_dragging = False
+        self._explore_rotating = False
         self._explore_drag_start = None
 
     def _explore_reset_view(self):
@@ -11955,8 +12430,7 @@ class AstroApp:
         self._explore_zoom = 1.0
         self._explore_pan_x = 0.0
         self._explore_pan_y = 0.0
-        self._explore_pa_var.set(0.0)
-        self._explore_pa_label.config(text="0.0°")
+        self._explore_pa_tape.set_value(0.0)
         self._explore_zoom_label.config(text="1.0×")
         self._explore_redraw()
 
@@ -12359,6 +12833,10 @@ class AstroApp:
         )
 
     def _explore_refresh_report(self):
+        self._explore_update_pa_match()
+        self._explore_refresh_report_body()
+
+    def _explore_refresh_report_body(self):
         """Rebuild the rig-chip row and the analysis report body for
         whichever rig is currently active (any one of the up-to-6
         analyzed rigs)."""
@@ -13803,8 +14281,11 @@ class AstroApp:
                     "obj_type": obj_category,
                     "v_mag": _try_float(row.get('v-mag') or row.get('vmag') or ''),
                     "surf_br": _try_float(row.get('surfbr') or row.get('surf_br') or ''),
+                    "pos_ang": _try_float(row.get('posang') or ''),
                     "size_src": size_src,
                 }
+                if info["pos_ang"] is None:
+                    info["pos_ang"] = MESSIER_POSANG.get(_messier_number(common))
                 # Tag with catalog memberships for the search filter + badges.
                 info["catalogs"] = self._identify_catalogs(name, info["common"])
                 # Don't let later sources overwrite earlier primary keys
@@ -14259,469 +14740,847 @@ class AstroApp:
         if hasattr(self, "_gantt_note_lbl"):
             self._gantt_note_lbl.config(text="")
 
-    def _draw_queue_gantt(self):
-        """Draw tonight's plan as a draggable schedule timeline.
+    # Rig Lanes geometry
+    _G_TOOL_H = 36     # toolbar row
+    _G_AXIS_H = 18     # hour labels
+    _G_SKY_H  = 22     # dark / moon band
+    _G_ROW_H  = 36     # one block sub-row
+    _G_LW     = 168    # lane label column
+    _G_RM     = 12     # right margin
 
-        A full-width collapsible strip at the bottom of the Plan tab (see
-        setup_plan_tab), drawn from ``_plan_entries``: drag a bar to change
-        that target's start time directly on the committed plan.
+    def _gantt_palette(self):
+        """Colours for the schedule timeline in the current theme."""
+        if self.night_mode:
+            return dict(bg="#0b0000", lane="#160303", lane_edge="#3a0a0a", lane_dark="#1f0505",
+                        text="#cc2a2a", dim="#882222", grid="#2a0808", accent="#aa1a1a",
+                        accent_ink="#0b0000", btn="#1a0404", btn_edge="#4a1010",
+                        red="#ff4040", red_bg="#2a0505", red_edge="#771212", red_ink="#ff6060",
+                        ok="#b04a20", ok_bg="#1d0805", ok_edge="#4a1a10", ok_ink="#cc5533",
+                        warn="#b04010", warn_bg="#1d0805", warn_edge="#5a2010", warn_ink="#cc5522",
+                        ink="#e0b0b0", moon="#802010", moonfree="#1a0806", now="#aa0000",
+                        peak="#ff7a30", peak_bg="#1a0000")
+        return dict(bg="#050810", lane="#0d1826", lane_edge="#1c2b3d", lane_dark="#112035",
+                    text="#e6edf5", dim="#8ea3b8", grid="#1a2a3c", accent="#38bdf8",
+                    accent_ink="#04202e", btn="#132235", btn_edge="#23384f",
+                    red="#f87171", red_bg="#3b1218", red_edge="#7f1d1d", red_ink="#fecaca",
+                    ok="#34d399", ok_bg="#0d2a20", ok_edge="#166534", ok_ink="#bbf7d0",
+                    warn="#fbbf24", warn_bg="#2e2208", warn_edge="#7a5a12", warn_ink="#fde68a",
+                    ink="#06111c", moon="#fbbf24", moonfree="#14301f", now="#ccaa00",
+                    peak="#fbbf24", peak_bg="#06111c")
 
-        One row per rig (target_id + scope + camera) rather than one row per
-        ``_plan_entries`` row (i.e. per filter) — filters on the same rig
-        always shoot sequentially, so a separate slider per filter just
-        showed identical/overlapping bars for no reason. Each row's bar
-        spans the combined allocated hours of every filter on that rig,
-        and dragging it moves every one of those filter rows together
-        (see ``_gantt_drag``). Bar color matches the rig's accent color
-        from the plan card list (``_get_rig_accent_color``) instead of a
-        separate fixed palette, so a rig looks the same in both places.
-        """
-        if not hasattr(self, "queue_gantt"):
-            return
-        canvas = self.queue_gantt
-        if not canvas.winfo_ismapped():
-            return   # strip is collapsed — nothing to draw
-        canvas.update_idletasks()
-        cw = canvas.winfo_width()
-        ch = canvas.winfo_height() or 200
+    @staticmethod
+    def _gantt_mix(hex_col, factor, bg="#050810"):
+        """Blend hex_col toward bg (Tk has no alpha)."""
+        out = []
+        for k in (1, 3, 5):
+            c, b = int(hex_col[k:k + 2], 16), int(bg[k:k + 2], 16)
+            out.append(int(c * factor + b * (1 - factor)))
+        return "#%02x%02x%02x" % tuple(out)
 
-        lm, rm = 74, 12          # left/right margins — needed for the pw guard below
-        pw = cw - lm - rm
+    def _gantt_order(self):
+        order = self.data.get("settings", {}).get("schedule_order", "transit")
+        return order if order in dict(SCHEDULE_ORDERS) else "transit"
 
-        # Canvas hasn't been laid out yet (returns 1 before the window is first drawn).
-        # Defer without touching any saved axis state so drag maths stays valid.
-        if pw <= 20:
-            self.root.after(80, self._draw_queue_gantt)
-            return
-
-        canvas.delete("all")
-
-        nm       = self.night_mode
-        fg_main  = "#cc0000" if nm else "#ffffff"    # matches altitude chart fg_main
-        fg_dim   = "#880000" if nm else "#aabbcc"    # matches altitude chart fg_dim
-        fg_now   = "#aa0000" if nm else "#ccaa00"    # matches altitude chart fg_label
-
-        if not self._plan_entries:
-            canvas.create_text(cw // 2, ch // 2,
-                text="Add targets to Tonight's Plan to see the schedule timeline",
-                fill=fg_dim, font=("Helvetica", 11))
-            return
-
+    def _gantt_axis(self):
+        """Tonight's night axis, or a reason string when there isn't one."""
         lat, lon = self._get_saved_location()
         if lat is None:
-            canvas.create_text(cw // 2, ch // 2,
-                text="Save a location to see the schedule timeline",
-                fill=fg_dim, font=("Helvetica", 11))
-            return
+            return "Save a location to see the schedule timeline"
+        d0, d1, _ = _dark_jd_range(lat, lon)
+        if d0 is None:
+            return "No dark window tonight at this location"
+        off = _utc_offset_hours()
+        to_h = lambda jd: (((jd + 0.5) % 1.0) * 24.0 + off) % 24.0
+        ds, de = to_h(d0), to_h(d1)
+        if de < ds:
+            de += 24.0
+        return dict(lat=lat, lon=lon, d0=d0, ds=ds, de=de,
+                    ax0=ds - 0.33, ax1=de + 0.33)
 
-        # ── Find tonight's astronomical dark window ──────────────────────
-        real_now      = datetime.now()   # kept for the "Now" marker below
-        utc_offset_h  = _utc_offset_hours()
-        jd_noon       = _jd_local_noon()
+    def _gantt_collect(self, ax):
+        """Plan rows grouped into blocks (one per target + rig), and lanes.
 
-        _d0, _d1, _ = _dark_jd_range(lat, lon)
-        to_h = lambda jd: (((jd + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
-        dark_start_h = to_h(_d0) if _d0 is not None else None
-        dark_end_h   = to_h(_d1) if _d1 is not None else None
-
-        if dark_start_h is None:
-            canvas.create_text(cw // 2, ch // 2,
-                text="No dark window tonight at this location",
-                fill=fg_dim, font=("Helvetica", 9))
-            return
-
-        if dark_end_h < dark_start_h:
-            dark_end_h += 24.0
-
-        ax_start = dark_start_h - 0.33
-        ax_end   = dark_end_h   + 0.33
-        ax_range = max(ax_end - ax_start, 0.1)
-
-        tm, bm = 14, 22
-        ph = ch - tm - bm
-
-        # Save axis params for drag calculations
-        self._gantt_ax_start = ax_start
-        self._gantt_ax_range = ax_range
-        self._gantt_pw       = pw
-
-        def h_to_x(h):
-            h_adj = h if h >= ax_start - 0.01 else h + 24.0
-            return lm + (h_adj - ax_start) / ax_range * pw
-
-        # Dark-band tint
-        canvas.create_rectangle(h_to_x(dark_start_h), tm,
-                                 h_to_x(dark_end_h), tm + ph,
-                                 fill="#080e1a", outline="")
-
-        # Hour grid + axis labels
-        h = math.ceil(ax_start)
-        while h <= ax_end + 0.5:
-            x = h_to_x(h)
-            if lm - 1 <= x <= cw - rm + 1:
-                canvas.create_line(x, tm, x, tm + ph, fill=fg_dim, dash=(2, 4))
-                canvas.create_text(x, ch - bm + 10,
-                                   text=f"{int(h) % 24:02d}:00",
-                                   fill=fg_main, font=("Helvetica", 10, "bold"), anchor="n")
-            h += 1
-        canvas.create_line(lm, tm + ph, cw - rm, tm + ph, fill=fg_dim)
-
-        # ── Group plan entries by rig (target_id + scope) ─────────────────
-        # Filters on the same rig shoot sequentially, so they share one row
-        # and one draggable bar spanning their combined allocated hours,
-        # instead of one (identical, overlapping) bar per filter.
-        MAX_ALT = 90.0
-
-        def _dim(hex_col, factor=0.25):
-            """Mix hex_col toward the canvas bg (#050810) — avoids alpha hex."""
-            r = int(int(hex_col[1:3], 16) * factor + 0x05 * (1 - factor))
-            g = int(int(hex_col[3:5], 16) * factor + 0x08 * (1 - factor))
-            b = int(int(hex_col[5:7], 16) * factor + 0x10 * (1 - factor))
-            return f"#{r:02x}{g:02x}{b:02x}"
-
-        groups = []
-        group_idx_by_key = {}
-        for member_idx, e in enumerate(self._plan_entries):
-            # Camera is part of the grouping key — two cameras can share a
-            # scope on the same target (e.g. LRGB on one camera, SHO on
-            # another), and each needs its own Gantt bar, not one shared
-            # between two unrelated imaging trains.
+        A block covers every filter row of one target on one rig — filters
+        shoot back to back, so they move together. Lanes are rigs (scope +
+        camera) in first-seen plan order."""
+        groups, by_key, lanes = [], {}, {}
+        for mi, e in enumerate(self._plan_entries):
             key = (e["target_id"], e.get("scope", ""), e.get("camera", ""))
-            gi = group_idx_by_key.get(key)
+            gi = by_key.get(key)
             if gi is None:
-                gi = len(groups)
-                group_idx_by_key[key] = gi
-                groups.append({
-                    "target_id":     e["target_id"],
-                    "scope":         e.get("scope", ""),
-                    "camera":        e.get("camera", ""),
-                    "ra_deg":        e.get("ra_deg", 0.0),
-                    "dec_deg":       e.get("dec_deg", 0.0),
-                    "win_start":     e.get("win_start") or "",
-                    "win_end":       e.get("win_end") or "",
-                    "start_time":    e.get("start_time") or e.get("win_start") or "",
-                    "total_alloc_h": 0.0,
-                    "member_idxs":   [],
-                })
+                gi = by_key[key] = len(groups)
+                ws = self._parse_h(e.get("win_start"))
+                we = self._parse_h(e.get("win_end"))
+                if ws is not None and we is not None:
+                    ws = _norm_h(ws, ax["ax0"])
+                    we = we if we > ws else we + 24.0
+                    while we - ws > 24.0:
+                        we -= 24.0
+                else:
+                    ws = we = None
+                st = self._parse_h(e.get("start_time") or e.get("win_start"))
+                st = _norm_h(st, ax["ax0"]) if st is not None else ws
+                try:
+                    tr = _norm_h(self._parse_h(_calc_transit_time(e.get("ra_deg", 0.0), ax["lon"])),
+                                 ax["ax0"])
+                except Exception:      # noqa: BLE001 — no tick rather than no timeline
+                    tr = None
+                lane = (e.get("scope", ""), e.get("camera", ""))
+                lanes.setdefault(lane, []).append(gi)
+                groups.append({"key": gi, "target_id": e["target_id"], "lane": lane,
+                               "scope": lane[0], "camera": lane[1],
+                               "win_start": e.get("win_start") or "",
+                               "win_end": e.get("win_end") or "",
+                               "ws": ws, "we": we, "start_h": st, "transit": tr,
+                               "peak_alt": 90.0 - abs(ax["lat"] - (e.get("dec_deg") or 0.0)),
+                               "total_alloc_h": 0.0, "member_idxs": [], "idx": mi})
             g = groups[gi]
             g["total_alloc_h"] += e.get("allocated_hrs") or 0.0
-            g["member_idxs"].append(member_idx)
+            g["member_idxs"].append(mi)
+        for g in groups:
+            g["dur"] = g["total_alloc_h"] or 1.0
+        return groups, lanes
 
-        # Saved for _gantt_drag, which needs to move every filter row on a
-        # rig together when its bar is dragged.
-        self._gantt_groups = groups
+    def _gantt_moon_spans(self, ax):
+        """(moon-up spans in continuous hours, illumination %) — memoised
+        per night so drags and resizes don't redo the Moon maths."""
+        memo_key = (round(ax["lat"], 4), round(ax["lon"], 4), round(ax["d0"], 5))
+        memo = self.__dict__.setdefault("_gantt_moon_memo", {})
+        if memo_key not in memo:
+            def alt(h):
+                jd = ax["d0"] + (h - ax["ds"]) / 24.0
+                m_ra, m_dec = _calc_moon_position(jd)
+                return _ra_dec_to_altaz(m_ra, m_dec, ax["lat"], ax["lon"], jd)
 
-        # Every rig gets a row: grow the strip when there are more rigs
-        # than fit at a readable height (it used to stop at 8 silently).
-        MIN_ROW_H = 19
-        need_h = max(190, tm + bm + len(groups) * MIN_ROW_H)
-        try:
-            cur_h = int(float(canvas.cget("height")))
-        except (TypeError, ValueError):
-            cur_h = need_h
-        if cur_h != need_h:
-            canvas.config(height=need_h)
-            self.root.after_idle(self._draw_queue_gantt)
+            def edge(a, b):
+                """Bisect the horizon crossing between samples a and b."""
+                up_a = alt(a) > 0
+                for _ in range(12):
+                    m = (a + b) / 2.0
+                    if (alt(m) > 0) == up_a:
+                        a = m
+                    else:
+                        b = m
+                return (a + b) / 2.0
+
+            spans, cur, prev, h = [], None, None, ax["ax0"]
+            while h <= ax["ax1"] + 1e-9:
+                up = alt(h) > 0
+                if up and cur is None:
+                    cur = h if prev is None else edge(prev, h)
+                elif not up and cur is not None:
+                    spans.append((cur, edge(prev, h)))
+                    cur = None
+                prev = h
+                h += 1.0 / 12.0
+            if cur is not None:
+                spans.append((cur, ax["ax1"]))
+            memo.clear()
+            memo[memo_key] = (spans, _calc_moon_phase()[1])
+        return memo[memo_key]
+
+    @staticmethod
+    def _plan_signature(entries):
+        """Everything about the plan except start times — Undo is only safe
+        while this hasn't changed (no adds, removals or edits since)."""
+        return json.dumps([{k: v for k, v in e.items() if k != "start_time"}
+                           for e in entries], sort_keys=True, default=str)
+
+    # ── preview / apply / undo ───────────────────────────────────────
+    def _gantt_compute_preview(self):
+        """(Re)build the auto-schedule preview for every lane."""
+        ax = self._gantt_axis()
+        if not isinstance(ax, dict):
+            self._gantt_preview = None
             return
-        max_rows = len(groups)
-        row_h    = ph / max(max_rows, 1)
-        self._gantt_row_info   = []   # (y_top, y_bot, group_idx, alloc_x1, alloc_x2, start_h_norm)
+        groups, lanes = self._gantt_collect(ax)
+        pv = self._gantt_preview or {"choices": {}}
+        pv.update(order=self._gantt_order(), placed={}, wont={}, durs={},
+                  sig=self._plan_signature(self._plan_entries))
+        choices = pv["choices"]
+        for gis in lanes.values():
+            blocks = []
+            for gi in gis:
+                g = groups[gi]
+                if g["ws"] is None or choices.get(gi, ("",))[0] == "remove":
+                    continue
+                dur = choices[gi][1] if choices.get(gi, ("",))[0] == "shorten" else g["dur"]
+                pv["durs"][gi] = dur
+                blocks.append({"key": gi, "ws": g["ws"], "we": g["we"], "dur": dur,
+                               "transit": g["transit"], "idx": g["idx"]})
+            placed, wont = auto_schedule(blocks, pv["order"])
+            pv["placed"].update(placed)
+            for w in wont:
+                pv["wont"][w["key"]] = w
+        self._gantt_preview = pv
+
+    def _gantt_apply_preview(self):
+        pv = self._gantt_preview
+        if not pv:
+            return
+        before = [dict(e) for e in self._plan_entries]
+        ax = self._gantt_axis()
+        groups, _ = self._gantt_collect(ax) if isinstance(ax, dict) else ([], {})
+        moved = 0
+        drop = []
+        for g in groups:
+            gi = g["key"]
+            choice = pv["choices"].get(gi, ("",))
+            if choice[0] == "remove":
+                drop += g["member_idxs"]
+                continue
+            if gi not in pv["placed"]:
+                continue
+            new_dur = pv["durs"].get(gi, g["dur"])
+            if abs(new_dur - g["dur"]) > 1e-6 and g["dur"] > 0:
+                f = new_dur / g["dur"]
+                for mi in g["member_idxs"]:
+                    e = self._plan_entries[mi]
+                    hrs = round((e.get("allocated_hrs") or 0.0) * f, 2)
+                    exp = max(float(e.get("exp_s") or 0.1), 0.1)
+                    e["allocated_hrs"] = hrs
+                    e["n_subs"] = int(hrs * 3600.0 / exp)
+                    e["total_int_hrs"] = round(e["n_subs"] * exp / 3600.0, 2)
+            new_start = _fmt_hm(pv["placed"][gi])
+            for mi in g["member_idxs"]:
+                self._plan_entries[mi]["start_time"] = new_start
+            moved += 1
+        for mi in sorted(drop, reverse=True):
+            del self._plan_entries[mi]
+        self._sort_plan_by_start()          # the cards follow the new schedule
+        self._gantt_push_undo(before)
+        self._gantt_preview = None
+        self._refresh_plan_tree()
+        self._gantt_sync_grid(before)
+        n_lanes = len({g["lane"] for g in groups})
+        msg = f"Scheduled {moved} target(s) on {n_lanes} rig(s)"
+        if drop:
+            msg += " · removed " + str(len({self._plan_key_of(i, before) for i in drop})) + " from tonight"
+        self._gantt_show_note(msg + " · Undo puts it back")
+
+    @staticmethod
+    def _plan_key_of(i, entries):
+        e = entries[i]
+        return (e["target_id"], e.get("scope", ""), e.get("camera", ""))
+
+    def _gantt_sync_grid(self, before):
+        """After the timeline changed which targets are in the plan (Apply
+        removing some, Undo bringing them back), update the browsing grid
+        the way adding / removing a plan card does: unpin targets no longer
+        planned, pin ones that came back, and re-scan so "in plan" checks
+        are right."""
+        old_ids = {e["target_id"] for e in before}
+        new_ids = {e["target_id"] for e in self._plan_entries}
+        if old_ids == new_ids:
+            return
+        for tid in old_ids - new_ids:
+            self._unmark_grid_touched_if_unplanned(tid)
+        for tid in new_ids - old_ids:
+            if tid not in getattr(self, "_grid_touched", {}):
+                self._mark_grid_touched(tid)
+        self._refresh_visible_grid()
+
+    def _sort_plan_by_start(self):
+        """Put Tonight's Plan in start-time order (stable). Filter rows of
+        one target on one rig stay together, in their own order; targets
+        with no dark window go last. Keeps the selected card selected."""
+        ax = self._gantt_axis()
+        if not isinstance(ax, dict) or not self._plan_entries:
+            return
+        groups, _ = self._gantt_collect(ax)
+        sort_key = {}
+        for g in groups:
+            st = g["start_h"] if (g["ws"] is not None and g["start_h"] is not None) else float("inf")
+            for mi in g["member_idxs"]:
+                sort_key[mi] = (st, g["idx"], mi)
+        order = sorted(range(len(self._plan_entries)), key=sort_key.get)
+        if order == list(range(len(self._plan_entries))):
+            return
+        sel = self._plan_card_selected
+        sel_entry = (self._plan_entries[sel]
+                     if sel is not None and 0 <= sel < len(self._plan_entries) else None)
+        self._plan_entries[:] = [self._plan_entries[i] for i in order]
+        if sel_entry is not None:
+            self._plan_card_selected = next(i for i, e in enumerate(self._plan_entries)
+                                            if e is sel_entry)
+
+    def _gantt_push_undo(self, before):
+        self._gantt_undo.append((before, self._plan_signature(self._plan_entries)))
+        del self._gantt_undo[:-20]
+
+    def _gantt_undo_last(self):
+        if not self._gantt_undo:
+            return
+        before, sig_after = self._gantt_undo.pop()
+        if self._plan_signature(self._plan_entries) != sig_after:
+            self._gantt_undo.clear()
+            self._gantt_show_note("The plan was changed since then (targets added, removed or "
+                                  "edited) — nothing to undo")
+            self._draw_queue_gantt()
+            return
+        now = list(self._plan_entries)
+        self._plan_entries[:] = before
+        self._gantt_preview = None
+        self._refresh_plan_tree()
+        self._gantt_sync_grid(now)
+        self._gantt_show_note("Undone")
+
+    def _gantt_button(self, action):
+        """Toolbar / tray clicks (canvas items tagged btn:<action>)."""
+        verb, _, arg = action.partition(":")
+        if verb == "order":
+            self.data.setdefault("settings", {})["schedule_order"] = arg
+            try:
+                self._persist_data()
+            except Exception:      # noqa: BLE001 — a preference, not worth an error box
+                pass
+            if self._gantt_preview is not None:
+                self._gantt_compute_preview()
+        elif verb == "auto":
+            self._gantt_preview = None
+            self._gantt_compute_preview()
+            pv = self._gantt_preview
+            if pv is not None and not pv["placed"] and not pv["wont"]:
+                self._gantt_preview = None
+                self._gantt_show_note("Nothing to schedule — no target has a dark window tonight")
+        elif verb == "apply":
+            self._gantt_apply_preview()
+            return
+        elif verb == "cancel":
+            self._gantt_preview = None
+        elif verb == "undo":
+            self._gantt_undo_last()
+            return
+        elif verb in ("shorten", "remove", "reopen") and self._gantt_preview is not None:
+            gi = int(arg)
+            ch = self._gantt_preview["choices"]
+            if verb == "reopen":
+                ch.pop(gi, None)
+            elif verb == "remove":
+                ch[gi] = ("remove",)
+            else:
+                w = self._gantt_preview["wont"].get(gi)
+                if w and w["free"] >= 0.25:
+                    ch[gi] = ("shorten", math.floor(w["free"] * 10 + 1e-6) / 10.0)
+            self._gantt_compute_preview()
+        self._draw_queue_gantt()
+
+    # ── drawing ──────────────────────────────────────────────────────
+    def _g_rrect(self, x1, y1, x2, y2, r, **kw):
+        return self.queue_gantt.create_polygon(_round_rect_points(x1, y1, x2, y2, r),
+                                               smooth=True, **kw)
+
+    def _g_chip(self, x, y, text, tag, P, kind="normal", font=("Helvetica", 9), h=22):
+        """A rounded button/pill on the canvas; returns its right edge."""
+        cv = self.queue_gantt
+        w = tkfont.Font(family=font[0], size=font[1],
+                        weight=font[2] if len(font) > 2 else "normal").measure(text) + 18
+        fill, edge, ink = {
+            "primary": (P["accent"], P["accent"], P["accent_ink"]),
+            "on":      (P["accent"], P["accent"], P["accent_ink"]),
+            "off":     (P["bg"], P["bg"], P["dim"]),
+            "red":     (P["red_bg"], P["red_edge"], P["red_ink"]),
+            "ok":      (P["ok_bg"], P["ok_edge"], P["ok_ink"]),
+            "warn":    (P["warn_bg"], P["warn_edge"], P["warn_ink"]),
+            "dim":     (P["btn"], P["btn_edge"], P["dim"]),
+        }.get(kind, (P["btn"], P["btn_edge"], P["text"]))
+        tags = ("btn:" + tag,) if tag else ()
+        self._g_rrect(x, y, x + w, y + h, h / 2.0, fill=fill, outline=edge, tags=tags)
+        cv.create_text(x + w / 2.0, y + h / 2.0, text=text, fill=ink, font=font, tags=tags)
+        return x + w
+
+    def _gantt_legend(self, x_right, y, P):
+        """Key for the peak marker, right-aligned at (x_right, y)."""
+        cv = self.queue_gantt
+        cv.delete("legend")
+        txt = "peak = transit, highest in the sky  ·  hover a block for details"
+        mx = x_right - tkfont.Font(family="Helvetica", size=8).measure(txt) - 12
+        cv.create_text(x_right, y, anchor="e", text=txt, fill=P["dim"],
+                       font=("Helvetica", 8), tags=("legend",))
+        cv.create_polygon(mx - 5, y - 5, mx + 5, y - 5, mx, y + 3, fill=P["peak"],
+                          outline="", tags=("legend",))
+
+    def _g_peak_mark(self, g, a, bend, h_to_x, by0, by1, ink, P, ax0, ax1, row_busy=False):
+        """Draw the transit (peak altitude) marker for one block: an amber cap
+        on its top edge with a dotted line down. Returns the peak time text
+        when the peak falls inside the block, else None. A peak outside the
+        block shows as a hollow cap in the same row (when nothing else sits
+        there), so you can see how far from its best the target is booked."""
+        cv = self.queue_gantt
+        tr = g.get("transit")
+        if tr is None or not (ax0 <= tr <= ax1):
+            return None
+        xt = h_to_x(tr)
+        col = P["peak"]
+        lbl = _fmt_hm(tr)
+        if not (a < tr < bend):
+            if row_busy:          # another block sits there — hover gives the time
+                return None
+            cv.create_line(xt, by0 + 2, xt, by1 - 2, fill=col, dash=(2, 3))
+            cv.create_polygon(xt - 5, by0 - 1, xt + 5, by0 - 1, xt, by0 + 6, fill="",
+                              outline=col)
+            cv.create_text(xt + 4, (by0 + by1) / 2, anchor="w", fill=col,
+                           font=("Helvetica", 7), text=f"peak {lbl}")
+            return None
+        cv.create_line(xt, by0 + 1, xt, by1 - 1, fill=ink, width=1, dash=(2, 2))
+        cv.create_polygon(xt - 6, by0 - 2, xt + 6, by0 - 2, xt, by0 + 7, fill=col,
+                          outline=P["peak_bg"])
+        return lbl
+
+    def _gantt_hover_text(self, gi):
+        g = self._gantt_groups[gi]
+        bits = [g["target_id"]]
+        if g.get("transit") is not None:
+            bits.append(f"peak {_fmt_hm(g['transit'])} at {max(0.0, g['peak_alt']):.0f}°")
+        bits.append(f"window {g['win_start']}–{g['win_end']}")
+        st = g["start_h"]
+        bits.append(f"booked {_fmt_hm(st)}–{_fmt_hm(st + g['dur'])} ({g['dur']:.1f}h)")
+        return "  ·  ".join(bits)
+
+    def _draw_queue_gantt(self):
+        """Draw Tonight's Plan as Rig Lanes: one lane per rig (scope +
+        camera), each target a block on its lane. Overlapping blocks stack
+        with a red outline and a hatched clash strip; a toolbar runs the
+        auto-scheduler (preview → Apply) and Undo; a tray lists what won't
+        fit. Drag a block to move its start inside the target's window.
+        Pure drawing — it never changes ``_plan_entries``."""
+        if not hasattr(self, "queue_gantt"):
+            return
+        cv = self.queue_gantt
+        if not cv.winfo_ismapped():
+            return   # strip is collapsed — nothing to draw
+        cv.update_idletasks()
+        cw = cv.winfo_width()
+        LW, RM = self._G_LW, self._G_RM
+        pw = cw - LW - RM
+        if pw <= 40:
+            self.root.after(80, self._draw_queue_gantt)
+            return
+        P = self._gantt_palette()
+        cv.delete("all")
+        cv.configure(bg=P["bg"])
+        self._gantt_row_info = []
         self._gantt_drag_bounds = {}
 
-        for i, g in enumerate(groups[:max_rows]):
-            color    = self._get_rig_accent_color(g["scope"], g["camera"])
-            dim_col  = _dim(color)
-            if nm:
-                # Night mode: keep each rig's hue (so bars still match the
-                # plan cards' accent bars) but pull the solid allocation bar
-                # well down toward the background so it doesn't glare on a
-                # dark-adapted screen; the available-window band dims with it.
-                color   = _dim(color, 0.42)
-                dim_col = _dim(dim_col, 0.6)
-            y_top    = tm + i * row_h + 1
-            y_bot    = tm + (i + 1) * row_h - 1
-            y_mid    = (y_top + y_bot) / 2
-            alt_base = y_bot - 2
-            alt_span = row_h * 0.82
-            is_drag  = (i == self._gantt_drag_idx)
-
-            # Target label — always include scope so users can tell apart entries at a glance.
-            scope_abbr = (g.get("scope") or "")
-            if scope_abbr:
-                row_label  = f"{g['target_id']}\n{scope_abbr[:12]}"
-                label_font = ("Helvetica", 8, "bold")
-            else:
-                row_label  = g["target_id"]
-                label_font = ("Helvetica", 10, "bold")
-            canvas.create_text(lm - 4, y_mid, text=row_label,
-                               fill=fg_main, font=label_font, anchor="e")
-
-            if not g.get("win_start"):
-                canvas.create_rectangle(lm, y_top, cw - rm, y_bot,
-                                        fill="#111820", outline=fg_dim, dash=(3, 3))
-                canvas.create_text((lm + cw - rm) // 2, y_mid,
-                                   text="not visible tonight", fill=fg_dim, font=("Helvetica", 9))
-                self._gantt_row_info.append((y_top, y_bot, i, lm, lm, dark_start_h))
-                continue
-
-            ws = self._parse_h(g.get("win_start"))
-            we = self._parse_h(g.get("win_end"))
-            if ws is None or we is None:
-                canvas.create_text((lm + cw - rm) // 2, y_mid,
-                                   text="not visible tonight", fill=fg_dim, font=("Helvetica", 9))
-                self._gantt_row_info.append((y_top, y_bot, i, lm, lm, dark_start_h))
-                continue
-            # Align ws/we to the plotting timeline: post-midnight times (e.g. 01:00)
-            # are numerically less than ax_start (~21h) and need +24 so that
-            # comparisons with start_h and dark_end_h work correctly.
-            if ws < ax_start - 0.01:
-                ws += 24.0
-            if we < ws:
-                we += 24.0
-
-            # ── Background: full available-window bar (faint) ─────────────
-            x_ws = max(lm,      h_to_x(ws))
-            x_we = min(cw - rm, h_to_x(we))
-            if x_we > x_ws:
-                canvas.create_rectangle(x_ws, y_top + 3, x_we, y_bot - 3,
-                                        fill=dim_col, outline="")
-
-            # ── Altitude curve over the whole available window ─────────────
-            ra_deg  = g.get("ra_deg", 0)
-            dec_deg = g.get("dec_deg", 0)
-            N_ALT   = 50
-            alt_pts = []
-            for k in range(N_ALT + 1):
-                jd_k = jd_noon + k * 30.0 / N_ALT / 24.0
-                lh_k = (((jd_k + 0.5) % 1.0) * 24.0 + utc_offset_h) % 24.0
-                alt_k = _ra_dec_to_altaz(ra_deg, dec_deg, lat, lon, jd_k)
-                alt_pts.append((lh_k, alt_k))
-
-            seg = []
-            for lh_k, alt_k in alt_pts:
-                x = h_to_x(lh_k)
-                if x < lm or x > cw - rm:
-                    if len(seg) > 1:
-                        canvas.create_line(*[c for pt in seg for c in pt],
-                                           fill=color, width=1, dash=(3, 3))
-                    seg = []
-                    continue
-                y = alt_base - max(0.0, min(alt_k, MAX_ALT)) / MAX_ALT * alt_span
-                seg.append((x, y))
-            if len(seg) > 1:
-                canvas.create_line(*[c for pt in seg for c in pt],
-                                   fill=color, width=1, dash=(3, 3))
-
-            # ── Foreground: draggable allocated bar (whole rig, all filters) ──
-            start_str = g.get("start_time") or g.get("win_start") or ""
-            start_h   = self._parse_h(start_str)
-            if start_h is None:
-                start_h = ws if ws is not None else dark_start_h
-            if start_h < ax_start - 0.01:
-                start_h += 24.0
-
-            alloc_h = g.get("total_alloc_h") or 1.0
-
-            # Clip the bar at the imaging window end (we) FOR DRAWING ONLY.
-            # This routine runs on every resize, theme switch and drag
-            # tick, so it must never change the plan rows themselves —
-            # the part that doesn't fit is drawn as a dashed overflow
-            # segment and the user is told once. If less than 30 min
-            # remain, show a message and skip the bar.
-            effective_h = min(start_h + alloc_h, we) - start_h
-            if effective_h < 0.5:
-                canvas.create_text((lm + cw - rm) // 2, y_mid,
-                    text=f"{g['target_id']}: less than 30 min in imaging window",
-                    fill=fg_dim, font=("Helvetica", 9))
-                self._gantt_row_info.append((y_top, y_bot, i, lm, lm, dark_start_h))
-                self._gantt_drag_bounds[i] = (ws, we)
-                continue
-            overflow_h = 0.0
-            if effective_h < alloc_h:
-                overflow_h = alloc_h - effective_h
-                noted = self.__dict__.setdefault("_gantt_overflow_noted", set())
-                note_key = (g["target_id"], g["scope"], g["camera"],
-                            round(overflow_h, 2))
-                if note_key not in noted:
-                    noted.add(note_key)
-                    self.root.after(0, lambda tid=g["target_id"], oh=round(overflow_h, 2):
-                        self._gantt_show_note(
-                            f"⚠  {tid}: {oh:.2f}h of the planned time falls after"
-                            f" the imaging window ends — start earlier or shorten it"))
-                alloc_h = effective_h
-
-            end_h  = start_h + alloc_h
-            x_al_s = max(lm,      h_to_x(start_h))
-            x_al_e = min(cw - rm, h_to_x(end_h))
-
-            # Store drag limits: bar must stay within [ws, we]
-            self._gantt_drag_bounds[i] = (ws, we)
-
-            self._gantt_row_info.append(
-                (y_top, y_bot, i, x_al_s, x_al_e, start_h)
-            )
-
-            if overflow_h > 0:
-                x_ov_e = min(cw - rm, h_to_x(end_h + overflow_h))
-                if x_ov_e > x_al_e:
-                    canvas.create_rectangle(
-                        x_al_e, y_top + 2, x_ov_e, y_bot - 2, fill="",
-                        outline="#aa3333" if nm else "#ff6b6b",
-                        dash=(3, 2), width=1)
-
-            bar_ink   = "#d9a0a0" if nm else "#ffffff"   # label / altitude line on the bar
-            bar_tick  = "#8a4a4a" if nm else "#ffffff"   # transit tick
-            if x_al_e > x_al_s:
-                outline_col = bar_ink if is_drag else ""
-                outline_w   = 2        if is_drag else 0
-                canvas.create_rectangle(x_al_s, y_top + 2, x_al_e, y_bot - 2,
-                                        fill=color, outline=outline_col, width=outline_w)
-
-                # Altitude overlay inside alloc bar (bright solid line)
-                bright = []
-                for lh_k, alt_k in alt_pts:
-                    x = h_to_x(lh_k)
-                    if x < x_al_s or x > x_al_e:
-                        if len(bright) > 1:
-                            canvas.create_line(*[c for pt in bright for c in pt],
-                                               fill=bar_ink, width=1)
-                        bright = []
-                        continue
-                    y = alt_base - max(0.0, min(alt_k, MAX_ALT)) / MAX_ALT * alt_span
-                    bright.append((x, y))
-                if len(bright) > 1:
-                    canvas.create_line(*[c for pt in bright for c in pt],
-                                       fill=bar_ink, width=1)
-
-                # Target label inside bar — bold 9pt
-                # When the same target is queued twice (two telescopes), include
-                # a short scope name so bars are distinguishable at a glance.
-                if x_al_e - x_al_s > 50:
-                    scope_s = (g.get("scope") or "")[:8]
-                    bar_label = (f"{g['target_id']} ({scope_s})" if scope_s
-                                 else g["target_id"])
-                    canvas.create_text((x_al_s + x_al_e) / 2, y_mid,
-                                       text=bar_label, fill=bar_ink,
-                                       font=("Helvetica", 9, "bold"))
-
-                # Start-time stamp top-left of bar — same ink as the bar's target label
-                disp_h = int(start_h) % 24
-                disp_m = int(round((start_h % 1) * 60)) % 60
-                canvas.create_text(x_al_s + 4, y_top + 3,
-                                   text=f"{disp_h:02d}:{disp_m:02d}",
-                                   fill=bar_ink, font=("Helvetica", 9, "bold"), anchor="nw")
-
-                # Grip tick (left edge of alloc bar)
-                canvas.create_line(x_al_s, y_top + 3, x_al_s, y_bot - 3,
-                                   fill=fg_main, width=2)
-
-            # Transit tick inside available-window bar (plan entries don't
-            # store transit_time, so compute it on the fly)
+        def set_height(h):
             try:
-                tr = self._parse_h(_calc_transit_time(g["ra_deg"], lon))
-            except Exception:
-                tr = None
-            if tr is not None:
-                if tr < ax_start - 0.01:
-                    tr += 24.0
-                x_tr = h_to_x(tr)
-                if lm <= x_tr <= cw - rm:
-                    canvas.create_line(x_tr, y_top, x_tr, y_bot,
-                                       fill=bar_tick, width=1, dash=(2, 2))
+                cur = int(float(cv.cget("height")))
+            except (TypeError, ValueError):
+                cur = -1
+            if cur != h:
+                cv.config(height=h)
+                self.root.after_idle(self._draw_queue_gantt)
+                return True
+            return False
 
-        # ── "Now" line (only shown when viewing today's date) ────────────
+        def empty(msg):
+            if set_height(110):
+                return
+            cv.create_text(cw // 2, 55, text=msg, fill=P["dim"], font=("Helvetica", 11))
+
+        if not self._plan_entries:
+            self._gantt_preview = None
+            return empty("Add targets to Tonight's Plan to see the schedule timeline")
+        ax = self._gantt_axis()
+        if not isinstance(ax, dict):
+            return empty(ax)
+
+        pv = self._gantt_preview
+        if pv is not None and pv.get("sig") != self._plan_signature(self._plan_entries):
+            pv = self._gantt_preview = None        # plan changed under the preview
+        groups, lanes = self._gantt_collect(ax)
+        self._gantt_groups = groups
+        ax0, ax1 = ax["ax0"], ax["ax1"]
+        rng = max(ax1 - ax0, 0.1)
+        h_to_x = lambda h: LW + (h - ax0) / rng * pw
+        clampx = lambda x: max(LW, min(cw - RM, x))
+        self._gantt_ax_start, self._gantt_ax_range, self._gantt_pw = ax0, rng, pw
+
+        # where each block sits (preview or real)
+        def span_of(g):
+            if g["ws"] is None:
+                return None
+            if pv is not None:
+                if pv["choices"].get(g["key"], ("",))[0] == "remove":
+                    return None
+                if g["key"] in pv["placed"]:
+                    st = pv["placed"][g["key"]]
+                    return st, st + pv["durs"].get(g["key"], g["dur"])
+            return g["start_h"], g["start_h"] + g["dur"]
+
+        lane_layout = []
+        for lane, gis in lanes.items():
+            spans = [(gi, *span_of(groups[gi])) for gi in gis if span_of(groups[gi])]
+            if self._gantt_frozen_rows is not None and self._gantt_drag_idx is not None:
+                rows = {gi: self._gantt_frozen_rows.get(gi, 0) for gi, _, _ in spans}
+                n_rows = max(rows.values(), default=0) + 1
+            else:
+                rows, n_rows = lane_rows(spans)
+            lane_layout.append((lane, gis, spans, rows, n_rows))
+
+        tray = []   # (gi, kind)
+        for g in groups:
+            if g["ws"] is None:
+                tray.append((g["key"], "invisible"))
+            elif pv is not None and (g["key"] in pv["wont"]
+                                     or pv["choices"].get(g["key"], ("",))[0] == "remove"):
+                tray.append((g["key"], "wont"))
+
+        TOOL, AXH, SKY, ROW = self._G_TOOL_H, self._G_AXIS_H, self._G_SKY_H, self._G_ROW_H
+        lanes_top = TOOL + AXH + SKY + 8
+        lane_hs = [max(n * ROW + 10, 58) for *_, n in lane_layout]
+        tray_h = (len(tray) * 28 + 14) if tray else 0
+        total_h = lanes_top + sum(lane_hs) + 6 * len(lane_hs) + tray_h + 8
+        if set_height(max(150, int(total_h))):
+            return
+
+        # ── toolbar ──
+        y = 6
+        x = LW
+        cv.create_text(12, y + 11, text="SCHEDULE", anchor="w", fill=P["dim"],
+                       font=("Helvetica", 9, "bold"))
+        if pv is None:
+            n_t = sum(1 for g in groups if g["ws"] is not None)
+            cv.create_text(12, y + 25, text=f"{len(lanes)} rig(s) · {n_t} target(s)",
+                           anchor="w", fill=P["dim"], font=("Helvetica", 8))
+        cv.create_text(x, y + 11, text="Order by", anchor="w", fill=P["dim"],
+                       font=("Helvetica", 9))
+        x += 58
+        order = self._gantt_order()
+        seg_w = sum(tkfont.Font(family="Helvetica", size=9).measure(lbl) + 18
+                    for _, lbl in SCHEDULE_ORDERS) + 6
+        self._g_rrect(x, y - 1, x + seg_w, y + 23, 12, fill=P["bg"], outline=P["btn_edge"])
+        sx = x + 3
+        for key, lbl in SCHEDULE_ORDERS:
+            sx = self._g_chip(sx, y + 1, lbl, "order:" + key, P,
+                              "on" if key == order else "off", h=20)
+        x += seg_w + 12
+        if pv is None:
+            x = self._g_chip(x, y, "Auto-schedule all rigs", "auto", P, "primary",
+                             font=("Helvetica", 9, "bold")) + 8
+            self._g_chip(x, y, "Undo", "undo" if self._gantt_undo else "", P,
+                         "normal" if self._gantt_undo else "dim")
+        else:
+            x = self._g_chip(x, y, "Apply", "apply", P, "primary",
+                             font=("Helvetica", 9, "bold")) + 8
+            x = self._g_chip(x, y, "Cancel", "cancel", P) + 12
+            cv.create_text(x, y + 11, anchor="w", fill=P["dim"], font=("Helvetica", 9, "italic"),
+                           text="Preview — dashed blocks are the new times")
+
+        # legend / hover readout, right end of the toolbar
+        self._gantt_hover_gi = None
+        self._gantt_hover_item = cv.create_text(cw - RM, y + 11, anchor="e", fill=P["dim"],
+                                                font=("Helvetica", 8), text="")
+        self._gantt_legend(cw - RM, y + 11, P)
+
+        # ── hour axis ──
+        ya = TOOL + AXH / 2.0
+        hh = math.ceil(ax0)
+        while hh <= ax1:
+            xx = h_to_x(hh)
+            cv.create_text(xx, ya, text=f"{int(hh) % 24:02d}:00", fill=P["dim"],
+                           font=("Helvetica", 9, "bold"))
+            hh += 1
+
+        # ── sky band: dark, moon up, moon-free ──
+        y0, y1 = TOOL + AXH, TOOL + AXH + SKY
+        cv.create_text(LW - 10, (y0 + y1) / 2, text="SKY", anchor="e", fill=P["dim"],
+                       font=("Helvetica", 8, "bold"))
+        self._g_rrect(LW, y0, cw - RM, y1, 6, fill=P["lane"], outline="")
+        xd0, xd1 = h_to_x(ax["ds"]), h_to_x(ax["de"])
+        cv.create_rectangle(xd0, y0, xd1, y1, fill=P["lane_dark"], outline="")
+        moon_spans, illum = self._gantt_moon_spans(ax)
+        free = _free_gaps(moon_spans, ax["ds"], ax["de"])
+        for a, b in free:
+            cv.create_rectangle(h_to_x(a), y0, h_to_x(b), y1, fill=P["moonfree"], outline="")
+        for a, b in moon_spans:
+            cv.create_rectangle(clampx(h_to_x(a)), y0, clampx(h_to_x(b)), y0 + 5,
+                                fill=P["moon"], outline="")
+        cv.create_text(xd0 + 4, y0 + 13, anchor="w", fill=P["accent"], font=("Helvetica", 8),
+                       text=f"dark {_fmt_hm(ax['ds'])}")
+        if free:
+            a, b = max(free, key=lambda g: g[1] - g[0])
+            if h_to_x(b) - h_to_x(a) > 120:
+                cv.create_text(h_to_x(a) + 4, y0 + 13, anchor="w", fill=P["ok"],
+                               font=("Helvetica", 8), text=f"moon-free {_fmt_hm(a)}–{_fmt_hm(b)}")
+        if moon_spans:
+            a, b = max(moon_spans, key=lambda g: g[1] - g[0])
+            xm = max(clampx(h_to_x(a)) + 4, xd0 + 78)      # clear of the "dark" label
+            if clampx(h_to_x(b)) - xm > 80:
+                cv.create_text(xm, y0 + 13, anchor="w", fill=P["moon"],
+                               font=("Helvetica", 8), text=f"moon up · {illum}%")
+
+        # ── lanes ──
+        ink_font = ("Helvetica", 9, "bold")
+        y = lanes_top
+        for (lane, gis, spans, rows, n_rows), lh in zip(lane_layout, lane_hs):
+            ly0, ly1 = y, y + lh
+            accent = self._get_rig_accent_color(*lane)
+            blk = self._gantt_mix(accent, 0.42, P["bg"]) if self.night_mode else accent
+            # label column
+            cv.create_rectangle(0, ly0, 3, ly1, fill=blk, outline="")
+            cv.create_text(12, ly0 + 4, anchor="nw", text=(lane[0] or "?")[:20],
+                           fill=P["text"], font=("Helvetica", 10, "bold"))
+            cv.create_text(12, ly0 + 19, anchor="nw", text=(lane[1] or "")[:24],
+                           fill=P["dim"], font=("Helvetica", 8))
+            pairs, clash = overlap_info([(a, b) for _, a, b in spans])
+            past = any(b > groups[gi]["we"] + 1e-6 for gi, _, b in spans)
+            if pairs:
+                # count targets caught in a clash, not pairs (4 at once = 6 pairs)
+                n_clash = sum(1 for gi, a, b in spans
+                              if any(gj != gi and a < d - 1e-6 and c < b - 1e-6
+                                     for gj, c, d in spans))
+                pill, kind = f"{n_clash} targets overlap", "red"
+            elif past:
+                pill, kind = "runs past window", "warn"
+            else:
+                busy = sorted((max(a, ax["ds"]), min(b, ax["de"])) for _, a, b in spans)
+                used = (ax["de"] - ax["ds"]) - sum(z - a for a, z in _free_gaps(busy, ax["ds"], ax["de"]))
+                pill, kind = f"OK · {max(0.0, ax['de'] - ax['ds'] - used):.1f}h free", "ok"
+            self._g_chip(12, ly0 + 34, pill, "", P, kind, font=("Helvetica", 8), h=17)
+            # lane body
+            self._g_rrect(LW, ly0, cw - RM, ly1, 9, fill=P["lane"], outline=P["lane_edge"])
+            cv.create_rectangle(max(LW + 2, xd0), ly0 + 1, min(cw - RM - 2, xd1), ly1 - 1,
+                                fill=P["lane_dark"], outline="")
+            hh = math.ceil(ax0)
+            while hh <= ax1:
+                xx = h_to_x(hh)
+                cv.create_line(xx, ly0 + 2, xx, ly1 - 2, fill=P["grid"], dash=(2, 4))
+                hh += 1
+            # dragged block: show its window in its row
+            if self._gantt_drag_idx is not None and self._gantt_drag_idx in rows:
+                g = groups[self._gantt_drag_idx]
+                r = rows[g["key"]]
+                ry = ly0 + 5 + r * ROW
+                self._g_rrect(clampx(h_to_x(g["ws"])), ry, clampx(h_to_x(g["we"])), ry + ROW - 4, 7,
+                              fill="", outline=blk, dash=(3, 3))
+            # blocks
+            clashing = set()
+            for gi, a, b in spans:
+                for gj, c, d in spans:
+                    if gi != gj and a < d - 1e-6 and c < b - 1e-6:
+                        clashing.add(gi)
+            for gi, a, b in spans:
+                g = groups[gi]
+                r = rows.get(gi, 0)
+                by0 = ly0 + 5 + r * ROW
+                by1 = by0 + ROW - 4
+                ghost = pv is not None and gi in pv["placed"] and (
+                    abs(pv["placed"][gi] - g["start_h"]) > 1 / 120.0
+                    or abs(pv["durs"].get(gi, g["dur"]) - g["dur"]) > 1e-6)
+                bend = min(b, g["we"])
+                bx0, bx1 = clampx(h_to_x(a)), clampx(h_to_x(bend))
+                if bx1 - bx0 < 4:
+                    bx1 = bx0 + 4
+                is_drag = gi == self._gantt_drag_idx
+                outline = P["red"] if gi in clashing else (P["ink"] if is_drag else "")
+                if ghost:
+                    self._g_rrect(bx0, by0, bx1, by1, 7, fill=P["lane"], outline=blk,
+                                  width=2, dash=(5, 3))
+                    ink = blk
+                else:
+                    self._g_rrect(bx0, by0, bx1, by1, 7, fill=blk,
+                                  outline=outline, width=2 if outline else 1)
+                    ink = P["ink"] if not self.night_mode else "#e0b0b0"
+                if b > g["we"] + 1e-6:      # part past the window end
+                    self._g_rrect(bx1, by0 + 2, clampx(h_to_x(b)), by1 - 2, 5, fill="",
+                                  outline=P["red"], dash=(3, 2))
+                tr_ = g.get("transit")
+                row_busy = tr_ is not None and any(
+                    gj != gi and rows.get(gj, 0) == r and c <= tr_ <= d for gj, c, d in spans)
+                peak_tag = self._g_peak_mark(g, a, bend, h_to_x, by0, by1, ink, P,
+                                             ax0, ax1, row_busy)
+                wpx = bx1 - bx0
+                if wpx > 46:
+                    name = g["target_id"]
+                    sub = f"{_fmt_hm(a)}–{_fmt_hm(b)}"
+                    if peak_tag:
+                        sub += f" · peak {peak_tag}"
+                    if pv is not None and abs(pv["durs"].get(gi, g["dur"]) - g["dur"]) > 1e-6:
+                        sub += f"  (was {g['dur']:.1f}h)"
+                    f = tkfont.Font(family="Helvetica", size=9, weight="bold")
+                    while name and f.measure(name) > wpx - 12:
+                        name = name[:-1]
+                    cv.create_text(bx0 + 7, by0 + 3, anchor="nw", text=name, fill=ink, font=ink_font)
+                    if wpx > 96:
+                        while sub and tkfont.Font(family="Helvetica", size=8).measure(sub) > wpx - 12:
+                            sub = sub[:-1]
+                        cv.create_text(bx0 + 7, by0 + 17, anchor="nw", text=sub, fill=ink,
+                                       font=("Helvetica", 8))
+                if pv is None and g["ws"] is not None:
+                    self._gantt_row_info.append((by0, by1, gi, bx0, bx1, a))
+                    self._gantt_drag_bounds[gi] = (g["ws"], g["we"])
+            # clash hatch along the lane bottom
+            for a, b in clash:
+                hx0, hx1 = clampx(h_to_x(a)), clampx(h_to_x(b))
+                cv.create_rectangle(hx0, ly1 - 6, hx1, ly1 - 1, fill=P["red_bg"], outline="")
+                xx = hx0
+                while xx < hx1:
+                    cv.create_line(xx, ly1 - 1, min(xx + 5, hx1), ly1 - 6, fill=P["red"])
+                    xx += 5
+            y = ly1 + 6
+
+        # ── won't-fit tray ──
+        if tray:
+            ty0 = y + 2
+            ty1 = ty0 + tray_h - 6
+            handled = lambda gi, kind: (kind == "wont" and pv is not None
+                                        and pv["choices"].get(gi, ("",))[0] == "remove")
+            open_items = any(not handled(gi, kind) for gi, kind in tray)
+            if open_items:
+                cv.create_text(LW - 10, ty0 + 14, anchor="e", text="WON'T FIT", fill=P["red"],
+                               font=("Helvetica", 8, "bold"))
+                self._g_rrect(LW, ty0, cw - RM, ty1, 9,
+                              fill=P["red_bg"] if self.night_mode else "#160b0f",
+                              outline=P["red_edge"], dash=(4, 3))
+            else:                       # every row dealt with — nothing alarming left
+                cv.create_text(LW - 10, ty0 + 14, anchor="e", text="ON APPLY", fill=P["dim"],
+                               font=("Helvetica", 8, "bold"))
+                self._g_rrect(LW, ty0, cw - RM, ty1, 9, fill=P["lane"],
+                              outline=P["lane_edge"], dash=(4, 3))
+            ry = ty0 + 7
+            for gi, kind in tray:
+                g = groups[gi]
+                x = LW + 10
+                if kind == "invisible":
+                    self._g_chip(x, ry, f"{g['target_id']} · {g['scope'][:14]} · not up in the dark tonight",
+                                 "", P, "red", font=("Helvetica", 8), h=20)
+                elif handled(gi, kind):
+                    x = self._g_chip(x, ry, f"✓  {g['target_id']} · {g['scope'][:14]} · comes off "
+                                     "tonight's plan when you Apply", "", P, "dim",
+                                     font=("Helvetica", 8), h=20) + 10
+                    self._g_chip(x, ry, "Change", f"reopen:{gi}", P, "normal",
+                                 font=("Helvetica", 8), h=20)
+                else:
+                    w = pv["wont"].get(gi)
+                    txt = (f"{g['target_id']} · {g['scope'][:14]} · needs {w['need']:.1f}h, "
+                           f"{w['free']:.1f}h free in its window")
+                    x = self._g_chip(x, ry, txt, "", P, "red", font=("Helvetica", 8), h=20) + 10
+                    if w and w["free"] >= 0.25:
+                        x = self._g_chip(x, ry, f"Shorten to {math.floor(w['free'] * 10 + 1e-6) / 10:.1f}h",
+                                         f"shorten:{gi}", P, "normal", font=("Helvetica", 8), h=20) + 6
+                    self._g_chip(x, ry, "Remove from tonight", f"remove:{gi}", P, "normal",
+                                 font=("Helvetica", 8), h=20)
+                ry += 28
+
+        # ── "Now" line (only when viewing today's date) ──
         if _PLANNING_DATE is None:
-            now_h = real_now.hour + real_now.minute / 60.0 + real_now.second / 3600.0
-            if now_h < ax_start - 0.01:
-                now_h += 24.0
-            if ax_start <= now_h <= ax_end + 0.25:
-                x_now = h_to_x(now_h)
-                canvas.create_line(x_now, tm, x_now, tm + ph,
-                                   fill=fg_now, width=1, dash=(4, 2))
-                canvas.create_text(x_now, tm - 3, text="Now",
-                                   fill=fg_dim, font=("Helvetica", 9, "bold"), anchor="s")
+            now = datetime.now()
+            now_h = _norm_h(now.hour + now.minute / 60.0, ax0)
+            if ax0 <= now_h <= ax1:
+                xn = h_to_x(now_h)
+                cv.create_line(xn, TOOL + AXH, xn, lanes_top + sum(lane_hs) + 6 * len(lane_hs),
+                               fill=P["now"], dash=(4, 2))
 
     # ── Gantt drag interactions ───────────────────────────────────────────────
 
     def _gantt_hit(self, x, y):
-        """Return (group_idx, start_h_norm) if (x,y) hits a draggable alloc bar.
-
-        group_idx indexes ``self._gantt_groups`` (one entry per rig), not
-        ``self._plan_entries`` directly — see ``_draw_queue_gantt``.
-        """
+        """Return (group_idx, start_h) if (x, y) is on a draggable block."""
         for y_top, y_bot, group_idx, bar_x1, bar_x2, start_h_norm in self._gantt_row_info:
-            if y_top <= y <= y_bot and bar_x1 - 12 <= x <= bar_x2 + 12:
+            if y_top <= y <= y_bot and bar_x1 - 6 <= x <= bar_x2 + 6:
                 return group_idx, start_h_norm
         return None, None
 
+    def _gantt_button_at(self, x, y):
+        cv = self.queue_gantt
+        for item in reversed(cv.find_overlapping(x, y, x, y)):
+            for tag in cv.gettags(item):
+                if tag.startswith("btn:") and len(tag) > 4:
+                    return tag[4:]
+        return None
+
     def _gantt_press(self, event):
-        """Begin a Gantt-bar drag if the mouse hit a draggable bar."""
+        """Click a toolbar/tray button, or begin dragging a block."""
+        action = self._gantt_button_at(event.x, event.y)
+        if action:
+            self._gantt_button(action)
+            return
+        if self._gantt_preview is not None:
+            return
         idx, start_h = self._gantt_hit(event.x, event.y)
         if idx is not None:
             self._gantt_drag_idx      = idx
             self._gantt_drag_x0       = event.x
             self._gantt_drag_start_h0 = start_h
+            self._gantt_press_snap    = [dict(e) for e in self._plan_entries]
+            # hold every block's sub-row still while dragging
+            self._gantt_frozen_rows = self._gantt_current_rows()
+
+    def _gantt_current_rows(self):
+        """Sub-row of every block as currently laid out."""
+        ax = self._gantt_axis()
+        if not isinstance(ax, dict):
+            return {}
+        groups, lanes = self._gantt_collect(ax)
+        out = {}
+        for gis in lanes.values():
+            spans = [(gi, groups[gi]["start_h"], groups[gi]["start_h"] + groups[gi]["dur"])
+                     for gi in gis if groups[gi]["ws"] is not None]
+            out.update(lane_rows(spans)[0])
+        return out
 
     def _gantt_drag(self, event):
-        """Update every filter row on the dragged rig's start_time together.
-
-        The Gantt now draws one bar per rig (target_id + scope), so a drag
-        moves every ``_plan_entries`` row that rig's group covers, not just
-        one — otherwise filters on the same rig would drift apart.
-        """
+        """Move the dragged block — every filter row of that target on that
+        rig together — keeping it inside the target's window."""
         if self._gantt_drag_idx is None or not self._gantt_pw:
             return
-        dx    = event.x - self._gantt_drag_x0
-        dh    = dx / self._gantt_pw * self._gantt_ax_range
-        new_h = self._gantt_drag_start_h0 + dh
-
-        idx = self._gantt_drag_idx
+        dh    = (event.x - self._gantt_drag_x0) / self._gantt_pw * self._gantt_ax_range
         groups = getattr(self, "_gantt_groups", [])
+        idx = self._gantt_drag_idx
         if idx >= len(groups):
             return
         g = groups[idx]
-
-        # Clamp within the available window
-        ws = self._parse_h(g.get("win_start"))
-        we = self._parse_h(g.get("win_end"))
-        if ws is not None and ws < self._gantt_ax_start - 0.01:
-            ws += 24.0
-        if we is not None and we < ws:
-            we += 24.0
-        alloc_h = g.get("total_alloc_h") or 1.0
-        # Use stored per-row bounds so drag respects the imaging window
-        bounds = getattr(self, "_gantt_drag_bounds", {}).get(idx)
-        if bounds:
-            b_lo, b_hi = bounds
-        else:
-            b_lo = ws if ws is not None else self._gantt_ax_start
-            b_hi = we if we is not None else (self._gantt_ax_start + self._gantt_ax_range)
-        lo    = b_lo
-        hi    = b_hi - alloc_h
-        new_h = max(lo, min(hi, new_h))
-
-        h_int = int(new_h) % 24
-        m_int = int(round((new_h % 1) * 60)) % 60
-        new_start = f"{h_int:02d}:{m_int:02d}"
+        lo, hi = self._gantt_drag_bounds.get(idx, (g["ws"], g["we"]))
+        new_h = max(lo, min(hi - g["dur"], self._gantt_drag_start_h0 + dh))
+        new_h = max(new_h, lo)              # longer than its window: pin to the start
+        new_start = _fmt_hm(new_h)
         for member_idx in g.get("member_idxs", []):
             if member_idx < len(self._plan_entries):
                 self._plan_entries[member_idx]["start_time"] = new_start
         self._draw_queue_gantt()
 
     def _gantt_release(self, event):
-        """End the Gantt-bar drag and clear drag state."""
+        """End a block drag: record it for Undo, re-stack the lanes."""
         if self._gantt_drag_idx is not None:
+            snap = self._gantt_press_snap
+            if snap is not None and [e.get("start_time") for e in snap] != \
+                    [e.get("start_time") for e in self._plan_entries]:
+                self._sort_plan_by_start()  # the cards follow the new schedule
+                self._gantt_push_undo(snap)
             self._gantt_drag_idx      = None
             self._gantt_drag_x0       = None
             self._gantt_drag_start_h0 = None
+            self._gantt_press_snap    = None
+            self._gantt_frozen_rows   = None
             # Plan cards show start_time too — refresh once, on release,
             # rather than on every drag motion tick.
             self._refresh_plan_tree()
 
     def _gantt_motion(self, event):
-        """Show a move cursor when hovering over a draggable Gantt bar."""
+        """Hand cursor on buttons, move cursor on draggable blocks."""
+        if self._gantt_button_at(event.x, event.y):
+            self.queue_gantt.config(cursor="hand2")
+            return
         idx, _ = self._gantt_hit(event.x, event.y)
         self.queue_gantt.config(cursor="fleur" if idx is not None else "")
+        self._gantt_set_hover(idx)
+
+    def _gantt_set_hover(self, idx):
+        """Swap the toolbar legend for the hovered block's details."""
+        if idx == getattr(self, "_gantt_hover_gi", None):
+            return
+        self._gantt_hover_gi = idx
+        cv, item = self.queue_gantt, getattr(self, "_gantt_hover_item", None)
+        if item is None:
+            return
+        P = self._gantt_palette()
+        if idx is None or idx >= len(getattr(self, "_gantt_groups", [])):
+            cv.itemconfig(item, text="")
+            cw = cv.winfo_width()
+            self._gantt_legend(cw - self._G_RM, cv.coords(item)[1], P)
+        else:
+            cv.delete("legend")
+            cv.itemconfig(item, text=self._gantt_hover_text(idx), fill=P["text"])
 
     def _plan_load_target(self, event):
         """Double-click in Tonight's Plan: edit allocated hours and/or sub-exposure for that row."""

@@ -31,7 +31,7 @@ In one window it:
 - ⏱️ **Recommends a sub-exposure length** from your camera's read noise and your Bortle-class sky background — with read-noise vs sky-flux regime detection so you know *why*
 - 🌙 **Calculates tonight's imaging window** inside astronomical darkness (sun below −18°), with moonrise/moonset and per-target altitude
 - 📍 **Saves named location profiles** so dark-site travelers can switch between home and remote sites in a click — every twilight, moon, and altitude calculation follows the active site
-- 📊 **Schedules the night as a drag-to-reorder plan** — commit targets straight from a live "what's up tonight" grid, reorder them by dragging a card's grip handle, and see the whole night as a collapsible timeline strip
+- 📊 **Schedules the night as a drag-to-reorder plan** — commit targets straight from a live "what's up tonight" grid, reorder them by dragging a card's grip handle, and see the whole night as one lane per rig — double-booked cameras are flagged, and one click packs every rig's night around each target's transit
 - 🚀 **Exports a `.ninaTargetSet` file** you double-click into NINA's Sequencer — multi-rig plans split automatically into one file per telescope
 - 📄 **Exports a printable plan** as a plain-text summary or a self-contained HTML report that embeds each target's altitude chart and prints to PDF straight from your browser
 - 🧩 **Imports your NINA profile** — pulls in filter-wheel names (LRGB + narrowband, with a bandwidth prompt) and your configured telescope, showing a preview of exactly what will be added or updated before anything is saved, and never touches whichever filter you currently have selected
@@ -102,7 +102,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** macOS 11 (Big Sur) or later. Apple Silicon only (Apple Intel support coming in a future release).
 
-1. Download **`LightbucketAstroPlanner-2.1.1.dmg`** from the release page.
+1. Download **`LightbucketAstroPlanner-2.2.0.dmg`** from the release page.
 2. Open the DMG and drag **Lightbucket Astro Planner** into your
    **Applications** folder.
 3. The first time you launch it:
@@ -121,7 +121,7 @@ If it's useful to you too, [grab the latest release](https://github.com/Lightbuc
 
 **Requirements:** Windows 10 (1909 or later) or Windows 11, 64-bit.
 
-1. Download **`LightbucketAstroPlanner-2.1.1-setup.exe`** from the
+1. Download **`LightbucketAstroPlanner-2.2.0-setup.exe`** from the
    release page.
 2. Run the installer. If **Windows Defender SmartScreen** appears:
    - Click **More info**.
@@ -313,6 +313,11 @@ right, which also lists the target size. Hover a card to highlight its frame
 and dim the others; use the 👁 toggle to hide a frame without losing its
 colour, ✕ to remove it, or **✕ clear all** to start over.
 
+Grab any frame's corner handle to turn every frame together (hold **Shift**
+to snap to 15°); drag anywhere else to pan. Under the image, the same
+**rotator tape** as the Frame dialog turns them too; its **Match** chip uses the selected rig's sensor shape to line
+the long side up with the target's long axis.
+
 The image is fetched at whatever span your largest analyzed FOV needs — there's
 no fixed size cap, so a wide-FOV rig frames correctly instead of clipping at
 the edge. A span wide enough to take a while server-side shows an explicit
@@ -322,7 +327,8 @@ a small placeholder image that could be mistaken for the final result; a
 targets keeps your whole rig stack and re-frames it over the new object, so
 you can sweep one set of equipment across a season's worth of candidates.
 Offline, the tab falls back to a geometric ellipse preview, with the frames
-still drawn to scale.
+still drawn to scale and the target outline at its catalog angle. The Frame
+dialog does the same, and its frame still rotates and pans without an image.
 
 <a id="sky-map"></a>
 
@@ -440,9 +446,15 @@ icon, a capped "peak ##° · HH:MM–HH:MM" readout, and a **visibility pill**
 Two icons on each card handle adding it to your plan. **🖼 Frame** opens the
 **Frame dialog** — an altitude/moon chart above a draggable, rotatable
 sensor-frame preview on a live DSS image. Drag to pan the frame off-centre,
-grab a corner to rotate it; the rotation readout shows the position angle in
-NINA's own convention (counter-clockwise from north, 0° upright), so the
-number on the preview matches NINA's framing assistant. The caption under
+grab a corner to rotate it, or use the **rotator tape** under the image: drag
+it (hold **Shift** for fine steps), scroll it, use the arrow keys, or type an
+angle. The tape reads the position angle in NINA's own convention
+(counter-clockwise from north, 0° upright), so the number matches NINA's
+framing assistant. An amber mark on the tape shows the angle that lines your
+sensor's long side up with the target's long axis (from the catalog), and the
+**Match** chip jumps straight to it (for a round target, or one the catalog
+gives no angle for, a note says so instead); **0°**, **90°** and **Flip 180°** are one
+click too. The caption under
 the image reads, e.g., *M52 ✅ fits · 23% span · PA 0.0° · img 1.2°*, and
 hovering the altitude chart shows a crosshair with the time and altitude
 under the cursor (plus moonrise/moonset when you're over those markers).
@@ -465,8 +477,30 @@ total integration). Drag a card's **⠿ grip handle** to reorder it — the
 existing ↑ / ↓ / ★ **Order by Transit** controls are all still there too — or
 click 🗑 to remove it.
 
-At the bottom, a collapsible **Schedule Timeline** strip shows the whole
-night as a Gantt-style chart you can drag to reschedule.
+At the bottom, a collapsible **Schedule Timeline** shows the night as **one
+lane per rig** (scope + camera). Each target is a block on its rig's lane —
+all its filters together. An amber **▼ cap** on a block marks its target's
+peak (transit, highest in the sky), and the block's time line reads *peak
+22:42*; a hollow cap in the same row shows a peak that falls outside the
+booked time. Hover a block for its peak time and altitude, window and booked
+time. A camera can only
+shoot one target at a time, so blocks that overlap stack inside the lane
+with a red outline and a hatched strip under the clash, and the lane's pill
+reads *4 targets overlap* (or *runs past window*, or *OK · 1.1h free*). Above the
+lanes, a sky band shows astronomical dark, when the Moon is up, and the
+moon-free stretch. Drag a block to change its start; it stays inside that
+target's window.
+
+**Auto-schedule all rigs** packs each lane for you: targets are taken in the
+**Order by** choice (*Transit*, *Sets first* or *Plan order*), each goes in
+the earliest free time inside its own window, and if there's slack every
+block slides toward its transit. You see a preview first, with dashed blocks
+at the new times, then **Apply** or **Cancel**. Anything that won't fit is
+listed in a **Won't fit** tray: **Shorten** it to the free time left in its
+window, or **Remove** it from tonight (the row turns into a calm ✓ with a **Change** button). A row you leave alone stays where it was when you Apply; **Cancel** drops the whole preview. After an Apply or a drag, the plan cards re-sort by start time (each target's
+filters stay together) so the list reads in the order you'll shoot. **Undo** reverses
+an Apply or a drag, order included; it won't undo past a later change to the plan (a target
+added, removed or edited), so it can't lose your work.
 
 - **Export Session** — saves the night's plan as a readable report. Pick the
   format in the Save dialog's file-type list: a plain-text summary you can
@@ -853,6 +887,37 @@ anything):
   member list now uses the same filter colours as the plan cards (Ha is
   violet in both), and the search suggestions use the same object-type
   colours as the grid's type chips.
+
+New in 2.2.0, nothing needs migrating — your equipment, sessions and plans
+carry over as they are:
+
+- **The schedule timeline is now Rig Lanes.** One lane per rig (scope +
+  camera), each target one block with all its filters. A camera can only
+  shoot one target at a time, so double-bookings stack in the lane with a
+  red outline and a hatched strip, and the lane says how many targets
+  overlap; otherwise it shows how much of the night is free. A sky band
+  above the lanes shows astronomical dark, when the Moon is up and the
+  moon-free stretch. See [Tonight's Plan](#-tonights-plan).
+- **Auto-schedule all rigs.** Packs every rig's night — ordered by transit,
+  by which target sets first, or by your plan order — keeping each target
+  inside its own window and sliding it toward its transit when there's
+  room. You see the new times first and choose **Apply** or **Cancel**. A
+  **Won't fit** tray offers to shorten a target to the time left or remove
+  it from tonight. **Undo** reverses an Apply or a drag.
+- **Peak markers.** An amber cap on each block marks when its target is
+  highest in the sky, and hovering a block shows its peak time and
+  altitude, window and booked time.
+- **The plan list follows the schedule.** After an Apply or a drag, the
+  plan cards — and the NINA export — run in start-time order.
+- **Rotator tape for the position angle**, in the Frame dialog and in
+  Explore: drag, scroll, use the arrow keys or type an angle. **Match**
+  lines your sensor's long side up with the target's long axis from the
+  catalog (it works with the built-in offline catalog too, for the
+  elongated Messier galaxies). In Explore you can now also grab a frame's
+  corner to rotate every frame together.
+- **Framing works offline.** Without internet, the Frame dialog's frame
+  still turns, pans and zooms, and both tabs draw the target at its
+  catalog angle instead of always level, in night mode too.
 
 ---
 
